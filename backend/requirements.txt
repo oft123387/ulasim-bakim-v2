@@ -1,0 +1,19 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+sqlalchemy>=2.0
+python-jose[cryptography]>=3.3
+passlib[bcrypt]>=1.7
+bcrypt<4.1  # passlib 1.7.4, bcrypt>=4.1'de kaldırılan __about__ özniteliğine bakıyor; pin olmadan hash üretimi hata veriyor
+python-multipart>=0.0.9
+openpyxl>=3.1
+# Parça Bilgi Bankası: kapak görsellerinden otomatik arka plan kaldırma
+rembg>=2.0.50
+onnxruntime>=1.16
+Pillow>=10.0
+# iPhone/iPad fotoğrafları (.heic/.heif) yüklenebilsin ve tarayıcıda görüntülenebilsin diye
+pillow-heif>=0.13
+# Çoklu format dışa aktarma (Bakımlar + İşlem Kayıtları): PDF ve Word çıktısı
+reportlab>=4.0
+python-docx>=1.1
+# Araç ve Parça QR kodları (telefonla okutunca bakım geçmişi/parça bilgisi açılır)
+qrcode>=7.4

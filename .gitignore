@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------- Sırlar
+# Gerçek gizli anahtarlar/şifreler yalnızca backend/.env'de tutulur ve
+# ASLA commit edilmez. backend/.env.example (placeholder değerlerle)
+# commit edilir, gerçek dosya bundan kopyalanır.
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# ---------------------------------------------------------------- Python
+**/__pycache__/
+**/*.py[cod]
+backend/.venv/
+backend/venv/
+.venv/
+venv/
+
+# ---------------------------------------------------------------- Node / Frontend
+**/node_modules/
+frontend/dist/
+frontend/.vite/
+node_modules/.tmp/
+*.tsbuildinfo
+
+# ---------------------------------------------------------------- Geliştirme veritabanı / yerel veri
+# (Docker'da bunlar volume'lerden gelir; native/baslat.bat ile çalıştırınca
+# oluşan yerel dosyalardır — kişiye/makineye özeldir, repo'ya girmez.)
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+backend/data/
+backend/uploads/
+backend/backups/
+backend/logs/
+backend/model_cache/
+
+# ---------------------------------------------------------------- Git / araç dosyaları
+.agents/
+
+# ---------------------------------------------------------------- IDE / işletim sistemi
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Bazı senkronizasyon/köprü araçlarının (ör. FUSE) bıraktığı geçici dosyalar
+.fuse_hidden*

@@ -1,0 +1,241 @@
+import { useEffect, useMemo, useState } from 'react'
+import { api, apiDownload } from '../api'
+import type { Maintenance, Plan, User, Vehicle } from '../types'
+import { STATUS_TR } from '../types'
+import { PageHeader, Badge, EmptyState, SkeletonTableRows } from '../components/ui'
+import { ChevronRight, Download, ListFilter, History as HistoryIcon, Truck } from 'lucide-react'
+
+const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
+const fmtKm = (n: number) => n.toLocaleString('tr-TR')
+
+interface Filters {
+  status: string
+  vehicle_id: string
+  plan_id: string
+  worked_by_id: string
+  date_from: string
+  date_to: string
+  km_min: string
+  km_max: string
+}
+
+const EMPTY: Filters = {
+  status: 'completed',
+  vehicle_id: '',
+  plan_id: '',
+  worked_by_id: '',
+  date_from: '',
+  date_to: '',
+  km_min: '',
+  km_max: '',
+}
+
+/** Bakım Geçmişi (Faz 13-14): tamamlanan (veya seçilen durumdaki) bakımları
+ * araç bazında, en yeni üstte gruplar; tarih/araç/plan/personel/km filtreleri
+ * ve Excel dışa aktarma sunar. */
+export default function HistoryPage({
+  user,
+  perms,
+  onOpenMaintenance,
+}: {
+  user: User
+  perms: Record<string, boolean>
+  onOpenMaintenance: (id: number) => void
+}) {
+  const [f, setF] = useState<Filters>(EMPTY)
+  const [list, setList] = useState<Maintenance[] | null>(null)
+  const [vehicles, setVehicles] = useState<Vehicle[]>([])
+  const [plans, setPlans] = useState<Plan[]>([])
+  const [users, setUsers] = useState<User[]>([])
+  const [exportError, setExportError] = useState('')
+
+  const isAdmin = user.role === 'admin'
+
+  useEffect(() => {
+    api<Vehicle[]>('/vehicles').then(setVehicles).catch(() => setVehicles([]))
+    api<Plan[]>('/plans').then(setPlans).catch(() => setPlans([]))
+    if (isAdmin) api<User[]>('/users').then(setUsers).catch(() => setUsers([]))
+  }, [isAdmin])
+
+  const query = useMemo(() => {
+    const p = new URLSearchParams()
+    if (f.status) p.set('status', f.status)
+    if (f.vehicle_id) p.set('vehicle_id', f.vehicle_id)
+    if (f.plan_id) p.set('plan_id', f.plan_id)
+    if (f.worked_by_id) p.set('worked_by_id', f.worked_by_id)
+    if (f.km_min) p.set('km_min', f.km_min)
+    if (f.km_max) p.set('km_max', f.km_max)
+    // Geçmiş: tamamlanma tarihine göre; aksi halde oluşturma tarihine göre filtrele
+    p.set('date_field', f.status === 'completed' ? 'completed' : 'created')
+    if (f.date_from) p.set('date_from', f.date_from)
+    if (f.date_to) p.set('date_to', f.date_to)
+    return p.toString()
+  }, [f])
+
+  useEffect(() => {
+    setList(null)
+    api<Maintenance[]>(`/maintenances?${query}`).then(setList).catch(() => setList([]))
+  }, [query])
+
+  const rows = list ?? []
+
+  // Araç bazlı gruplama (en yeni tamamlanan üstte). Sunucu zaten tarihe göre
+  // azalan sıralı döndürür; grubu ilk görülen araç sırasına göre koruyoruz.
+  const groups = useMemo(() => {
+    const map = new Map<string, { vehicle: Vehicle; items: Maintenance[] }>()
+    for (const m of rows) {
+      const key = m.vehicle.code
+      if (!map.has(key)) map.set(key, { vehicle: m.vehicle, items: [] })
+      map.get(key)!.items.push(m)
+    }
+    return Array.from(map.values())
+  }, [rows])
+
+  function set<K extends keyof Filters>(k: K, v: string) {
+    setF((prev) => ({ ...prev, [k]: v }))
+  }
+
+  async function exportExcel() {
+    setExportError('')
+    try {
+      await apiDownload(`/maintenances/export?${query}`, 'bakim_gecmisi.xlsx')
+    } catch (e) {
+      setExportError((e as Error).message)
+    }
+  }
+
+  const hasFilter =
+    f.vehicle_id || f.plan_id || f.worked_by_id || f.date_from || f.date_to || f.km_min || f.km_max ||
+    f.status !== 'completed'
+
+  return (
+    <>
+      <PageHeader
+        title="Bakım Geçmişi"
+        subtitle="Tamamlanan bakımlar araç bazında, en yeni üstte listelenir. Tarih aralığı, araç, periyot, personel ve kilometreye göre filtreleyip Excel'e aktarabilirsiniz."
+      />
+
+      <div className="table-card fade-in">
+        <div className="table-toolbar" style={{ flexWrap: 'wrap' }}>
+          <ListFilter size={15} color="var(--text-tertiary)" />
+          <select value={f.status} onChange={(e) => set('status', e.target.value)}>
+            <option value="completed">Tamamlandı</option>
+            <option value="">Tüm Durumlar</option>
+            <option value="pending">Bekliyor</option>
+            <option value="in_progress">Devam Ediyor</option>
+          </select>
+          <select value={f.vehicle_id} onChange={(e) => set('vehicle_id', e.target.value)}>
+            <option value="">Tüm Araçlar</option>
+            {vehicles.map((v) => (
+              <option key={v.id} value={v.id}>{v.code}</option>
+            ))}
+          </select>
+          <select value={f.plan_id} onChange={(e) => set('plan_id', e.target.value)}>
+            <option value="">Tüm Periyotlar</option>
+            {plans.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+          {isAdmin && (
+            <select value={f.worked_by_id} onChange={(e) => set('worked_by_id', e.target.value)}>
+              <option value="">Tüm Personel</option>
+              {users.map((u) => (
+                <option key={u.id} value={u.id}>{u.full_name}</option>
+              ))}
+            </select>
+          )}
+          <label className="filter-inline">
+            <span>Tarih</span>
+            <input type="date" value={f.date_from} onChange={(e) => set('date_from', e.target.value)} />
+            <span>–</span>
+            <input type="date" value={f.date_to} onChange={(e) => set('date_to', e.target.value)} />
+          </label>
+          <label className="filter-inline">
+            <span>KM</span>
+            <input
+              type="number"
+              placeholder="min"
+              value={f.km_min}
+              onChange={(e) => set('km_min', e.target.value)}
+              style={{ width: 90 }}
+            />
+            <span>–</span>
+            <input
+              type="number"
+              placeholder="max"
+              value={f.km_max}
+              onChange={(e) => set('km_max', e.target.value)}
+              style={{ width: 90 }}
+            />
+          </label>
+          {hasFilter && (
+            <button className="small ghost" onClick={() => setF(EMPTY)}>Filtreleri Temizle</button>
+          )}
+          <span className="muted" style={{ marginLeft: 'auto' }}>{rows.length} kayıt</span>
+          {perms.export_excel && (
+            <button className="small" onClick={exportExcel}>
+              <Download size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+              Excel'e Aktar
+            </button>
+          )}
+        </div>
+        {exportError && <div className="error" style={{ margin: '0 16px 12px' }}>{exportError}</div>}
+
+        {list === null && (
+          <div className="table-scroll">
+            <table><tbody><SkeletonTableRows columns={6} /></tbody></table>
+          </div>
+        )}
+
+        {list !== null && groups.length === 0 && (
+          <EmptyState
+            icon={<HistoryIcon size={22} />}
+            title="Kayıt bulunamadı"
+            description="Seçtiğiniz filtrelere uyan bir bakım yok."
+          />
+        )}
+
+        {list !== null &&
+          groups.map((g) => (
+            <div key={g.vehicle.code} className="history-group">
+              <div className="history-group-head">
+                <span className="vehicle-code"><Truck size={13} style={{ verticalAlign: -2, marginRight: 4 }} />{g.vehicle.code}</span>
+                {g.vehicle.name && <span className="muted">{g.vehicle.name}</span>}
+                <span className="muted" style={{ marginLeft: 'auto' }}>{g.items.length} bakım</span>
+              </div>
+              <div className="table-scroll">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>İş Emri</th>
+                      <th>Periyot</th>
+                      <th>Hedef KM</th>
+                      <th>Durum</th>
+                      <th>Bitiş</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {g.items.map((m) => (
+                      <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
+                        <td style={{ fontWeight: 600 }}>#{m.id}</td>
+                        <td>{m.plan.name}</td>
+                        <td>{fmtKm(m.target_km)} km</td>
+                        <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
+                        <td>{fmt(m.completed_at)}</td>
+                        <td>
+                          <button className="small primary" onClick={(e) => { e.stopPropagation(); onOpenMaintenance(m.id) }}>
+                            Detay <ChevronRight size={12} style={{ verticalAlign: -1, marginLeft: 2 }} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          ))}
+      </div>
+    </>
+  )
+}

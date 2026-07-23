@@ -1,0 +1,55 @@
+services:
+  app:
+    build: .
+    container_name: ulasim-bakim
+    ports:
+      - "8000:8000"
+    # backend/.env, build sırasında imaja KOPYALANMAZ (.dockerignore'da
+    # bilerek hariç tutulur — sırlar imaja gömülmesin diye). Bunun yerine
+    # docker compose up sırasında HOST'taki bu dosya konteynere ortam
+    # değişkeni olarak enjekte edilir; böylece SMTP_* gibi ayarları
+    # backend/.env dosyasından değiştirip yalnızca konteyneri yeniden
+    # başlatmak (docker compose up -d) yeterli olur, imajı yeniden
+    # derlemeye (build) gerek kalmaz. Aşağıdaki environment: bloğu, aynı
+    # anahtar için env_file'daki değerin ÜZERİNE yazar (compose önceliği).
+    #
+    # ÖNEMLİ (GitHub'a pushlarken güvenlik): SECRET_KEY buraya SABİT/AÇIK
+    # metin olarak YAZILMAZ — bilerek yalnızca backend/.env'den gelir
+    # (o dosya .gitignore'da, hiç commit'e girmez). Böylece bu dosya
+    # (docker-compose.yml) git'e eklense/pushlansa bile gerçek anahtar
+    # sızmaz. backend/.env yoksa/SECRET_KEY boşsa auth.py kendi varsayılan
+    # (üretimde MUTLAKA değiştirilmesi gereken) değerine düşer.
+    env_file:
+      - backend/.env
+    environment:
+      # Veritabanı kalıcı volume içinde (db-data). SQLite mutlak yol (4 bölü).
+      DATABASE_URL: "sqlite:////app/data/ulasim_bakim.db"
+      # Siteyi gerçek bir alan adından yayınlarken buraya o adresi yazın
+      # (ör. "https://bakim.sirketiniz.com"). Boş/"*" bırakılırsa tüm
+      # kaynaklara izin verilir — yalnızca dış erişimi olmayan/iç ağ
+      # kullanımında güvenli kabul edilir.
+      ALLOWED_ORIGIN: "*"
+      # Otomatik veritabanı yedeklerinin yazıldığı klasör (ayrı volume).
+      BACKUP_DIR: "/app/backups"
+      # Parça Bilgi Bankası'ndaki arka plan kaldırma modelinin (u2netp)
+      # önbelleği — kalıcı volume'de tutulur, aksi halde konteyner her
+      # yeniden başlatıldığında/derlendiğinde modeli tekrar internetten
+      # indirmesi gerekir.
+      U2NET_HOME: "/app/model_cache"
+      # Merkezi loglama (Faz 23) — uygulama/hata/erişim logları kalıcı
+      # volume'de tutulur, konteyner yeniden oluşturulsa bile korunur.
+      LOG_DIR: "/app/logs"
+    volumes:
+      - db-data:/app/data                      # veritabanı kalıcı
+      - uploads:/app/backend/uploads           # yüklenen dosyalar (foto/PDF/3D model) kalıcı
+      - backups:/app/backups                   # otomatik veritabanı yedekleri (db-data'dan AYRI volume — db-data silinse/bozulsa bile yedekler korunur)
+      - model-cache:/app/model_cache            # arka plan kaldırma AI modeli önbelleği
+      - logs:/app/logs                          # merkezi loglama (uygulama/hata/erişim logları)
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  uploads:
+  backups:
+  model-cache:
+  logs:
