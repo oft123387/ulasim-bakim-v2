@@ -1,20 +1,152 @@
 import { useEffect, useMemo, useState } from 'react'
 import { api, apiUploadWithFields } from '../api'
 import { PageHeader } from '../components/ui'
-import { ChevronRight, Paperclip, FileText, ImageIcon, LinkIcon, Download, Trash2 } from 'lucide-react'
+import { ChevronRight, Paperclip, FileText, ImageIcon, LinkIcon, Download, Trash2, UploadCloud, ShieldAlert } from 'lucide-react'
 import Tram3D from '../components/Tram3D'
 import type {
-  ImportTreeResult,
+  BulkCatalogImportResult,
+  MergedTreeNode,
   Model3D,
   Plan,
   TreeNode,
   TreeNodeFlat,
   PartHotspot,
   NodeAttachment,
+  PartCatalogItem,
+  TreeNodePartUsage,
+  VehicleModelMergeResult,
 } from '../types'
 
+// Parça ağacı (alt parçalar iç içe) iç içe geldiği için, "hangi maddede
+// hangi parçadan kaç adet" seçicisinde düz (children'sız) bir liste olarak
+// göstermek üzere derinlik öneki ile düzleştirir.
+function flattenParts(items: PartCatalogItem[], depth = 0): { id: number; label: string }[] {
+  const out: { id: number; label: string }[] = []
+  for (const it of items) {
+    out.push({ id: it.id, label: `${'— '.repeat(depth)}${it.name}` })
+    out.push(...flattenParts(it.children, depth + 1))
+  }
+  return out
+}
+
+// Periyot seçicide "Tümü" (birleşik görünüm) için özel/sentetik değer —
+// gerçek bir plan id'si değildir.
+const ALL_PLANS_VALUE = '__all__'
+
+// Plan periyodunu türüne göre okunur biçimde göster (km bazlı ↔ süre bazlı ↔
+// kaynakta yorumlanamamış/belirsiz — "?" olarak kalmalı, asla 0 km gibi
+// yanlış bir sayı gösterilmemeli).
+function planPeriodLabel(p: Plan): string {
+  if (p.plan_type === 'unknown') return 'Belirsiz (?)'
+  if (p.plan_type === 'time') {
+    const mo = p.interval_months ?? 0
+    return mo % 12 === 0 ? `${mo / 12} yıl` : `${mo} ay`
+  }
+  return `${fmtKm(p.interval_km)} km`
+}
+
+// ---------------------------------------------------------- Madde-parça eşleşmesi (stok)
+function NodePartsSection({
+  nodeId,
+  knownParts,
+}: {
+  nodeId: number
+  knownParts: { id: number; label: string }[]
+}) {
+  const [usages, setUsages] = useState<TreeNodePartUsage[]>([])
+  const [partId, setPartId] = useState('')
+  const [qty, setQty] = useState('1')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  function load() {
+    api<TreeNodePartUsage[]>(`/tree/${nodeId}/parts`).then(setUsages).catch(() => setUsages([]))
+  }
+  useEffect(load, [nodeId])
+
+  async function addUsage(e: React.FormEvent) {
+    e.preventDefault()
+    if (!partId) return
+    setBusy(true)
+    setError('')
+    try {
+      await api(`/tree/${nodeId}/parts`, {
+        method: 'POST',
+        body: { part_id: Number(partId), qty: Math.max(0.001, Number(qty) || 1) },
+      })
+      setPartId('')
+      setQty('1')
+      load()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeUsage(id: number) {
+    await api(`/tree/part-usages/${id}`, { method: 'DELETE' })
+    load()
+  }
+
+  return (
+    <div className="node-info-panel" style={{ marginTop: 4, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+      <label className="node-info-label">
+        Kullanılan Parçalar (madde tamamlanınca stoktan otomatik düşer)
+      </label>
+      <div className="muted" style={{ fontSize: 11.5, marginBottom: 6 }}>
+        Miktar kesirli olabilir — ör. parçanın birimi "kg" ise ve bu maddede 1 kg'lık üründen
+        200 gram kullanılıyorsa 0.2 girin.
+      </div>
+      {usages.length > 0 && (
+        <div className="attach-list" style={{ marginBottom: 8 }}>
+          {usages.map((u) => (
+            <div key={u.id} className="attach-list-row">
+              <span className="attach-chip">
+                <span>{u.part_name || `#${u.part_id}`} × {u.qty}</span>
+              </span>
+              <button className="small danger" onClick={() => removeUsage(u.id)} title="Eşleşmeyi kaldır">
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <form className="row" onSubmit={addUsage} style={{ flexWrap: 'wrap', gap: 6 }}>
+        <select value={partId} onChange={(e) => setPartId(e.target.value)} style={{ minWidth: 200 }}>
+          <option value="">Parça seç…</option>
+          {knownParts.map((p) => (
+            <option key={p.id} value={p.id}>{p.label}</option>
+          ))}
+        </select>
+        <input
+          type="number"
+          min={0.001}
+          step="any"
+          placeholder="Miktar"
+          value={qty}
+          onChange={(e) => setQty(e.target.value)}
+          style={{ width: 80 }}
+        />
+        <button className="small primary" disabled={!partId || busy}>Ekle</button>
+      </form>
+      {error && <div className="error" style={{ marginTop: 6 }}>{error}</div>}
+    </div>
+  )
+}
+
 // ---------------------------------------------------------- Madde bilgi/ek paneli (Faz 10)
-function NodeInfoPanel({ node, onChanged }: { node: TreeNode; onChanged: () => void }) {
+function NodeInfoPanel({
+  node,
+  onChanged,
+  isLeaf,
+  knownParts,
+}: {
+  node: TreeNode
+  onChanged: () => void
+  isLeaf: boolean
+  knownParts: { id: number; label: string }[]
+}) {
   const [note, setNote] = useState(node.note ?? '')
   const [savingNote, setSavingNote] = useState(false)
   const [file, setFile] = useState<File | null>(null)
@@ -147,6 +279,8 @@ function NodeInfoPanel({ node, onChanged }: { node: TreeNode; onChanged: () => v
           })}
         </div>
       )}
+
+      {isLeaf && <NodePartsSection nodeId={node.id} knownParts={knownParts} />}
     </div>
   )
 }
@@ -162,14 +296,64 @@ function flatten(nodes: TreeNode[], depth = 0): { node: TreeNode; depth: number 
   return out
 }
 
+// "Tümü" (birleşik görünüm) için salt-okunur düğüm — düzenleme
+// düğmeleri yok, yaprak maddelerde kart kodunun yanında hangi periyoda ait
+// olduğu (period_label) da rozet olarak gösterilir.
+function MergedNodeView({ node }: { node: MergedTreeNode }) {
+  const [open, setOpen] = useState(true)
+  const isLeaf = node.children.length === 0
+
+  return (
+    <li className="tree-node">
+      <div className={`tree-row ${isLeaf ? 'leaf' : ''}`}>
+        {!isLeaf ? (
+          <button className={`toggle ${open ? 'expanded' : ''}`} onClick={() => setOpen(!open)}>
+            <ChevronRight size={15} />
+          </button>
+        ) : (
+          <span style={{ width: 22, textAlign: 'center' }}>☐</span>
+        )}
+        <span className="node-name">
+          {node.name}
+          {node.card_code && <span className="card-code-pill">{node.card_code}</span>}
+          {isLeaf && node.period_label && (
+            <span className="card-code-pill" style={{ background: 'var(--amber-soft, #fde8c4)', color: 'var(--amber, #92600d)' }}>
+              {node.period_label}
+              {node.is_catalog_only ? ' · katalog' : ''}
+            </span>
+          )}
+          {isLeaf && node.vehicle_model && (
+            <span className="card-code-pill" style={{ background: 'var(--blue-soft, #d6e4ff)', color: 'var(--blue, #1b4da0)' }}>
+              {node.vehicle_model}
+            </span>
+          )}
+        </span>
+      </div>
+      {!isLeaf && (
+        <div className={`tree-children ${open ? 'open' : ''}`}>
+          <div className="tree-children-inner">
+            <ul className="tree-sub">
+              {node.children.map((c) => (
+                <MergedNodeView key={c.id} node={c} />
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
+    </li>
+  )
+}
+
 function EditorNode({
   node,
   onChanged,
   allNodes,
+  knownParts,
 }: {
   node: TreeNode
   onChanged: () => void
   allNodes: { node: TreeNode; depth: number }[]
+  knownParts: { id: number; label: string }[]
 }) {
   const [open, setOpen] = useState(true)
   const [adding, setAdding] = useState(false)
@@ -236,7 +420,10 @@ function EditorNode({
             </button>
           </form>
         ) : (
-          <span className="node-name">{node.name}</span>
+          <span className="node-name">
+            {node.name}
+            {node.card_code && <span className="card-code-pill">{node.card_code}</span>}
+          </span>
         )}
         {!renaming && (
           <span className="row" style={{ marginLeft: 'auto' }}>
@@ -255,7 +442,9 @@ function EditorNode({
           </span>
         )}
       </div>
-      {showInfo && <NodeInfoPanel node={node} onChanged={onChanged} />}
+      {showInfo && (
+        <NodeInfoPanel node={node} onChanged={onChanged} isLeaf={isLeaf} knownParts={knownParts} />
+      )}
       {moving && (
         <div className="row" style={{ padding: '4px 0 4px 30px' }}>
           <select defaultValue="__none" onChange={(e) => e.target.value !== '__none' && move(e.target.value)}>
@@ -282,12 +471,16 @@ function EditorNode({
           <button className="small primary">Ekle</button>
         </form>
       )}
-      {!isLeaf && open && (
-        <ul>
-          {node.children.map((c) => (
-            <EditorNode key={c.id} node={c} onChanged={onChanged} allNodes={allNodes} />
-          ))}
-        </ul>
+      {!isLeaf && (
+        <div className={`tree-children ${open ? 'open' : ''}`}>
+          <div className="tree-children-inner">
+            <ul className="tree-sub">
+              {node.children.map((c) => (
+                <EditorNode key={c.id} node={c} onChanged={onChanged} allNodes={allNodes} knownParts={knownParts} />
+              ))}
+            </ul>
+          </div>
+        </div>
       )}
     </li>
   )
@@ -498,91 +691,374 @@ function Model3DSection({ planId, flatNodes }: { planId: number; flatNodes: Tree
   )
 }
 
-// ---------------------------------------------------------- Excel ile yeni tablo/plan oluşturma
-function ExcelImportSection({
+// ---------------------------------------------------------- Toplu Bakım Kataloğu İçe Aktarma
+// KB TOPLU LİSTE formatı: her satır tek bir bakım kalemi —
+// ARAÇ | BÖLGE | SİSTEM | EKİPMAN | BAKIM | BAKIM KALEMİ | KART KODU.
+// Yukarıdaki "Excel ile Yeni Bakım Tablosu" tek model + sütun-bloklu format
+// beklerken, bu ekran ÇOK modelli, satır-bazlı ve hem km hem süre (aylık/
+// yıllık, "3M"/"1Y" gibi) periyotları tek dosyada barındıran kaynak
+// listeler için — plan+ağaç her benzersiz (model, periyot) için otomatik
+// oluşturulur/güncellenir.
+function BulkCatalogImportSection({
   knownModels,
   onImported,
 }: {
   knownModels: string[]
-  onImported: (planIds: number[], vehicleModel: string) => void
+  onImported: () => void
 }) {
+  const [open, setOpen] = useState(false)
   const [file, setFile] = useState<File | null>(null)
   const [vehicleModel, setVehicleModel] = useState('')
   const [uploading, setUploading] = useState(false)
+  const [previewing, setPreviewing] = useState(false)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<ImportTreeResult | null>(null)
+  const [result, setResult] = useState<BulkCatalogImportResult | null>(null)
 
-  async function upload(e: React.FormEvent) {
-    e.preventDefault()
+  async function runUpload(dryRun: boolean) {
     if (!file) return
-    setUploading(true)
+    if (dryRun) setPreviewing(true)
+    else setUploading(true)
     setError('')
     setResult(null)
     try {
-      const res = await apiUploadWithFields<ImportTreeResult>('/tree/import-excel', file, {
+      const res = await apiUploadWithFields<BulkCatalogImportResult>('/tree/import-bulk-catalog', file, {
         vehicle_model: vehicleModel.trim(),
+        dry_run: dryRun ? 'true' : 'false',
       })
       setResult(res)
-      setFile(null)
-      const input = document.getElementById('tree-excel-input') as HTMLInputElement | null
-      if (input) input.value = ''
-      onImported(res.plans.map((p) => p.id), vehicleModel.trim())
+      if (!dryRun) {
+        setFile(null)
+        const input = document.getElementById('bulk-catalog-input') as HTMLInputElement | null
+        if (input) input.value = ''
+        onImported()
+      }
     } catch (err) {
       setError((err as Error).message)
     } finally {
+      setPreviewing(false)
       setUploading(false)
     }
   }
 
+  async function preview(e: React.FormEvent) {
+    e.preventDefault()
+    await runUpload(true)
+  }
+
+  async function confirmUpload() {
+    await runUpload(false)
+  }
+
   return (
-    <div className="card">
-      <h2 style={{ fontSize: 16, marginBottom: 6 }}>Excel ile Yeni Bakım Tablosu Oluştur</h2>
-      <p className="muted" style={{ marginBottom: 12 }}>
-        Farklı araç modelleri için ayrı bakım ağaçları tanımlayabilirsiniz. Araç modeli alanını
-        boş bırakırsanız plan "Genel" sayılır ve modelinden bağımsız TÜM araçlara uygulanır. Bir
-        model adı girerseniz (ör. "CAF Urbos 100"), bu Excel'den oluşan planlar yalnızca o
-        modeldeki araçlara uygulanır — aynı model adıyla tekrar yüklemek o modelin ağacını
-        tamamen günceller (üzerine yazar), diğer modellere dokunmaz.
-      </p>
-      <form className="row" onSubmit={upload} style={{ flexWrap: 'wrap' }}>
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="row" style={{ justifyContent: 'space-between', cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <strong>
+          <UploadCloud size={15} style={{ marginRight: 6, verticalAlign: -3 }} />
+          Toplu Bakım Kataloğu İçe Aktar (KB Toplu Liste)
+        </strong>
+        <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
+          {open ? 'Gizle' : 'Göster'}
+        </button>
+      </div>
+      {open && (
+        <>
+      <form className="row" onSubmit={preview} style={{ flexWrap: 'wrap', marginTop: 10 }}>
         <input
-          placeholder="Araç modeli (boş = Genel / mevcut filo)"
+          placeholder="Araç modeli (boş = dosyadaki ARAÇ sütunundan otomatik)"
           value={vehicleModel}
           onChange={(e) => setVehicleModel(e.target.value)}
-          list="tree-known-models"
-          style={{ minWidth: 220 }}
+          list="bulk-catalog-known-models"
+          style={{ minWidth: 260 }}
         />
-        <datalist id="tree-known-models">
+        <datalist id="bulk-catalog-known-models">
           {knownModels.map((m) => (
             <option key={m} value={m} />
           ))}
         </datalist>
         <input
-          id="tree-excel-input"
+          id="bulk-catalog-input"
           type="file"
           accept=".xlsx,.xls"
-          onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          onChange={(e) => {
+            setFile(e.target.files?.[0] ?? null)
+            setResult(null)
+          }}
         />
-        <button className="primary" disabled={!file || uploading}>
-          {uploading ? 'İçe aktarılıyor…' : 'Excel Yükle ve Tablo Oluştur'}
+        <button className="secondary" disabled={!file || uploading || previewing}>
+          {previewing ? 'Önizleniyor…' : 'Önizle'}
         </button>
+        {result && result.dry_run && (
+          <button
+            type="button"
+            className="primary"
+            disabled={!file || uploading || previewing}
+            onClick={confirmUpload}
+          >
+            {uploading ? 'İçe aktarılıyor…' : 'Onayla ve Yükle'}
+          </button>
+        )}
       </form>
+      <p className="muted" style={{ marginTop: 6, fontSize: 12.5 }}>
+        Araç modeli seçersen dosyadaki ARAÇ sütunu (varsa) yok sayılır, TÜM satırlar seçtiğin
+        modele uygulanır — ARAÇ sütunu olmayan, tek modele özel dosyalar için kullanışlıdır. Boş
+        bırakırsan (varsayılan) her satırın modeli dosyadaki ARAÇ sütunundan otomatik okunur.
+      </p>
       {error && <div className="error">{error}</div>}
       {result && (
-        <p className="muted" style={{ marginTop: 10 }}>
-          {result.plans.length} plan, {result.nodes_created} düğüm oluşturuldu/güncellendi (
-          {vehicleModel.trim() || 'Genel'}):{' '}
-          {result.plans.map((p) => p.name).join(', ')}
-          {result.maintenances_reset > 0 && (
-            <>
-              {' — '}
-              <span style={{ color: 'var(--amber, #b45309)', fontWeight: 600 }}>
-                {result.maintenances_reset} açık iş emri sıfırlandı
-              </span>
-              , güncel ağaçtan baştan açılacaklar.
-            </>
+        <div className="muted" style={{ marginTop: 10 }}>
+          {result.dry_run && (
+            <p
+              style={{
+                background: 'var(--amber-bg, #fef3c7)',
+                color: 'var(--amber, #92400e)',
+                fontWeight: 600,
+                padding: '6px 10px',
+                borderRadius: 6,
+                marginBottom: 8,
+              }}
+            >
+              Bu bir önizleme — henüz hiçbir şey kaydedilmedi. Sonuçlar uygunsa "Onayla ve Yükle"
+              ile gerçek yüklemeyi yap.
+            </p>
           )}
-        </p>
+          <p>
+            Araç modelleri: <strong>{result.vehicle_models.join(', ') || '—'}</strong> ·{' '}
+            {result.plans_created} yeni plan, {result.plans_updated} güncellenen plan,{' '}
+            {result.nodes_created} düğüm ({result.leaves_created} madde) oluşturuldu.
+          </p>
+          {result.unresolved_period.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <span style={{ color: 'var(--blue, #1b4da0)', fontWeight: 600 }}>
+                {result.unresolved_period.length} satırda periyot belirsiz — atlanmadı, "Periyodu
+                Belirsiz (?)" altında ağaca eklendi, kaynak netleşene kadar "?" olarak kalacak:
+              </span>
+              <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                {result.unresolved_period.map((s, i) => (
+                  <li key={i} style={{ fontSize: 12.5 }}>
+                    Satır {s.row}: {s.reason}
+                    {s.data.length > 0 && (
+                      <span> — {s.data.filter(Boolean).slice(0, 5).join(' / ')}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {result.catalog_only_periods && result.catalog_only_periods.length > 0 && (() => {
+            const rows = result.catalog_only_periods!
+            return (
+              <div style={{ marginTop: 8 }}>
+                <span style={{ color: 'var(--green, #1e7a46)', fontWeight: 600 }}>
+                  {rows.length} periyot bir temel bakımın katı olduğu için "katalog-amaçlı"
+                  işaretlendi — Bakım Planları sayfasında görünmeyecek, kendi başına bakım
+                  açmayacak (temel bakım o katlarda zaten tetiklenir), ama Bakım Ağacı
+                  sayfasında ("Tümü"/kendi periyodu seçilerek) görülebilir/düzenlenebilir:
+                </span>
+                <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                  {rows.slice(0, 12).map((c, i) => (
+                    <li key={i} style={{ fontSize: 12.5 }}>
+                      {c.vehicle_model ? `[${c.vehicle_model}] ` : ''}{c.reason}
+                    </li>
+                  ))}
+                  {rows.length > 12 && (
+                    <li style={{ fontSize: 12.5 }}>…ve {rows.length - 12} tane daha</li>
+                  )}
+                </ul>
+              </div>
+            )
+          })()}
+          {result.skipped.length > 0 && (
+            <div style={{ marginTop: 8 }}>
+              <span style={{ color: 'var(--amber, #b45309)', fontWeight: 600 }}>
+                {result.skipped.length} satır tamamen atlandı (boş satır/alan):
+              </span>
+              <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
+                {result.skipped.map((s, i) => (
+                  <li key={i} style={{ fontSize: 12.5 }}>
+                    Satır {s.row}: {s.reason}
+                    {s.data.length > 0 && (
+                      <span> — {s.data.filter(Boolean).slice(0, 5).join(' / ')}</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------- Katalog periyotları gözden geçirme
+// is_catalog_only planlar (bir temel periyodun katı, ör. 800.000 km) Bakım
+// Planı seçicisinde artık gösterilmiyor — zamanla "unutulan" kat periyotlar
+// birikmesin diye, TÜM modellerdeki bu planları tek listede gösterip
+// gerekirse silebilen küçük bir gözden geçirme paneli.
+function CatalogOnlyPlansPanel({ plans, onChanged }: { plans: Plan[]; onChanged: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [busyId, setBusyId] = useState<number | null>(null)
+  const [error, setError] = useState('')
+
+  const catalogOnly = useMemo(
+    () =>
+      plans
+        .filter((p) => p.is_catalog_only)
+        .sort((a, b) => (a.vehicle_model || '').localeCompare(b.vehicle_model || '', 'tr') || a.interval_km - b.interval_km),
+    [plans],
+  )
+
+  async function remove(p: Plan) {
+    if (!confirm(`"${p.name}" (${p.vehicle_model || 'Genel'}) katalog periyodu silinsin mi?`)) return
+    setBusyId(p.id)
+    setError('')
+    try {
+      await api(`/plans/${p.id}`, { method: 'DELETE' })
+      onChanged()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  if (catalogOnly.length === 0) return null
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="row" style={{ justifyContent: 'space-between', cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <strong>Katalog Periyotları ({catalogOnly.length})</strong>
+        <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
+          {open ? 'Gizle' : 'Göster'}
+        </button>
+      </div>
+      {open && (
+        <>
+          <p className="muted" style={{ marginTop: 8, fontSize: 12.5 }}>
+            Bunlar bir temel periyodun tam katı (ör. 800.000 km, 200.000 km'nin katı) — Bakım
+            Planları'nda ve periyot seçicide gösterilmiyorlar, kendi başlarına bakım
+            tetiklemiyorlar. Kaynak katalogdaki içerikleri artık gerekmiyorsa buradan silinebilir.
+          </p>
+          {error && <div className="error">{error}</div>}
+          <div className="table-scroll" style={{ marginTop: 8 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Araç Modeli</th>
+                  <th>Plan</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {catalogOnly.map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.vehicle_model || 'Genel'}</td>
+                    <td>{p.name}</td>
+                    <td>
+                      <button className="small danger" disabled={busyId === p.id} onClick={() => remove(p)}>
+                        {busyId === p.id ? 'Siliniyor…' : 'Sil'}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------- Araç modeli birleştirme
+// Yanlış yazılmış/eski bir model adının (ör. Excel'den "BOZANKAYA" gelmiş,
+// filodaki gerçek modelle "Bozankaya Tip-1" birebir eşleşmeyen kayıtlar)
+// gerçek filo modeliyle tek elde toplanmasını sağlar — bkz.
+// backend excel_utils.merge_vehicle_model.
+function VehicleModelMergePanel({ knownModels, onMerged }: { knownModels: string[]; onMerged: () => void }) {
+  const [open, setOpen] = useState(false)
+  const [fromModel, setFromModel] = useState('')
+  const [toModel, setToModel] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [result, setResult] = useState<VehicleModelMergeResult | null>(null)
+
+  async function merge(e: React.FormEvent) {
+    e.preventDefault()
+    if (!fromModel.trim() || !toModel.trim() || fromModel.trim() === toModel.trim()) return
+    if (
+      !confirm(
+        `"${fromModel}" modelindeki TÜM araçlar ve planlar "${toModel}" modeline taşınacak. Devam edilsin mi?`,
+      )
+    )
+      return
+    setBusy(true)
+    setError('')
+    setResult(null)
+    try {
+      const res = await api<VehicleModelMergeResult>('/vehicle-models/merge', {
+        method: 'POST',
+        body: { from_model: fromModel.trim(), to_model: toModel.trim() },
+      })
+      setResult(res)
+      setFromModel('')
+      onMerged()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (knownModels.length < 2) return null
+
+  return (
+    <div className="card" style={{ marginBottom: 16 }}>
+      <div className="row" style={{ justifyContent: 'space-between', cursor: 'pointer' }} onClick={() => setOpen(!open)}>
+        <strong>Araç Modeli Birleştir</strong>
+        <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
+          {open ? 'Gizle' : 'Göster'}
+        </button>
+      </div>
+      {open && (
+        <>
+          <p className="muted" style={{ marginTop: 8, fontSize: 12.5 }}>
+            Yanlış yazılmış ya da yinelenen bir model adını (ör. "BOZANKAYA") gerçek filo
+            modeliyle (ör. "Bozankaya Tip-1") birleştirir — o modeldeki tüm araçlar taşınır,
+            planlar mümkünse yeniden adlandırılır, çakışan periyotların tamamlanmış geçmişi
+            korunarak hedef plana taşınır.
+          </p>
+          <form className="row" onSubmit={merge} style={{ flexWrap: 'wrap', marginTop: 8 }}>
+            <select value={fromModel} onChange={(e) => setFromModel(e.target.value)} style={{ minWidth: 200 }}>
+              <option value="">Kaynak model seçin…</option>
+              {knownModels.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+            <span className="muted">→</span>
+            <select value={toModel} onChange={(e) => setToModel(e.target.value)} style={{ minWidth: 200 }}>
+              <option value="">Hedef model seçin…</option>
+              {knownModels.filter((m) => m !== fromModel).map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </select>
+            <button
+              className="primary"
+              disabled={!fromModel.trim() || !toModel.trim() || fromModel.trim() === toModel.trim() || busy}
+            >
+              {busy ? 'Birleştiriliyor…' : 'Birleştir'}
+            </button>
+          </form>
+          {error && <div className="error" style={{ marginTop: 8 }}>{error}</div>}
+          {result && (
+            <p className="muted" style={{ marginTop: 8, fontSize: 12.5 }}>
+              {result.vehicles_moved} araç taşındı, {result.plans_renamed.length} plan yeniden
+              adlandırıldı{result.plans_merged.length > 0 && `, ${result.plans_merged.length} plan çakışma nedeniyle birleştirildi (tamamlanmış geçmiş korundu)`}.
+            </p>
+          )}
+        </>
       )}
     </div>
   )
@@ -595,14 +1071,34 @@ export default function TreeEditorPage() {
   const [flatNodes, setFlatNodes] = useState<TreeNodeFlat[]>([])
   const [newRoot, setNewRoot] = useState('')
   const [modelFilter, setModelFilter] = useState('')
+  const [merged, setMerged] = useState<MergedTreeNode[] | null>(null)
+  const [showAll, setShowAll] = useState(false)
   const [knownModels, setKnownModels] = useState<string[]>([])
+  const [knownParts, setKnownParts] = useState<{ id: number; label: string }[]>([])
 
-  useEffect(() => {
+  // Seçili planın TÜM ağacını (tek tek kök bölüm silmek yerine) bir kerede
+  // boşaltma — plan kaydı ve geçmiş iş emirleri korunur, yalnızca checklist
+  // içeriği silinir.
+  const [clearTreeBusy, setClearTreeBusy] = useState(false)
+  // "Tüm Araçlardan Tüm Ağaçları Sil" — Tehlikeli Bölge (yazarak onay gerekir).
+  const [wipeOpen, setWipeOpen] = useState(false)
+  const [wipeConfirmText, setWipeConfirmText] = useState('')
+  const [wipeBusy, setWipeBusy] = useState(false)
+  const [wipeError, setWipeError] = useState('')
+
+  const loadKnownModels = () =>
     api<string[]>('/vehicle-models').then(setKnownModels).catch(() => setKnownModels([]))
+  useEffect(() => {
+    loadKnownModels()
+    api<PartCatalogItem[]>('/parts').then((ps) => setKnownParts(flattenParts(ps))).catch(() => setKnownParts([]))
   }, [])
 
+  // include_catalog_only=true: bir temel periyodun katı olan (ör. 800.000
+  // km) planlar da dahil TÜMÜ gelsin — bunlar Bakım Planları sayfasında
+  // gizlense de, kaynak katalogdaki içerik burada kaybolmasın diye görünür
+  // kalmalı.
   const loadPlans = (selectId?: number, selectModel?: string) =>
-    api<Plan[]>('/plans').then((ps) => {
+    api<Plan[]>('/plans?include_catalog_only=true').then((ps) => {
       setPlans(ps)
       if (selectModel !== undefined) setModelFilter(selectModel)
       if (selectId !== undefined && ps.some((p) => p.id === selectId)) {
@@ -624,14 +1120,27 @@ export default function TreeEditorPage() {
     return Array.from(set).sort((a, b) => a.localeCompare(b, 'tr'))
   }, [plans])
 
-  const visiblePlans = useMemo(
-    () => plans.filter((p) => (p.vehicle_model || '') === modelFilter),
-    [plans, modelFilter],
-  )
+  // "Genel (mevcut filo)" seçiliyken bu, filodaki tüm araçların/tüm
+  // modellerin bakımlarını gösteren bir "hepsi bir arada" görünüme
+  // dönüşür — yalnızca vehicle_model="" olan planlar değil, TÜM planlar
+  // listelenir (her birinin yanında hangi modele ait olduğu gösterilir,
+  // bkz. aşağıdaki <option> render'ı). Belirli bir model seçiliyse
+  // (Sirio, Bozankaya Tip-1 vb.) yalnızca o modelin planları gösterilir.
+  //
+  // is_catalog_only planlar (ör. 1.500.000 km — 500.000 km'nin katı) bu
+  // seçici listede AYRI bir madde olarak GÖSTERİLMEZ — zaten temel periyot
+  // (ör. 500.000 km Bakımı) o katta da otomatik tetiklenir, listede iki kez
+  // (hem 500.000 hem 1.500.000 olarak) görünmesi kafa karıştırır. İçerikleri
+  // yine de "Tümü" (birleşik görünüm) içinde, periyot etiketiyle görülebilir.
+  const visiblePlans = useMemo(() => {
+    const base = modelFilter === '' ? plans : plans.filter((p) => (p.vehicle_model || '') === modelFilter)
+    return base.filter((p) => !p.is_catalog_only)
+  }, [plans, modelFilter])
 
   // Seçili model değiştiğinde veya o modelde artık plan kalmadığında,
-  // görünür planlardan ilkine geç.
+  // görünür planlardan ilkine geç ("Tümü" seçimini de sıfırla).
   useEffect(() => {
+    setShowAll(false)
     if (visiblePlans.length === 0) {
       setPlanId(null)
     } else if (!visiblePlans.some((p) => p.id === planId)) {
@@ -641,11 +1150,23 @@ export default function TreeEditorPage() {
   }, [modelFilter, plans])
 
   const load = () => {
-    if (planId === null) return
+    if (planId === null || showAll) return
     api<TreeNode[]>(`/tree?plan_id=${planId}`).then(setTree).catch(() => setTree([]))
     api<TreeNodeFlat[]>(`/tree/flat?plan_id=${planId}`).then(setFlatNodes).catch(() => setFlatNodes([]))
   }
-  useEffect(load, [planId])
+  useEffect(load, [planId, showAll])
+
+  // "Tümü" (birleşik görünüm): o modeldeki (ya da "Genel (mevcut filo)"
+  // seçiliyken TÜM modellerin — all_models=true) planlarının ağaçlarını,
+  // her maddenin yanında periyot (ve tüm-modeller modunda araç modeli)
+  // etiketiyle birlikte birleştirip gösteren salt-okunur görünüm.
+  useEffect(() => {
+    if (!showAll) return
+    const qs = modelFilter === '' ? 'all_models=true' : `vehicle_model=${encodeURIComponent(modelFilter)}`
+    api<MergedTreeNode[]>(`/tree/merged?${qs}`)
+      .then(setMerged)
+      .catch(() => setMerged([]))
+  }, [showAll, modelFilter])
 
   async function addRoot(e: React.FormEvent) {
     e.preventDefault()
@@ -655,19 +1176,54 @@ export default function TreeEditorPage() {
     load()
   }
 
+  const currentPlan = visiblePlans.find((p) => p.id === planId) ?? plans.find((p) => p.id === planId) ?? null
+
+  // Seçili planın TÜM ağacını (her kök bölümü tek tek silmek yerine) bir
+  // kerede boşaltır — plan kaydı ve geçmiş iş emirleri korunur.
+  async function clearCurrentPlanTree() {
+    if (planId === null || !currentPlan) return
+    if (
+      !confirm(
+        `"${currentPlan.name}" (${currentPlan.vehicle_model || 'Genel'}) planının TÜM ağacı (tüm bölümler/maddeler) silinsin mi? Bu işlem geri alınamaz.`,
+      )
+    )
+      return
+    setClearTreeBusy(true)
+    try {
+      await api(`/tree/plan/${planId}`, { method: 'DELETE' })
+      load()
+    } finally {
+      setClearTreeBusy(false)
+    }
+  }
+
+  // Tehlikeli Bölge: TÜM planlardaki/araç modellerindeki bakım ağaçlarını
+  // tek seferde tamamen boşaltır (planların kendisi/geçmiş iş emirleri
+  // korunur). Yanlışlıkla tıklamayı önlemek için "SİL" yazarak onay gerekir.
+  async function wipeAllTrees() {
+    if (wipeConfirmText.trim().toUpperCase() !== 'SİL') return
+    setWipeBusy(true)
+    setWipeError('')
+    try {
+      await api('/tree', { method: 'DELETE' })
+      setWipeOpen(false)
+      setWipeConfirmText('')
+      load()
+      loadPlans()
+    } catch (e) {
+      setWipeError((e as Error).message)
+    } finally {
+      setWipeBusy(false)
+    }
+  }
+
   const all = flatten(tree)
 
   return (
     <>
-      <PageHeader
-        title="Bakım Ağacı Şablonu"
-        subtitle="Her bakım planının kendi bakım ağacı vardır. Bu şablon, o plana göre yeni açılan her bakıma kopyalanır; değişiklikler zaten açık olan bakımları etkilemez. Her seviyede sınırsız ekleme, yeniden adlandırma, taşıma ve silme yapabilirsiniz."
-      />
+      <PageHeader title="Bakım Ağacı Şablonu" />
 
-      <ExcelImportSection
-        knownModels={knownModels}
-        onImported={(ids, vehicleModel) => loadPlans(ids[0], vehicleModel)}
-      />
+      <BulkCatalogImportSection knownModels={knownModels} onImported={() => loadPlans()} />
 
       <div className="card">
         <div className="row" style={{ flexWrap: 'wrap' }}>
@@ -688,50 +1244,152 @@ export default function TreeEditorPage() {
           </select>
           <strong style={{ marginLeft: 12 }}>Bakım Planı:</strong>
           <select
-            value={planId ?? ''}
-            onChange={(e) => setPlanId(Number(e.target.value))}
-            style={{ minWidth: 220 }}
+            value={showAll ? ALL_PLANS_VALUE : planId ?? ''}
+            onChange={(e) => {
+              if (e.target.value === ALL_PLANS_VALUE) {
+                setShowAll(true)
+              } else {
+                setShowAll(false)
+                setPlanId(Number(e.target.value))
+              }
+            }}
+            style={{ minWidth: 260 }}
           >
+            {visiblePlans.length > 0 && (
+              <option value={ALL_PLANS_VALUE}>
+                {modelFilter === '' ? 'Tümü (tüm modeller, birleşik görünüm)' : 'Tümü (birleşik görünüm)'}
+              </option>
+            )}
             {visiblePlans.map((p) => (
               <option key={p.id} value={p.id}>
-                {p.name} ({fmtKm(p.interval_km)} km)
+                {p.name} ({planPeriodLabel(p)})
+                {modelFilter === '' ? ` — ${p.vehicle_model || 'Genel'}` : ''}
               </option>
             ))}
           </select>
           {visiblePlans.length === 0 && (
             <span className="muted">
-              Bu modele ait plan yok — yukarıdan bu model için Excel yükleyin ya da "Bakım
-              Planları" sayfasından elle oluşturun.
+              Bu modele ait plan yok — yukarıda "Toplu Bakım Kataloğu İçe Aktar" ile Excel
+              yükleyin ya da "Bakım Planları" sayfasından elle oluşturun.
             </span>
           )}
         </div>
       </div>
 
-      {planId !== null && (
-        <>
-          <div className="card">
-            <form className="row" onSubmit={addRoot}>
-              <input
-                placeholder="Yeni ana bölüm (ör. Araç İçi)"
-                value={newRoot}
-                onChange={(e) => setNewRoot(e.target.value)}
-              />
-              <button className="primary">Ana Bölüm Ekle</button>
-            </form>
-          </div>
-          <div className="card">
+      <CatalogOnlyPlansPanel plans={plans} onChanged={() => loadPlans()} />
+
+      <VehicleModelMergePanel
+        knownModels={knownModels}
+        onMerged={() => {
+          loadKnownModels()
+          loadPlans()
+        }}
+      />
+
+      {showAll ? (
+        <div className="card">
+          {merged === null && <div className="muted">Yükleniyor…</div>}
+          {merged !== null && merged.length === 0 && (
+            <div className="muted">Bu model için henüz hiçbir planda bölüm yok.</div>
+          )}
+          {merged !== null && merged.length > 0 && (
             <ul className="tree">
-              {tree.map((n) => (
-                <EditorNode key={n.id} node={n} onChanged={load} allNodes={all} />
+              {merged.map((n) => (
+                <MergedNodeView key={n.id} node={n} />
               ))}
             </ul>
-            {tree.length === 0 && (
-              <div className="muted">Bu plan için henüz bölüm yok. Yukarıdan ekleyin.</div>
-            )}
-          </div>
-          <Model3DSection planId={planId} flatNodes={flatNodes} />
-        </>
+          )}
+        </div>
+      ) : (
+        planId !== null && (
+          <>
+            <div className="card">
+              <form className="row" onSubmit={addRoot}>
+                <input
+                  placeholder="Yeni ana bölüm (ör. Araç İçi)"
+                  value={newRoot}
+                  onChange={(e) => setNewRoot(e.target.value)}
+                />
+                <button className="primary">Ana Bölüm Ekle</button>
+                {tree.length > 0 && (
+                  <button
+                    type="button"
+                    className="small danger"
+                    style={{ marginLeft: 'auto' }}
+                    disabled={clearTreeBusy}
+                    onClick={clearCurrentPlanTree}
+                    title="Bu planın tüm ağacını (tüm bölüm/maddeleri) siler — plan kaydı ve geçmiş iş emirleri korunur"
+                  >
+                    <Trash2 size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                    {clearTreeBusy ? 'Siliniyor…' : 'Bu Planın Ağacını Tamamen Sil'}
+                  </button>
+                )}
+              </form>
+            </div>
+            <div className="card">
+              <ul className="tree">
+                {tree.map((n) => (
+                  <EditorNode key={n.id} node={n} onChanged={load} allNodes={all} knownParts={knownParts} />
+                ))}
+              </ul>
+              {tree.length === 0 && (
+                <div className="muted">Bu plan için henüz bölüm yok. Yukarıdan ekleyin.</div>
+              )}
+            </div>
+            <Model3DSection planId={planId} flatNodes={flatNodes} />
+          </>
+        )
       )}
+
+      <div className="card" style={{ marginTop: 20, borderColor: 'var(--red)', background: 'var(--red-light)' }}>
+        <div className="card-head">
+          <div>
+            <div className="card-title" style={{ color: 'var(--red)' }}>
+              <ShieldAlert size={15} style={{ marginRight: 6, verticalAlign: -3 }} />
+              Tehlikeli Bölge
+            </div>
+            <div className="card-subtitle">
+              Tüm araç modellerindeki TÜM bakım ağaçları (tüm bölüm/maddeler) kalıcı olarak
+              silinir. Planların kendisi ve geçmiş iş emirleri korunur — yalnızca checklist
+              içeriği boşaltılır. Bu işlem geri alınamaz.
+            </div>
+          </div>
+        </div>
+        {wipeError && <div className="error">{wipeError}</div>}
+        {!wipeOpen ? (
+          <button className="small danger" onClick={() => setWipeOpen(true)}>
+            <Trash2 size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+            Tüm Araçlardan Tüm Ağaçları Sil
+          </button>
+        ) : (
+          <div className="row" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 13 }}>
+              Onaylamak için kutuya <strong>SİL</strong> yazın:
+            </span>
+            <input
+              style={{ width: 100 }}
+              value={wipeConfirmText}
+              onChange={(e) => setWipeConfirmText(e.target.value)}
+              placeholder="SİL"
+              autoFocus
+            />
+            <button
+              className="small danger"
+              disabled={wipeBusy || wipeConfirmText.trim().toUpperCase() !== 'SİL'}
+              onClick={wipeAllTrees}
+            >
+              {wipeBusy ? 'Siliniyor…' : 'Kalıcı Olarak Sil'}
+            </button>
+            <button
+              className="small"
+              type="button"
+              onClick={() => { setWipeOpen(false); setWipeConfirmText(''); setWipeError('') }}
+            >
+              Vazgeç
+            </button>
+          </div>
+        )}
+      </div>
     </>
   )
 }

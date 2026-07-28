@@ -1,6 +1,26 @@
 services:
   app:
+    # Hem "build:" hem "image:" birlikte tanımlı — iki farklı kullanım
+    # tek dosyada bir arada çalışır:
+    #  · Kodu kendiniz değiştirip test ediyorsanız: yine eskisi gibi
+    #    "docker compose up -d --build" yazarsınız, yereldeki Dockerfile'dan
+    #    derler (README'deki adım değişmedi).
+    #  · Sunucuda/üretimde çalıştırıyorsanız: artık HİÇBİR komut yazmaya
+    #    gerek yok. GitHub Actions her push'ta imajı otomatik derleyip GHCR'a
+    #    (ghcr.io) yüklüyor (bkz. .github/workflows/ci.yml → docker-image
+    #    job'u), "pull_policy: always" sayesinde düz "docker compose up -d"
+    #    (--build OLMADAN) her zaman en güncel imajı çeker, ve aşağıdaki
+    #    "watchtower" servisi de yeni bir sürüm çıktığında container'ı
+    #    kendisi fark edip indirip yeniden başlatır — yani ilk kurulumdan
+    #    sonra tek bir komut bile yazmanıza gerek kalmaz.
     build: .
+    image: ghcr.io/beyziki/ulasim-bakim:latest
+    pull_policy: always
+    labels:
+      # Watchtower yalnızca bu etikete sahip container'ları izler (aşağıda
+      # WATCHTOWER_LABEL_ENABLE=true ile) — sunucuda başka container'lar
+      # varsa onlara dokunulmaz.
+      - "com.centurylinklabs.watchtower.enable=true"
     container_name: ulasim-bakim
     ports:
       - "8000:8000"
@@ -45,6 +65,40 @@ services:
       - backups:/app/backups                   # otomatik veritabanı yedekleri (db-data'dan AYRI volume — db-data silinse/bozulsa bile yedekler korunur)
       - model-cache:/app/model_cache            # arka plan kaldırma AI modeli önbelleği
       - logs:/app/logs                          # merkezi loglama (uygulama/hata/erişim logları)
+    restart: unless-stopped
+
+  # Watchtower — GHCR'daki "ulasim-bakim:latest" imajının yeni bir sürümü
+  # yüklendiğinde (yani GitHub Actions bir push sonrası imajı güncellediğinde)
+  # bunu periyodik olarak kontrol eder, farkederse imajı indirip "app"
+  # container'ını otomatik olarak yeni sürümle yeniden başlatır. Bu sayede
+  # sunucuda elle "docker compose pull && docker compose up -d" (ya da
+  # "--build") yazmaya hiç gerek kalmaz.
+  #
+  # GHCR paketi PRIVATE ise (varsayılan budur) Watchtower'ın imajı
+  # indirebilmesi için sunucuda BİR KEZ giriş yapmanız gerekir:
+  #   docker login ghcr.io -u <github-kullanıcı-adınız> -p <PAT (read:packages)>
+  # Bu, docker daemon'ın kimlik bilgilerini yerelde saklamasını sağlar ve
+  # Watchtower bunları otomatik kullanır (ekstra ayar gerekmez). Alternatif
+  # olarak GHCR paket ayarlarından "Change visibility → Public" yaparsanız
+  # login adımına hiç gerek kalmaz.
+  watchtower:
+    image: containrrr/watchtower
+    container_name: ulasim-bakim-watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      # Yalnızca "com.centurylinklabs.watchtower.enable=true" etiketli
+      # container'ları izler (yukarıdaki "app" servisi) — sunucudaki diğer
+      # container'lara dokunmaz.
+      WATCHTOWER_LABEL_ENABLE: "true"
+      # Her 5 dakikada bir GHCR'ı kontrol eder (saniye cinsinden).
+      WATCHTOWER_POLL_INTERVAL: "300"
+      # Güncelledikten sonra eski (artık kullanılmayan) imajları temizler,
+      # disk dolmasın diye.
+      WATCHTOWER_CLEANUP: "true"
+      # Yalnızca bu container'ı güncelle, kendi kendini yeniden başlatma
+      # döngüsüne girme.
+      WATCHTOWER_INCLUDE_RESTARTING: "false"
     restart: unless-stopped
 
 volumes:

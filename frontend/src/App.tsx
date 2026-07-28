@@ -1,8 +1,10 @@
-import { useEffect, useState, type ReactElement } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { api, refreshAccessToken, revokeRefreshToken, setRefreshToken, setToken } from './api'
+import { startLiveEvents, stopLiveEvents, restartLiveEvents } from './liveEvents'
 import type { MyPermissions, SearchHit, User } from './types'
 import { ROLE_TR } from './types'
 import Login from './pages/Login'
+import ParticleNetwork from './components/ParticleNetwork'
 import DashboardPage from './pages/DashboardPage'
 import MaintenancesPage from './pages/MaintenancesPage'
 import HistoryPage from './pages/HistoryPage'
@@ -17,8 +19,12 @@ import ProfilePage from './pages/ProfilePage'
 import PartsCatalogPage from './pages/PartsCatalogPage'
 import AlarmCenterPage from './pages/AlarmCenterPage'
 import SuggestionsPage from './pages/SuggestionsPage'
+import SystemStatusPage from './pages/SystemStatusPage'
+import HelpPage from './pages/HelpPage'
 import { Avatar } from './components/ui'
 import TopbarTools, { type HitType } from './components/TopbarTools'
+import { ToastHost } from './components/toast'
+import { OnboardingTour, ONBOARDING_STEPS } from './components/onboarding'
 import {
   LayoutDashboard,
   Workflow,
@@ -37,9 +43,13 @@ import {
   PackageSearch,
   Siren,
   Lightbulb,
+  ChevronLeft,
+  ChevronRight,
+  Activity,
+  HelpCircle,
 } from 'lucide-react'
 
-type Page =
+export type Page =
   | 'dashboard'
   | 'alarms'
   | 'maintenances'
@@ -53,6 +63,8 @@ type Page =
   | 'users'
   | 'permissions'
   | 'audit'
+  | 'system'
+  | 'help'
   | 'profile'
 
 type Theme = 'light' | 'dark'
@@ -71,6 +83,8 @@ const NAV_ICONS: Record<Page, ReactElement> = {
   users: <UsersIcon size={17} />,
   permissions: <ShieldCheck size={17} />,
   audit: <ScrollText size={17} />,
+  system: <Activity size={17} />,
+  help: <HelpCircle size={17} />,
   profile: <UserCircle2 size={17} />,
 }
 
@@ -88,6 +102,8 @@ const PAGE_TITLES: Record<Page, string> = {
   users: 'Kullanıcılar',
   permissions: 'Yetki Yönetimi',
   audit: 'İşlem Kayıtları',
+  system: 'Sistem Durumu',
+  help: 'Yardım',
   profile: 'Profil',
 }
 
@@ -101,9 +117,30 @@ export default function App() {
   const [openVehicleId, setOpenVehicleId] = useState<number | null>(null)
   const [openPartId, setOpenPartId] = useState<number | null>(null)
   const [navOpen, setNavOpen] = useState(false)
+  // Masaüstünde kenar çubuğu daraltılıp (yalnızca ikonlar) genişletilebilir
+  // ("içe girip çıkabilir") — tercih tarayıcıda hatırlanır. Mobilde zaten
+  // navOpen ile tam ekran açılıp kapanıyor, bu ayrı bir özellik (bkz. CSS'te
+  // masaüstüne özel medya sorgusu).
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    () => localStorage.getItem('sidebar_collapsed') === '1',
+  )
   const [theme, setTheme] = useState<Theme>(
     () => (localStorage.getItem('theme') as Theme | null) ?? 'light',
   )
+  // Eğitim turu (onboarding) — bkz. components/onboarding.tsx. Kullanıcı
+  // adına özel localStorage bayrağıyla yalnızca ilk girişte bir kez
+  // otomatik açılır; topbar'daki "?" butonundan istendiğinde tekrar
+  // başlatılabilir (bu durumda bayrak tekrar yazılsa da zararsızdır).
+  const [tourActive, setTourActive] = useState(false)
+  // Hangi kullanıcı adı için otomatik başlatmayı zaten denediğimizi tutar —
+  // bir booleandan farklı olarak, aynı sekmede çıkış yapıp BAŞKA bir hesapla
+  // girildiğinde (sayfa yenilenmeden) her hesap için ayrı ayrı kontrol
+  // edilmesini sağlar.
+  const tourAutoTriedForRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    localStorage.setItem('sidebar_collapsed', sidebarCollapsed ? '1' : '0')
+  }, [sidebarCollapsed])
 
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
@@ -142,6 +179,26 @@ export default function App() {
     boot().finally(() => setLoading(false))
   }, [])
 
+  function tourStorageKey(username: string) {
+    return `ulasim_bakim_onboarding_done_${username}`
+  }
+
+  // Kullanıcı bilgisi geldikten sonra, bu hesap için tur daha önce
+  // görülmemişse (localStorage'da bayrak yoksa) kısa bir gecikmeyle
+  // otomatik başlatılır — sayfa ilk açıldığında içerik otursun diye.
+  useEffect(() => {
+    if (!user || tourAutoTriedForRef.current === user.username) return
+    tourAutoTriedForRef.current = user.username
+    if (localStorage.getItem(tourStorageKey(user.username))) return
+    const t = setTimeout(() => setTourActive(true), 900)
+    return () => clearTimeout(t)
+  }, [user])
+
+  function closeTour() {
+    setTourActive(false)
+    if (user) localStorage.setItem(tourStorageKey(user.username), '1')
+  }
+
   // Erişim jetonu artık kısa ömürlü (2 saat — bkz. backend/app/auth.py);
   // oturumun kesintisiz kalması için sekme açıkken periyodik olarak
   // sessizce yenilenir (Faz 23 — JWT + Refresh Token). Başarısız olursa
@@ -151,8 +208,24 @@ export default function App() {
   // riskli bir 401-yakala-yeniden-dene mekanizmasına göre çok daha güvenli.
   useEffect(() => {
     if (!user) return
-    const id = setInterval(() => { refreshAccessToken() }, 20 * 60 * 1000)
+    const id = setInterval(() => {
+      refreshAccessToken().then((ok) => { if (ok) restartLiveEvents() })
+    }, 20 * 60 * 1000)
     return () => clearInterval(id)
+  }, [user])
+
+  // Canlı Güncelleme (SSE) — oturum açıkken bağlan, çıkış yapılınca kapat.
+  // Bir başkasının yaptığı değişiklik (bakım tamamlama, alarm onaylama, km
+  // güncelleme vb.) sayfa yenilenmeden anında yansısın diye (bkz.
+  // liveEvents.ts / useLiveEvent) — mevcut sayfa-bazlı polling (setInterval)
+  // yedek olarak kalmaya devam eder, SSE yalnızca onu hızlandırır.
+  useEffect(() => {
+    if (!user) {
+      stopLiveEvents()
+      return
+    }
+    startLiveEvents()
+    return () => stopLiveEvents()
   }, [user])
 
   // QR kod ile açılan derin bağlantıyı uygular: ?vehicle_id=… aracın
@@ -191,9 +264,12 @@ export default function App() {
       setJumpToMaintenance(null)
       setMaintFilter(null)
     }
-    // Menüden Araçlar'a geçişte, önceden global aramadan açılmış bir araç
-    // profili varsa temizle (liste görünümüyle başlasın).
-    if (next === 'vehicles') setOpenVehicleId(null)
+    // Menüden Araçlar'a geçişte, önceden global aramadan/Dashboard'dan
+    // açılmış bir araç profili varsa temizle (liste görünümüyle başlasın).
+    // Araçlar sayfasından BAŞKA bir sayfaya çıkarken de aynı şekilde
+    // temizlenir — böylece bir dahaki sefere normal menüden (deep-link
+    // olmadan) girildiğinde asla eski açık araç "yapışık" kalmaz.
+    if (next === 'vehicles' || page === 'vehicles') setOpenVehicleId(null)
     if (next === 'parts') setOpenPartId(null)
     setPage(next)
     setNavOpen(false)
@@ -246,20 +322,27 @@ export default function App() {
 
   const menu: { key: Page; label: string; show: boolean }[] = [
     { key: 'dashboard', label: 'Dashboard', show: true },
-    { key: 'alarms', label: 'Canlı Alarm Merkezi', show: true },
-    { key: 'tree', label: 'Bakım Ağacı', show: isAdmin },
+    { key: 'alarms', label: 'Canlı Alarm Merkezi', show: isStaff },
     { key: 'maintenances', label: 'Bakımlar', show: true },
     { key: 'calendar', label: 'Takvim', show: true },
-    { key: 'history', label: 'Bakım Geçmişi', show: true },
     { key: 'vehicles', label: 'Araçlar', show: isStaff },
+    { key: 'history', label: 'Bakım Geçmişi', show: true },
     { key: 'plans', label: 'Bakım Planları', show: isAdmin },
+    { key: 'tree', label: 'Bakım Ağacı', show: isAdmin },
     { key: 'parts', label: 'Parça Bilgi Bankası', show: true },
     { key: 'suggestions', label: 'Öneriler', show: true },
     { key: 'users', label: 'Kullanıcılar', show: canManageUsers },
     { key: 'permissions', label: 'Yetki Yönetimi', show: isAdmin },
     { key: 'audit', label: 'İşlem Kayıtları', show: isAdmin },
+    { key: 'system', label: 'Sistem Durumu', show: isAdmin },
+    { key: 'help', label: 'Yardım', show: true },
     { key: 'profile', label: 'Profil', show: true },
   ]
+
+  // Eğitim turu yalnızca bu kullanıcının menüsünde görünen sayfalara ait
+  // adımları içersin (ör. usta girişinde Araçlar/Planlar adımları atlanır).
+  const visibleTourPages = new Set(menu.filter((m) => m.show).map((m) => m.key))
+  const tourSteps = ONBOARDING_STEPS.filter((s) => visibleTourPages.has(s.page))
 
   function openMaintenance(id: number) {
     setJumpToMaintenance(id)
@@ -305,9 +388,14 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      <ToastHost />
+      {tourActive && tourSteps.length > 0 && (
+        <OnboardingTour steps={tourSteps} currentPage={page} onNavigate={navigate} onClose={closeTour} />
+      )}
       {navOpen && <div className="nav-backdrop" onClick={() => setNavOpen(false)} />}
-      <aside className={`sidebar${navOpen ? ' nav-open' : ''}`}>
+      <aside className={`sidebar${navOpen ? ' nav-open' : ''}${sidebarCollapsed ? ' collapsed' : ''}`}>
         <div className="brand">
+          <ParticleNetwork particleDensity={0.00025} minParticles={10} maxParticles={26} linkDistance={70} mouseLinkDistance={90} />
           <span className="logo-dot">
             <Box size={17} />
           </span>
@@ -315,6 +403,15 @@ export default function App() {
             Ulaşım Bakım
             <small>Yönetim Sistemi</small>
           </span>
+        </div>
+        <div className="sidebar-toggle-row">
+          <button
+            className="sidebar-collapse-btn"
+            title={sidebarCollapsed ? 'Kenar çubuğunu genişlet' : 'Kenar çubuğunu daralt'}
+            onClick={() => setSidebarCollapsed((v) => !v)}
+          >
+            {sidebarCollapsed ? <ChevronRight size={15} /> : <ChevronLeft size={15} />}
+          </button>
         </div>
         <div className="sidebar-divider" />
         <nav>
@@ -325,10 +422,11 @@ export default function App() {
               <button
                 key={m.key}
                 className={page === m.key ? 'active' : ''}
+                title={sidebarCollapsed ? m.label : undefined}
                 onClick={() => navigate(m.key)}
               >
                 <span className="nav-icon">{NAV_ICONS[m.key]}</span>
-                {m.label}
+                <span className="nav-label">{m.label}</span>
               </button>
             ))}
         </nav>
@@ -374,12 +472,15 @@ export default function App() {
             allow={searchAllow}
             onPick={handleSearchPick}
             onOpenMaintenance={openMaintenance}
+            onStartTour={() => setTourActive(true)}
           />
         </div>
         <main className="content">
+          <div key={page} className="page-transition">
           {page === 'dashboard' && (
             <DashboardPage
               user={user}
+              perms={p}
               onOpenMaintenance={openMaintenance}
               onGoToMaintenances={() => navigate('maintenances')}
               onFilterMaintenances={goToFilteredMaintenances}
@@ -395,14 +496,14 @@ export default function App() {
               initialPlanName={maintFilter?.planName}
             />
           )}
-          {page === 'alarms' && (
+          {page === 'alarms' && isStaff && (
             <AlarmCenterPage
               onOpenMaintenance={openMaintenance}
               onOpenVehicle={openVehicleProfile}
             />
           )}
           {page === 'calendar' && (
-            <CalendarPage onOpenMaintenance={openMaintenance} />
+            <CalendarPage perms={p} onOpenMaintenance={openMaintenance} />
           )}
           {page === 'history' && (
             <HistoryPage user={user} perms={p} onOpenMaintenance={openMaintenance} />
@@ -422,9 +523,12 @@ export default function App() {
           {page === 'users' && canManageUsers && <UsersPage currentUser={user} />}
           {page === 'permissions' && isAdmin && <PermissionsPage />}
           {page === 'audit' && isAdmin && <AuditLogPage />}
+          {page === 'system' && isAdmin && <SystemStatusPage />}
+          {page === 'help' && <HelpPage isAdmin={isAdmin} isStaff={isStaff} />}
           {page === 'profile' && (
             <ProfilePage user={user} theme={theme} onThemeChange={setTheme} onUserUpdate={setUser} />
           )}
+          </div>
         </main>
       </div>
     </div>

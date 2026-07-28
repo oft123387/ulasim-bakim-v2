@@ -7,6 +7,13 @@ export function setToken(t: string | null) {
   else sessionStorage.removeItem('token')
 }
 
+/** Canlı güncelleme (SSE) bağlantısı token'ı URL sorgu parametresi olarak
+ * taşımak zorunda olduğu için (EventSource özel başlık gönderemez) — bkz.
+ * liveEvents.ts. */
+export function getToken(): string | null {
+  return token
+}
+
 export function setRefreshToken(t: string | null) {
   refreshToken = t
   if (t) sessionStorage.setItem('refreshToken', t)

@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from . import models
+from . import events, models
 
 # main.py'deki _capture_request_context middleware'i her istekte bu iki
 # değişkeni doldurur; log_action bunları otomatik okuyarak denetim kaydına
@@ -20,22 +20,30 @@ REQUEST_UA: ContextVar[str] = ContextVar("REQUEST_UA", default="")
 
 # ------------------------------------------------------ açık bakım tekilleştirme
 def dedupe_open_by_vehicle(open_maintenances: list["models.Maintenance"]) -> list["models.Maintenance"]:
-    """Aynı araç için birden fazla açık (Bekliyor/Devam Ediyor) iş emri
-    varsa yalnızca hedef km'si en büyük olanı döner — küçük periyotlar
-    (ör. 25.000/50.000 km) zaten o büyük bakımın kombine checklist'ine
-    dahildir, ayrı sayılmaz/gösterilmez. Yalnızca TAMAMLANMAMIŞ kayıtlar
-    verilmeli (tamamlananlar geçmiş kayıt olduğu için bu tekilleştirmeye
-    tabi değildir — ayrıca sayılır).
+    """Aynı araç için, AYNI TÜRDEN (km ya da süre) birden fazla açık
+    (Bekliyor/Devam Ediyor) iş emri varsa yalnızca hedefi en büyük olanı
+    döner — küçük periyotlar (ör. 25.000/50.000 km ya da 3 ay/1 yıl) zaten
+    o büyük bakımın kombine checklist'ine dahildir, ayrı sayılmaz/gösterilmez.
+    KM bazlı ve SÜRE bazlı bakımlar birbirinden tamamen bağımsız iş akışları
+    olduğu için (biri diğerinin checklist'ini kapsamaz) asla birbirini
+    gizlemez — anahtar (vehicle_id, plan.plan_type) ikilisidir. Yalnızca
+    TAMAMLANMAMIŞ kayıtlar verilmeli (tamamlananlar geçmiş kayıt olduğu için
+    bu tekilleştirmeye tabi değildir — ayrıca sayılır).
 
     Dashboard'daki "Bekleyen Bakım" sayısı ile Bakımlar sayfasındaki
     listenin (aynı mantığı istemci tarafında uygulayan) tutarlı olması
     için bu tek yerde tutulur."""
-    best_by_vehicle: dict[int, models.Maintenance] = {}
+    best_by_key: dict[tuple[int, str], models.Maintenance] = {}
     for m in open_maintenances:
-        cur = best_by_vehicle.get(m.vehicle_id)
-        if cur is None or m.target_km > cur.target_km:
-            best_by_vehicle[m.vehicle_id] = m
-    return list(best_by_vehicle.values())
+        plan_type = getattr(m.plan, "plan_type", "km") if m.plan else "km"
+        key = (m.vehicle_id, plan_type)
+        cur = best_by_key.get(key)
+        # target_km süre bakımlarında negatif sentinel'dir (-hedef ay sayısı);
+        # abs() alınca km'de olduğu gibi "büyük periyot = daha yönetici/daha
+        # ileri" karşılaştırması her iki türde de doğru sonucu verir.
+        if cur is None or abs(m.target_km) > abs(cur.target_km):
+            best_by_key[key] = m
+    return list(best_by_key.values())
 
 
 # ---------------------------------------------------------------- audit log
@@ -81,6 +89,11 @@ def log_action(
         db.commit()
     else:
         db.flush()
+    # Bağlı tüm istemcilere (bkz. events.py, /api/events/stream) "bir şey
+    # değişti" sinyali gönderir — log_action neredeyse her mutasyon
+    # endpoint'inden çağrıldığı için (main.py) bu, ayrı ayrı her endpoint'e
+    # yayın kodu eklemek yerine tek, merkezi bir kanca (hook) noktasıdır.
+    events.broadcast(entity_type, action)
     return entry
 
 # Dashboard/Araçlar listesinde "yaklaşan bakım" olarak gösterilecek sabit
@@ -103,6 +116,19 @@ URGENT_WITHIN_DAYS = 14
 # sayfasında ayrıca vurgulanır (ör. kırmızı yerine daha koyu/parlayan ton).
 CRITICAL_WITHIN_DAYS = 7
 CRITICAL_WITHIN_KM = 1000
+
+
+def plan_window(plan: "models.MaintenancePlan", target: int) -> tuple[float, float]:
+    """Bir planın belirli bir hedef km için açılma (tolerans) penceresini
+    (alt, üst) döner. Plan.threshold_type'a göre ya yüzdelik (periyoda
+    bağlı) ya da sabit km (periyottan bağımsız) hesaplanır — bkz.
+    MaintenancePlan model docstring'i."""
+    if plan.threshold_type == "km":
+        return target - plan.lower_km, target + plan.upper_km
+    return (
+        target - plan.interval_km * plan.lower_pct / 100,
+        target + plan.interval_km * plan.upper_pct / 100,
+    )
 
 
 # ---------------------------------------------------------------- bakım açma
@@ -146,10 +172,15 @@ def check_and_open_maintenances(
     plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
     # Yalnızca "genel" (vehicle_model="") planlar veya bu aracın modeliyle
     # birebir eşleşen planlar uygulanır — farklı araç modelleri için ayrı
-    # yüklenmiş bakım ağaçları birbirine karışmaz.
+    # yüklenmiş bakım ağaçları birbirine karışmaz. Katalog-amaçlı planlar
+    # (is_catalog_only — bir temel periyodun katı, ör. 800.000 km) kendi
+    # başına bakım TETİKLEMEZ; onu bölen temel plan (ör. 200.000 km) zaten
+    # o katta da tetiklenir (bkz. excel_utils.canonical_base_interval).
     active_plans = [
         p for p in plans
-        if p.interval_km > 0 and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+        if p.interval_km > 0
+        and not p.is_catalog_only
+        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
     ]
     if not active_plans:
         return opened
@@ -176,8 +207,7 @@ def check_and_open_maintenances(
             continue
         governing = max(applicable, key=lambda p: p.interval_km)
 
-        lower = target - governing.interval_km * governing.lower_pct / 100
-        upper = target + governing.interval_km * governing.upper_pct / 100
+        lower, upper = plan_window(governing, target)
         if not (lower <= km <= upper):
             continue
 
@@ -195,6 +225,9 @@ def check_and_open_maintenances(
             target_km=target,
             km_at_open=km,
             status="pending",
+            # Faz 26: otomatik açılan aday, admin/mühendis "Başlat" demeden
+            # hiçbir listede (Bakımlar/Takvim/Dashboard/Alarm Merkezi) görünmez.
+            is_activated=False,
         )
         db.add(m)
         db.flush()
@@ -204,6 +237,292 @@ def check_and_open_maintenances(
     if opened:
         db.commit()
     return opened
+
+
+# ---------------------------------------------------------------- süre bazlı (aylık/yıllık) bakım açma
+def default_plan_name(plan_type: str, interval_km: int, interval_months: int | None) -> str:
+    """Admin plan adını boş bırakırsa türe göre otomatik, tutarlı bir ad
+    üretir — km planlarında mevcut "25.000 km Bakımı" kuralıyla aynı biçim,
+    süre planlarında "3 Aylık Bakım" / "1 Yıllık Bakım" gibi. plan_type=
+    "unknown" (toplu katalogda periyodu yorumlanamayan, ör. "?" satırları
+    için kullanılan geçici tür — bkz. excel_utils.import_bulk_catalog) hem
+    km hem süre motorundan hariç tutulan, "belirsiz" madde grubudur."""
+    if plan_type == "unknown":
+        return "Periyodu Belirsiz (?)"
+    if plan_type == "time" and interval_months:
+        if interval_months % 12 == 0:
+            years = interval_months // 12
+            return f"{years} Yıllık Bakım"
+        return f"{interval_months} Aylık Bakım"
+    return f"{fmt_km_static(interval_km)} km Bakımı"
+
+
+def fmt_km_static(n: int) -> str:
+    """main.fmt_km ile aynı biçim (services.py main.py'yi import edemediği
+    için burada küçük bir kopyası tutulur — bkz. main.fmt_km)."""
+    return f"{n:,}".replace(",", ".")
+
+
+def add_months(d: date, months: int) -> date:
+    """`d` tarihine `months` ay ekler (takvim-güvenli — ör. 31 Ocak + 1 ay
+    = 28/29 Şubat, taşma olmaz)."""
+    import calendar
+
+    month_index = d.month - 1 + months
+    year = d.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def elapsed_months(start: date, today: date) -> int:
+    """`start` tarihinden `today`'e kadar TAM geçen ay sayısı (ör. 15 Ocak'tan
+    10 Mart'a: 1 tam ay geçmiş — 14 Mart'a kadar 2. ay tamamlanmaz)."""
+    months = (today.year - start.year) * 12 + (today.month - start.month)
+    if today.day < start.day:
+        months -= 1
+    return max(0, months)
+
+
+def time_plan_window(plan: "models.MaintenancePlan", target_months: int) -> tuple[float, float]:
+    """Süre planı için (km planındaki plan_window ile aynı mantık, ay
+    biriminde): lower_pct/upper_pct, interval_months'un yüzdesi olarak
+    yorumlanır. threshold_type="km" süre planlarında desteklenmez (basit
+    tutulur — admin isterse lower_pct/upper_pct'i 0'a çok yakın ayarlayarak
+    sıkı bir pencere tanımlayabilir)."""
+    return (
+        target_months - plan.interval_months * plan.lower_pct / 100,
+        target_months + plan.interval_months * plan.upper_pct / 100,
+    )
+
+
+def check_and_open_time_maintenances(
+    db: Session, vehicle: "models.Vehicle", skip_passed_targets: bool = False
+) -> list[models.Maintenance]:
+    """Süre bazlı (aylık/yıllık) bakımları otomatik açar — km motoruyla
+    (check_and_open_maintenances) BİREBİR AYNI algoritma, tek farkla:
+    "aracın şu anki km'si" yerine "aracın hizmete başlama tarihinden bugüne
+    kadar geçen tam ay sayısı" kullanılır. Kademeli/kümülatif birleştirme
+    (ör. 3 aylık ve 1 yıllık bakım aynı ay denk gelirse tek iş emri) km
+    motorundaki mantıkla aynı şekilde çalışır.
+
+    target_km sütununda dahili benzersizlik için NEGATİF bir sentinel
+    (-target_months) tutulur — bkz. models.Maintenance yorumu; gerçek
+    tarih için her zaman target_date kullanılır."""
+    opened: list[models.Maintenance] = []
+    if not vehicle.commissioning_date:
+        return opened
+    today = date.today()
+    elapsed = elapsed_months(vehicle.commissioning_date, today)
+
+    plans = db.query(models.MaintenancePlan).filter_by(is_active=True, plan_type="time").all()
+    active_plans = [
+        p for p in plans
+        if p.interval_months and p.interval_months > 0
+        and not p.is_catalog_only
+        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+    ]
+    if not active_plans:
+        return opened
+
+    base_unit = active_plans[0].interval_months
+    for plan in active_plans[1:]:
+        base_unit = math.gcd(base_unit, plan.interval_months)
+    if base_unit <= 0:
+        return opened
+
+    candidates: set[int] = set()
+    candidates.add((elapsed // base_unit) * base_unit)
+    candidates.add(((elapsed // base_unit) + 1) * base_unit)
+    candidates.discard(0)
+
+    for target in sorted(candidates):
+        if skip_passed_targets and target <= elapsed:
+            continue
+        applicable = [p for p in active_plans if target % p.interval_months == 0]
+        if not applicable:
+            continue
+        governing = max(applicable, key=lambda p: p.interval_months)
+
+        lower, upper = time_plan_window(governing, target)
+        if not (lower <= elapsed <= upper):
+            continue
+
+        sentinel_km = -target
+        exists = (
+            db.query(models.Maintenance)
+            .filter_by(vehicle_id=vehicle.id, plan_id=governing.id, target_km=sentinel_km)
+            .first()
+        )
+        if exists:
+            continue
+
+        target_date = add_months(vehicle.commissioning_date, target)
+        m = models.Maintenance(
+            vehicle_id=vehicle.id,
+            plan_id=governing.id,
+            target_km=sentinel_km,
+            target_date=target_date,
+            km_at_open=vehicle.current_km,
+            status="pending",
+            is_activated=False,
+        )
+        db.add(m)
+        db.flush()
+        _copy_tree_snapshot(db, m, applicable)
+        opened.append(m)
+
+    if opened:
+        db.commit()
+    return opened
+
+
+def check_and_open_time_maintenances_all_vehicles(db: Session) -> list[models.Maintenance]:
+    """Zamanlanmış arka plan görevinin çağırdığı toplu kontrol — bkz.
+    main.py `_time_maintenance_background_loop` (km-sim/backup ile aynı
+    desen). Her aktif ve hizmete başlama tarihi tanımlı araç için çalışır."""
+    opened: list[models.Maintenance] = []
+    vehicles = (
+        db.query(models.Vehicle)
+        .filter(models.Vehicle.is_active == True, models.Vehicle.commissioning_date.isnot(None))  # noqa: E712
+        .all()
+    )
+    for v in vehicles:
+        opened.extend(check_and_open_time_maintenances(db, v))
+    return opened
+
+
+def create_manual_time_maintenance(
+    db: Session,
+    vehicle: "models.Vehicle",
+    plan: "models.MaintenancePlan",
+    target_date: date,
+    actor: "models.User",
+) -> models.Maintenance:
+    """create_manual_maintenance'ın süre planları için karşılığı."""
+    if plan.plan_type != "time":
+        raise ValueError("Bu plan süre bazlı değil — target_date yerine target_km kullanın")
+    if not vehicle.is_active:
+        raise ValueError(f"{vehicle.code} aracı pasif — pasif bir araç için bakım iş emri açılamaz")
+    if not plan.is_active:
+        raise ValueError(f"'{plan.name}' planı pasif — pasif bir plan için bakım iş emri açılamaz")
+    if plan.vehicle_model and plan.vehicle_model != vehicle.model:
+        raise ValueError(
+            f"'{plan.name}' planı yalnızca '{plan.vehicle_model}' modeli için tanımlı — "
+            f"{vehicle.code} bu modelde değil ({vehicle.model or 'model belirtilmemiş'})"
+        )
+    if not vehicle.commissioning_date:
+        raise ValueError(f"{vehicle.code} aracının hizmete başlama tarihi tanımlı değil")
+    target_months = elapsed_months(vehicle.commissioning_date, target_date)
+    sentinel_km = -target_months
+    exists = (
+        db.query(models.Maintenance)
+        .filter_by(vehicle_id=vehicle.id, plan_id=plan.id, target_km=sentinel_km)
+        .first()
+    )
+    if exists:
+        raise ValueError("Bu araç için bu periyotta ve hedef tarihte zaten bir iş emri var")
+
+    m = models.Maintenance(
+        vehicle_id=vehicle.id,
+        plan_id=plan.id,
+        target_km=sentinel_km,
+        target_date=target_date,
+        km_at_open=vehicle.current_km,
+        status="pending",
+        is_activated=True,
+        activated_at=datetime.now(),
+        activated_by_id=actor.id,
+    )
+    db.add(m)
+    db.flush()
+    _copy_tree_snapshot(db, m, [plan])
+    db.commit()
+    return m
+
+
+def activate_maintenance(db: Session, m: "models.Maintenance", actor: "models.User") -> None:
+    """Faz 26: Admin/Mühendis'in Bakımlar sayfasındaki "Başlatılmayı
+    Bekleyenler" bölümünden bir aday iş emrini onaylayıp devreye almasıdır.
+    Bundan sonra iş emri Bakımlar listesinde, Takvim'de, Dashboard'da ve
+    Alarm Merkezi'nde normal şekilde görünür ve teknisyen çalışabilir."""
+    m.is_activated = True
+    m.activated_at = datetime.now()
+    m.activated_by_id = actor.id
+    db.commit()
+
+
+def create_manual_maintenance(
+    db: Session,
+    vehicle: "models.Vehicle",
+    plan: "models.MaintenancePlan",
+    target_km: int,
+    actor: "models.User",
+) -> models.Maintenance:
+    """Faz 28 — Manuel bakım ekleme: otomatik tespiti (check_and_open_maintenances)
+    beklemeden admin/mühendis/amir'in istediği araç + periyot + hedef km için
+    elle bir iş emri açmasıdır (ör. otomatik algılama bir nedenle kaçırılmışsa
+    ya da planlı periyodun dışında ek bir bakım gerekiyorsa). Otomatik açılan
+    adayların aksine "Başlat" onayı beklemez — zaten bilinçli bir yetkili
+    işlemi olduğundan doğrudan is_activated=True ile oluşturulur."""
+    if target_km <= 0:
+        raise ValueError("Hedef km 0'dan büyük olmalı")
+    if not vehicle.is_active:
+        raise ValueError(f"{vehicle.code} aracı pasif — pasif bir araç için bakım iş emri açılamaz")
+    if not plan.is_active:
+        raise ValueError(f"'{plan.name}' planı pasif — pasif bir plan için bakım iş emri açılamaz")
+    if plan.vehicle_model and plan.vehicle_model != vehicle.model:
+        raise ValueError(
+            f"'{plan.name}' planı yalnızca '{plan.vehicle_model}' modeli için tanımlı — "
+            f"{vehicle.code} bu modelde değil ({vehicle.model or 'model belirtilmemiş'})"
+        )
+    # Hedef km'nin aracın güncel km'sinden makul bir aralıkta olduğunu
+    # doğrula — çok uzak bir değer muhtemelen bir yazım hatasıdır (ör.
+    # 25.000 km'lik bir planda 500.000 km hedef girilmesi gibi). Sınır,
+    # planın periyoduna göre esnektir (küçük periyotlu planlarda katı,
+    # büyük periyotlu planlarda daha geniş olsun diye) ama her zaman en az
+    # 50.000 km'lik bir pay bırakır.
+    max_gap = max(plan.interval_km * 3, 50_000)
+    if abs(target_km - vehicle.current_km) > max_gap:
+        def _tr_km(n: int) -> str:
+            return f"{n:,}".replace(",", ".")
+        raise ValueError(
+            f"Hedef km ({_tr_km(target_km)}) aracın güncel kilometresinden "
+            f"({_tr_km(vehicle.current_km)}) çok uzak görünüyor — lütfen kontrol edin."
+        )
+    exists = (
+        db.query(models.Maintenance)
+        .filter_by(vehicle_id=vehicle.id, plan_id=plan.id, target_km=target_km)
+        .first()
+    )
+    if exists:
+        raise ValueError("Bu araç için bu periyotta ve hedef km'de zaten bir iş emri var")
+
+    m = models.Maintenance(
+        vehicle_id=vehicle.id,
+        plan_id=plan.id,
+        target_km=target_km,
+        km_at_open=vehicle.current_km,
+        status="pending",
+        is_activated=True,
+        activated_at=datetime.now(),
+        activated_by_id=actor.id,
+    )
+    db.add(m)
+    db.flush()
+    _copy_tree_snapshot(db, m, [plan])
+    db.commit()
+    return m
+
+
+def _plan_size(p: "models.MaintenancePlan") -> int:
+    """Planın periyot büyüklüğü — km planlarında interval_km, süre
+    planlarında interval_months. `_copy_tree_snapshot` içindeki sıralama/
+    "tiers" etiketleme mantığı bunu tek, tür-bağımsız bir sayı olarak
+    kullanır (bir çağrıda hem km hem süre planı asla karışmaz — bkz.
+    check_and_open_maintenances / check_and_open_time_maintenances, her
+    biri kendi türündeki planlarla ayrı ayrı çalışır)."""
+    return p.interval_km if p.plan_type == "km" else (p.interval_months or 0)
 
 
 def _plan_roots(db: Session, plan: models.MaintenancePlan) -> list[models.TreeNode]:
@@ -242,7 +561,7 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
     source_node_id yöneten plana ait olur ve 3D model parça eşleşmeleri
     (PartHotspot, plana özel) doğru maddeye bağlanmaya devam eder.
     """
-    ordered = sorted(applicable_plans, key=lambda p: p.interval_km)
+    ordered = sorted(applicable_plans, key=_plan_size)
 
     if len(ordered) <= 1:
         plan = ordered[0] if ordered else None
@@ -299,9 +618,9 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
             walk(child, item, key, km)
 
     # Yöneten (en büyük) plan önce → paylaşılan düğümler onun source_node_id'sini alır
-    for plan in sorted(ordered, key=lambda p: -p.interval_km):
+    for plan in sorted(ordered, key=lambda p: -_plan_size(p)):
         for r in _plan_roots(db, plan):
-            walk(r, None, tuple(), plan.interval_km)
+            walk(r, None, tuple(), _plan_size(plan))
 
     for key, item in by_path.items():
         item.tiers = ",".join(str(k) for k in sorted(tiers[key]))
@@ -377,6 +696,11 @@ def compute_upcoming_maintenances(
                 .filter_by(vehicle_id=v.id, plan_id=governing.id, target_km=target)
                 .first()
             )
+            if exists is not None and not exists.is_activated:
+                # Faz 26: admin/mühendis henüz "Başlat" demediyse, bu iş emri
+                # HENÜZ açılmamış gibi davranılır (yalnızca önizleme
+                # penceresine girdiğinde "yaklaşıyor" olarak gösterilir).
+                exists = None
             if exists is not None:
                 # Tamamlanmış bakım her zaman listeden düşer. Açık (Bekliyor/
                 # Devam Ediyor) iş emri ise include_open=True çağrılarında
@@ -451,6 +775,115 @@ def compute_upcoming_maintenances(
     return upcoming
 
 
+def compute_upcoming_time_maintenances(
+    db: Session,
+    vehicles: list[models.Vehicle] | None = None,
+    plans: list[models.MaintenancePlan] | None = None,
+    limit: int | None = None,
+    include_open: bool = False,
+) -> list[dict]:
+    """compute_upcoming_maintenances'ın süre bazlı planlar için karşılığı.
+    KM'deki "günlük ortalama km" varsayımıyla gün tahmini yapmaya gerek
+    yoktur — hedef zaten bir takvim tarihidir, "kalan gün" doğrudan
+    (target_date - bugün).days'tir.
+
+    Dönüş sözlüğü km sürümüyle AYNI anahtarları taşır ve BİLEREK aynı
+    "birim-agnostik" alanları yeniden kullanır ki çağıran taraf (main.py
+    `_compute_upcoming_merged`) iki listeyi birleştirip tek bir sırada
+    gösterebilsin:
+      - target_km: gerçek Maintenance satırındaki NEGATİF sentinel
+        (-hedef ay sayısı) — alarm/AlarmState gibi target_km'ye göre
+        eşleşen mevcut genel kodun değişiklik yapılmadan çalışmasını sağlar.
+      - remaining_km: burada KM değil, İMZALI kalan gün sayısıdır (negatifse
+        gecikmiş demektir) — km tarafındaki "remaining_km <= 0 → gecikti"
+        kuralıyla birebir uyumlu kalır.
+      - target_date: gerçek takvim tarihi (yalnızca süre bakımlarında dolu)."""
+    if vehicles is None:
+        vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+    if plans is None:
+        plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
+    today = date.today()
+
+    upcoming: list[dict] = []
+    for v in vehicles:
+        if not v.commissioning_date:
+            continue
+        elapsed = elapsed_months(v.commissioning_date, today)
+        active_plans = [
+            p for p in plans
+            if p.plan_type == "time" and p.interval_months
+            and (not p.vehicle_model or p.vehicle_model == v.model)
+        ]
+        if not active_plans:
+            continue
+
+        base_unit = active_plans[0].interval_months
+        for p in active_plans[1:]:
+            base_unit = math.gcd(base_unit, p.interval_months)
+        if base_unit <= 0:
+            continue
+
+        targets: set[int] = set()
+        targets.add((elapsed // base_unit) * base_unit)
+        targets.add(((elapsed // base_unit) + 1) * base_unit)
+        targets.discard(0)
+
+        for target in targets:
+            applicable = [p for p in active_plans if target % p.interval_months == 0]
+            if not applicable:
+                continue
+            governing = max(applicable, key=lambda p: p.interval_months)
+            sentinel_km = -target
+            exists = (
+                db.query(models.Maintenance)
+                .filter_by(vehicle_id=v.id, plan_id=governing.id, target_km=sentinel_km)
+                .first()
+            )
+            if exists is not None and not exists.is_activated:
+                exists = None
+            if exists is not None:
+                if not include_open or exists.status == "completed":
+                    continue
+            else:
+                lower_bound = target - governing.interval_months * PREVIEW_LOWER_PCT / 100
+                upper_bound = target + governing.interval_months * PREVIEW_UPPER_PCT / 100
+                if not (lower_bound <= elapsed <= upper_bound):
+                    continue
+            target_date = add_months(v.commissioning_date, target)
+            signed_days = (target_date - today).days
+            estimated_days = max(0, signed_days)
+            upcoming.append(
+                {
+                    "vehicle": v,
+                    "plan_name": governing.name,
+                    "target_km": sentinel_km,
+                    "remaining_km": signed_days,
+                    "target_date": target_date,
+                    "covered_tiers": sorted(p.interval_months for p in applicable),
+                    "estimated_days": estimated_days,
+                    "urgent": signed_days <= URGENT_WITHIN_DAYS,
+                    "critical": signed_days <= CRITICAL_WITHIN_DAYS,
+                    "maintenance_id": exists.id if exists is not None else None,
+                }
+            )
+
+    best_open_target: dict[int, int] = {}
+    for u in upcoming:
+        if u["maintenance_id"] is not None:
+            vid = u["vehicle"].id
+            if abs(u["target_km"]) > abs(best_open_target.get(vid, 0)):
+                best_open_target[vid] = u["target_km"]
+    upcoming = [
+        u for u in upcoming
+        if u["maintenance_id"] is None or u["target_km"] == best_open_target[u["vehicle"].id]
+    ]
+
+    upcoming.sort(key=lambda u: u["estimated_days"])
+    if limit is not None:
+        upcoming = upcoming[:limit]
+    return upcoming
+
+
 def compute_maintenance_calendar_projections(
     db: Session,
     vehicles: list[models.Vehicle] | None = None,
@@ -518,6 +951,11 @@ def compute_maintenance_calendar_projections(
             )
             if existing is not None and existing.status == "completed":
                 continue  # tamamlanmış periyot — bir daha gösterilmez
+            if existing is not None and not existing.is_activated:
+                # Faz 26: admin/mühendis henüz "Başlat" demediyse, takvimde de
+                # HENÜZ açılmamış gibi davranılır — aksi halde bir aday, admin
+                # onaylamadan Takvim'de gerçek bir iş emriymiş gibi görünürdü.
+                existing = None
 
             lower_km = target - governing.interval_km * PREVIEW_LOWER_PCT / 100
             upper_km = target + governing.interval_km * PREVIEW_UPPER_PCT / 100
@@ -578,6 +1016,7 @@ def complete_item(
     item.is_locked = True
     item.completed_by_id = (completed_by or user).id
     item.completed_at = datetime.now()
+    _adjust_stock_for_node(db, item.source_node_id, -1)
 
     m = item.maintenance
     if m.status == "pending":
@@ -587,6 +1026,27 @@ def complete_item(
     _cascade_up(db, item)
     _check_maintenance_done(db, m)
     db.commit()
+
+
+def _adjust_stock_for_node(db: Session, source_node_id: int | None, sign: int) -> None:
+    """Bir bakım ağacı maddesine (TreeNode) tanımlı parça-adet eşleşmelerine
+    (TreeNodePartUsage) göre bağlı parçaların stoğunu günceller: sign=-1
+    madde tamamlanınca düşer, sign=+1 madde kilidi açılıp sıfırlanınca geri
+    ekler. source_node_id yoksa (ör. kademeli bakımlardaki sarmalayıcı grup
+    düğümleri, ya da şablonda hiç parça eşleşmesi tanımlanmamışsa) hiçbir
+    şey yapmaz. Stok eksiye düşebilir (kasıtlı — sayım/kayıt tutarsızlığını
+    gizlemek yerine görünür kılar); düşük stok kontrolü buna göre yapılır."""
+    if not source_node_id:
+        return
+    usages = (
+        db.query(models.TreeNodePartUsage)
+        .filter_by(tree_node_id=source_node_id)
+        .all()
+    )
+    for u in usages:
+        part = db.get(models.PartCatalogItem, u.part_id)
+        if part:
+            part.stock_qty += sign * u.qty
 
 
 def add_maintenance_note(
@@ -661,12 +1121,48 @@ def unlock_item(db: Session, item: models.MaintenanceItem) -> None:
 
 
 def _reset_subtree(db: Session, item: models.MaintenanceItem) -> None:
+    if item.is_completed:
+        # Bu madde tamamlanmışken stoktan düşülmüştü (complete_item /
+        # force_complete_maintenance) — kilidi açılıp sıfırlanınca aynı
+        # miktar geri eklenir.
+        _adjust_stock_for_node(db, item.source_node_id, +1)
     item.is_completed = False
     item.is_locked = False
     item.completed_at = None
     item.completed_by_id = None
     for child in db.query(models.MaintenanceItem).filter_by(parent_id=item.id).all():
         _reset_subtree(db, child)
+
+
+def force_complete_maintenance(
+    db: Session, m: models.Maintenance, actor: models.User
+) -> None:
+    """Admin kısayolu: tek tek madde işaretlemeye gerek kalmadan tüm iş
+    emrini doğrudan tamamlandı yapar. Ağaçtaki her maddeyi (dal + yaprak)
+    tamamlanmış/kilitli işaretler ve tamamlayan kişi olarak admin'i yazar."""
+    items = db.query(models.MaintenanceItem).filter_by(maintenance_id=m.id).all()
+    now = datetime.now()
+    for it in items:
+        if not it.is_completed:
+            it.is_completed = True
+            it.completed_at = now
+            it.completed_by_id = actor.id
+            _adjust_stock_for_node(db, it.source_node_id, -1)
+        it.is_locked = True
+    m.status = "completed"
+    m.started_at = m.started_at or now
+    m.completed_at = now
+    db.commit()
+
+
+def reopen_maintenance(db: Session, m: models.Maintenance) -> None:
+    """Admin kısayolu: yanlışlıkla ya da erken tamamlandı işaretlenmiş bir
+    iş emrini 'Tamamlandı' durumundan çıkarır. Madde işaretleri/kilitleri
+    olduğu gibi kalır — gerekirse tek tek 'Kilidi Aç' ile düzeltilebilir;
+    bu yalnızca iş emrinin genel durumunu geri alır."""
+    m.status = "in_progress"
+    m.completed_at = None
+    db.commit()
 
 
 # ---------------------------------------------------- Günlük KM simülasyonu
@@ -828,6 +1324,29 @@ def run_km_sim_catchup(db: Session) -> int:
     return days
 
 
+def run_daily_time_maintenance_check(db: Session) -> int:
+    """Süre bazlı (aylık/yıllık) bakımlar için günlük kontrol — KM
+    simülasyonundaki gün-değişikliği tespiti ile AYNI desen (AppSetting'de
+    son çalıştığı gün saklanır), ama "kaçırılan günü telafi etme" kavramı
+    yok — süre motoru zaten HER ÇALIŞTIĞINDA aracın o günkü gerçek "geçen ay"
+    sayısını hesaplıyor (km_at_open gibi ara adım biriktirmiyor), o yüzden
+    burada sadece "bugün için kontrol edildi mi?" işaretlenir. Sunucu birkaç
+    gün kapalı kalsa bile bir sonraki açılışta kaçırılan hiçbir bakım
+    kaybolmaz — sadece o güne kadar geçen ay sayısı üzerinden normal şekilde
+    değerlendirilir.
+
+    Dönüş: bugün için kontrol yapıldıysa (henüz yapılmamışsa) açılan iş emri
+    sayısı; bugün için zaten kontrol edilmişse -1."""
+    today = date.today()
+    last = get_setting(db, "time_maintenance_last_date", "")
+    if last == today.isoformat():
+        return -1
+    opened = check_and_open_time_maintenances_all_vehicles(db)
+    set_setting(db, "time_maintenance_last_date", today.isoformat())
+    db.commit()
+    return len(opened)
+
+
 # ------------------------------------------------------------ Yetki Yönetimi
 # Yetki matrisinde yönetilen roller. Admin bilerek dışarıda bırakılır:
 # admin her zaman tüm izinlere sahiptir, buradan kısıtlanamaz (kilitlenmeyi
@@ -843,7 +1362,76 @@ PERMISSION_KEYS = [
     "approve_maintenance",
     "export_excel",
     "manage_users",
+    # Faz 26: otomatik açılan aday bakımları "Başlat" diyerek devreye alma
+    # yetkisi — teknisyene verilmez (o yalnızca zaten başlatılmış bir iş
+    # emrinde çalışır), varsayılan olarak mühendis/amir'e açıktır.
+    "start_maintenance",
+    # Faz 27: sistemdeki TÜM bakım iş emirlerini (tamamlananlar/geçmiş dahil)
+    # kalıcı olarak silme — normal delete_maintenance'tan (tek iş emri, geçmişi
+    # olmayan) çok daha yıkıcı bir işlem olduğu için ayrı bir izin anahtarıdır.
+    "delete_all_maintenance",
+    # Faz 28: otomatik tespiti beklemeden araç+periyot+hedef km seçerek elle
+    # bir bakım iş emri açma — start_maintenance ile aynı yetki seviyesindeki
+    # roller (mühendis/amir) için varsayılan olarak açık, teknisyene kapalı.
+    "create_maintenance",
+    # Faz 29: Dashboard'daki "Analiz" bölümünün (periyoda göre bakım grafiği +
+    # genel tamamlanma oranı) görünürlüğü — Yetki Yönetimi sayfasının, ileride
+    # başka arayüz öğelerini de aynı desenle açıp kapatabileceğini gösteren
+    # ilk "görünürlük" tipi izin. Mevcut davranışı bozmamak için üç rolde de
+    # varsayılan olarak açıktır.
+    "view_dashboard_analytics",
 ]
+
+# Yetki Yönetimi sayfasında gruplama için: izin anahtarı -> kategori adı.
+# Yeni bir izin eklenirse buraya da eklenmesi gerekir (eklenmezse sayfada
+# "Diğer" kategorisi altında görünür, bkz. get_permission_defs).
+PERMISSION_CATEGORIES: dict[str, str] = {
+    "view_maintenance": "Bakım İşlemleri",
+    "edit_maintenance": "Bakım İşlemleri",
+    "delete_maintenance": "Bakım İşlemleri",
+    "approve_maintenance": "Bakım İşlemleri",
+    "start_maintenance": "Bakım İşlemleri",
+    "create_maintenance": "Bakım İşlemleri",
+    "delete_all_maintenance": "Bakım İşlemleri",
+    "export_excel": "Veri ve Dışa Aktarma",
+    "manage_users": "Kullanıcı Yönetimi",
+    "view_dashboard_analytics": "Dashboard Görünürlüğü",
+}
+
+# İzin anahtarı -> kısa açıklama (Yetki Yönetimi sayfasında etiketin altında
+# gösterilir — hangi rolün tam olarak neyi yapabildiğini netleştirir).
+PERMISSION_DESCRIPTIONS: dict[str, str] = {
+    "view_maintenance": "Bakım iş emirlerini ve checklist'lerini görüntüleyebilir.",
+    "edit_maintenance": "Checklist maddelerini işaretleyip yürütme notu ekleyebilir.",
+    "delete_maintenance": "Tek bir bakım iş emrini kalıcı olarak silebilir.",
+    "approve_maintenance": "Kilitlenmiş bir maddenin kilidini açıp yeniden düzenlenebilir hâle getirebilir.",
+    "start_maintenance": "Otomatik açılan aday iş emirlerini 'Başlat' diyerek devreye alabilir.",
+    "create_maintenance": "Otomatik tespiti beklemeden araç + periyot seçerek elle bakım iş emri açabilir.",
+    "delete_all_maintenance": "Tamamlanmış/geçmiş dahil TÜM bakım kayıtlarını kalıcı olarak silebilir (çok yıkıcı).",
+    "export_excel": "Bakım listelerini Excel, PDF, CSV veya Word olarak dışa aktarabilir.",
+    "manage_users": "Kullanıcı ekleyebilir, onaylayabilir, rolünü/durumunu değiştirebilir.",
+    "view_dashboard_analytics": "Dashboard'daki Analiz bölümünü (periyoda göre grafik, tamamlanma oranı) görebilir.",
+}
+
+
+def get_default_role_permissions(role: str) -> dict[str, bool]:
+    """Bir rolün fabrika varsayılanlarını döner (admin panelinden yapılmış
+    özelleştirmeleri YOK sayar) — "varsayılana sıfırla" aksiyonu için."""
+    return dict(_DEFAULT_ROLE_PERMISSIONS.get(role, {}))
+
+
+def get_permission_defs() -> list[dict]:
+    """Yetki Yönetimi sayfasında kategorilere göre gruplamak için, sabit
+    PERMISSION_KEYS sırasına göre {key, category, description} listesi
+    döner."""
+    return [
+        {
+            "key": key,
+            "category": PERMISSION_CATEGORIES.get(key, "Diğer"),
+            "description": PERMISSION_DESCRIPTIONS.get(key, ""),
+        }
+        for key in PERMISSION_KEYS
+    ]
 
 # Mevcut (yetki matrisi eklenmeden önceki) davranışla birebir aynı olacak
 # şekilde seçilmiş varsayılanlar. Sonradan admin panelinden değiştirilebilir.
@@ -857,6 +1445,10 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, dict[str, bool]] = {
         "approve_maintenance": True,
         "export_excel": True,
         "manage_users": False,
+        "start_maintenance": True,
+        "delete_all_maintenance": True,
+        "create_maintenance": True,
+        "view_dashboard_analytics": True,
     },
     "technician": {
         "view_maintenance": True,
@@ -865,6 +1457,10 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, dict[str, bool]] = {
         "approve_maintenance": False,
         "export_excel": True,
         "manage_users": False,
+        "start_maintenance": False,
+        "delete_all_maintenance": False,
+        "create_maintenance": False,
+        "view_dashboard_analytics": True,
     },
     # Amir (saha amiri/denetçi): mühendisle aynı denetim seviyesinde —
     # bakımları görüntüler, gerekirse düzenler, kilit açıp onaylayabilir ve
@@ -877,6 +1473,10 @@ _DEFAULT_ROLE_PERMISSIONS: dict[str, dict[str, bool]] = {
         "approve_maintenance": True,
         "export_excel": True,
         "manage_users": False,
+        "start_maintenance": True,
+        "delete_all_maintenance": False,
+        "create_maintenance": True,
+        "view_dashboard_analytics": True,
     },
 }
 
@@ -930,6 +1530,60 @@ def has_permission(db: Session, user: "models.User", key: str) -> bool:
     if user.role == "admin":
         return True
     return get_role_permissions(db, user.role).get(key, False)
+
+
+def delete_user_permanently(db: Session, target: "models.User") -> None:
+    """Kullanıcıyı veritabanından kalıcı olarak siler (pasife almaktan farklı
+    olarak hesap tamamen kaldırılır).
+
+    Geçmiş kayıtların (tamamlanan bakım maddeleri, notlar, işlem kayıtları,
+    öneriler, alarm atamaları) okunabilirliği bozulmasın diye önce bu
+    kullanıcıya olan referanslar NULL'a çekilir — bu tablolardaki metinler
+    (ör. denetim kaydı özeti, madde adı) zaten o anki tam adla ayrıca
+    saklandığı için bilgi kaybı olmaz, yalnızca "kim yaptı" bağlantısı
+    kalkar. Yalnızca oturum açma ile ilgili geçici kayıtlar (e-posta
+    doğrulama kodu, yenileme jetonu) doğrudan silinir."""
+    uid = target.id
+
+    db.query(models.VerificationCode).filter_by(user_id=uid).delete(synchronize_session=False)
+    db.query(models.RefreshToken).filter_by(user_id=uid).delete(synchronize_session=False)
+
+    db.query(models.Maintenance).filter_by(assigned_to_id=uid).update(
+        {"assigned_to_id": None}, synchronize_session=False
+    )
+    db.query(models.Maintenance).filter_by(activated_by_id=uid).update(
+        {"activated_by_id": None}, synchronize_session=False
+    )
+    db.query(models.MaintenanceItem).filter_by(completed_by_id=uid).update(
+        {"completed_by_id": None}, synchronize_session=False
+    )
+    db.query(models.MaintenanceItem).filter_by(exec_note_by_id=uid).update(
+        {"exec_note_by_id": None}, synchronize_session=False
+    )
+    db.query(models.MaintenanceNote).filter_by(author_id=uid).update(
+        {"author_id": None}, synchronize_session=False
+    )
+    db.query(models.AuditLog).filter_by(actor_id=uid).update(
+        {"actor_id": None}, synchronize_session=False
+    )
+    db.query(models.Suggestion).filter_by(created_by_id=uid).update(
+        {"created_by_id": None}, synchronize_session=False
+    )
+    db.query(models.Suggestion).filter_by(reviewed_by_id=uid).update(
+        {"reviewed_by_id": None}, synchronize_session=False
+    )
+    db.query(models.AlarmState).filter_by(acknowledged_by_id=uid).update(
+        {"acknowledged_by_id": None}, synchronize_session=False
+    )
+    db.query(models.AlarmState).filter_by(assigned_to_id=uid).update(
+        {"assigned_to_id": None}, synchronize_session=False
+    )
+    # Bu kullanıcıyı vardiya sorumlusu/üyesi olarak gösteren başka
+    # kullanıcı kaydı yok (shift_id kendi satırında) — ayrı bir işlem
+    # gerekmez, satır silinince kendiliğinden kalkar.
+
+    db.delete(target)
+    db.commit()
 
 
 def set_permission(db: Session, role: str, permission: str, allowed: bool, actor=None) -> None:

@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { api, setRefreshToken, setToken } from '../api'
 import type { User } from '../types'
-import { Box, LogIn, Mail } from 'lucide-react'
+import { Box, Eye, EyeOff, LockKeyhole, LogIn, Mail, UserRound } from 'lucide-react'
+import ParticleNetwork from '../components/ParticleNetwork'
 
 interface RegisterResult {
   message: string
@@ -283,6 +284,7 @@ export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
   const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
@@ -313,29 +315,56 @@ export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
 
   return (
     <div className="login-wrap">
+      <ParticleNetwork particleDensity={0.00006} maxParticles={140} linkDistance={150} mouseLinkDistance={200} />
       <div className="login-box slide-up">
-        <div className="login-logo">
-          <Box size={20} />
+        <div className="login-brand">
+          <div className="login-logo">
+            <Box size={20} />
+          </div>
+          <span>Filo Operasyonları</span>
         </div>
         <h1>Ulaşım Bakım Yönetim Sistemi</h1>
         <div className="sub">{titles[mode]}</div>
         {mode === 'login' && (
           <>
-            <form onSubmit={submit}>
-              <input
-                placeholder="Kullanıcı adı"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoFocus
-              />
-              <input
-                type="password"
-                placeholder="Şifre"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
+            <form className="login-form" onSubmit={submit}>
+              <label className="login-field">
+                <span>Kullanıcı adı</span>
+                <div className="login-input-wrap">
+                  <UserRound size={16} aria-hidden="true" />
+                  <input
+                    placeholder="Kullanıcı adınızı girin"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    autoComplete="username"
+                    autoFocus
+                  />
+                </div>
+              </label>
+              <label className="login-field">
+                <span>Şifre</span>
+                <div className="login-input-wrap">
+                  <LockKeyhole size={16} aria-hidden="true" />
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder="Şifrenizi girin"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    autoComplete="current-password"
+                  />
+                  <button
+                    type="button"
+                    className="login-password-toggle"
+                    onClick={() => setShowPassword((visible) => !visible)}
+                    aria-label={showPassword ? 'Şifreyi gizle' : 'Şifreyi göster'}
+                    title={showPassword ? 'Şifreyi gizle' : 'Şifreyi göster'}
+                  >
+                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              </label>
               {error && <div className="error">{error}</div>}
-              <button className="primary" disabled={busy || !username || !password}>
+              <button className="primary login-submit" disabled={busy || !username || !password}>
                 <LogIn size={14} style={{ marginRight: 7, verticalAlign: -2 }} />
                 Giriş Yap
               </button>

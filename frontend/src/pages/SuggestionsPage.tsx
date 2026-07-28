@@ -132,14 +132,7 @@ export default function SuggestionsPage({ user, canReview }: { user: User; canRe
 
   return (
     <>
-      <PageHeader
-        title="Öneriler"
-        subtitle={
-          canReview
-            ? 'Mühendis, usta ve amirlerden gelen tüm önerileri değerlendirin: onaylayın, reddedin veya Bakım Ağacı’na ekleyip işaretleyin.'
-            : 'Sahada fark ettiğiniz bir eksikliği veya iyileştirmeyi bir araç ve isteğe bağlı bir bakım periyoduyla ilişkilendirip bildirin.'
-        }
-      />
+      <PageHeader title="Öneriler" />
 
       <div className="card">
         <div className="card-head"><div className="card-title">Yeni Öneri</div></div>

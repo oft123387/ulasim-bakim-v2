@@ -1,12 +1,19 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import type { CalendarProjection, Maintenance } from '../types'
+import type { Maintenance } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Tabs, EmptyState, Badge } from '../components/ui'
-import { ChevronLeft, ChevronRight, CalendarDays, Wrench, Gauge, Info } from 'lucide-react'
+import { ChevronLeft, ChevronRight, CalendarDays, Wrench, PlayCircle } from 'lucide-react'
+
+const fmtKm = (n: number) => n.toLocaleString('tr-TR')
+// Süre bazlı (aylık/yıllık) aday iş emirlerinde gerçek hedef target_date'de —
+// backend km alanını bu durumda gizler (null).
+const hedefLabel = (m: Maintenance) =>
+  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+
+const DAILY_KM = 300
 
 type ViewMode = 'day' | 'week' | 'month'
-type DateField = 'created' | 'completed'
 
 const DOW_TR = ['Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt', 'Paz']
 const MONTH_TR = [
@@ -74,13 +81,24 @@ function fmtTime(s: string | null): string {
   return new Date(s).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
 }
 
-function fmtDateShort(iso: string): string {
-  const d = new Date(iso + 'T00:00:00')
-  return `${d.getDate()} ${MONTH_TR[d.getMonth()]}`
-}
+// Takvimde "en geç bitirilmesi gereken tarih" planın kendi tolerans
+// aralığından (upper_pct/upper_km) BAĞIMSIZDIR — yapılması gereken hedef
+// km'nin sabit 2500 km geçilmesine kadar olan tarihtir.
+const OVERDUE_ALLOWANCE_KM = 2500
 
-function eventDate(m: Maintenance, field: DateField): string | null {
-  return field === 'completed' ? m.completed_at : m.created_at
+/** Bir iş emrinin hedef km'sinin sabit OVERDUE_ALLOWANCE_KM kadar
+ * geçilmesine kadar olan tahmini son tarih — DAILY_KM varsayımıyla aracın
+ * güncel km'sinden kaç gün sonra bu noktaya ulaşacağı hesaplanır. Süre
+ * bazlı (aylık/yıllık) iş emirlerinde hedef zaten bir takvim tarihidir
+ * (target_date) — km projeksiyonu yerine doğrudan o tarih kullanılır. */
+function latestDeadline(m: Maintenance): Date {
+  if (m.target_date) return new Date(m.target_date)
+  const upperKm = (m.target_km ?? 0) + OVERDUE_ALLOWANCE_KM
+  const remainingUpper = upperKm - m.vehicle.current_km
+  const days = Math.max(0, Math.ceil(remainingUpper / DAILY_KM))
+  const d = new Date()
+  d.setDate(d.getDate() + days)
+  return d
 }
 
 // En dolu hücrelerde en önemli maddelerin görünür kalması için: Bekliyor ve
@@ -112,23 +130,10 @@ function CalendarLegend() {
         <span className="cal-legend-dot" style={{ background: 'var(--green)' }} /> Tamamlandı
       </span>
       <span className="row" style={{ gap: 6 }}>
-        <Gauge size={12} /> Tahmini bakım penceresi
-      </span>
-      <span className="row" style={{ gap: 6 }}>
         <span className="cal-legend-today" /> Bugün
       </span>
     </div>
   )
-}
-
-/** Projeksiyon penceresi verilen günü kapsıyor mu (ISO string karşılaştırması, aynı format olduğu için doğrudan çalışır). */
-function projectionCoversDay(p: CalendarProjection, dayISO: string): boolean {
-  return p.window_start <= dayISO && dayISO <= p.window_end
-}
-
-/** Projeksiyon penceresi verilen [from,to] aralığıyla kesişiyor mu. */
-function projectionOverlapsRange(p: CalendarProjection, fromISO: string, toISO: string): boolean {
-  return p.window_start <= toISO && p.window_end >= fromISO
 }
 
 // ---------------------------------------------------------- Ay/Hafta hücresi
@@ -136,14 +141,12 @@ function DayCell({
   date,
   inMonth,
   events,
-  projections,
   onOpenMaintenance,
   onOpenDay,
 }: {
   date: Date
   inMonth: boolean
   events: Maintenance[]
-  projections: CalendarProjection[]
   onOpenMaintenance: (id: number) => void
   onOpenDay: (d: Date) => void
 }) {
@@ -151,24 +154,12 @@ function DayCell({
   const sorted = sortByStatusPriority(events)
   const visible = sorted.slice(0, 3)
   const extra = sorted.length - visible.length
-  const hasProjection = projections.length > 0
   return (
     <div
-      className={`cal-cell ${inMonth ? '' : 'cal-out'} ${isToday ? 'cal-today' : ''} ${hasProjection ? 'cal-projected' : ''}`}
+      className={`cal-cell ${inMonth ? '' : 'cal-out'} ${isToday ? 'cal-today' : ''}`}
       onClick={() => onOpenDay(date)}
-      title={
-        hasProjection
-          ? `Tahmini bakım aralığı: ${projections.map((p) => `${p.vehicle.code} — ${p.plan_name}`).join(', ')}`
-          : undefined
-      }
     >
       <div className="cal-daynum">{date.getDate()}</div>
-      {hasProjection && (
-        <div className="cal-projection-band">
-          <Gauge size={10} />
-          {projections.length === 1 ? projections[0].vehicle.code : `${projections.length} araç`}
-        </div>
-      )}
       <div className="cal-chips">
         {visible.map((m) => (
           <button
@@ -189,140 +180,128 @@ function DayCell({
   )
 }
 
-// ---------------------------------------------------------- Tahmini pencere listesi
-function ProjectionsPanel({
-  projections,
-  onOpenMaintenance,
-}: {
-  projections: CalendarProjection[]
-  onOpenMaintenance: (id: number) => void
-}) {
-  if (projections.length === 0) return null
-  return (
-    <div className="table-card fade-in" style={{ marginTop: 16 }}>
-      <div className="table-toolbar">
-        <Gauge size={15} color="var(--text-tertiary)" />
-        <span style={{ fontWeight: 700, fontSize: 13.5 }}>Tahmini Bakım Pencereleri</span>
-        <span
-          title="Aracın günlük ortalama 300 km yaptığı varsayılarak hesaplanır; pencere hedef km'nin %5 öncesinden %10 sonrasına kadardır. Henüz açılmamış (yaklaşan) bakımların tahmini tarihidir — kesin değildir."
-          style={{ cursor: 'help', display: 'inline-flex' }}
-        >
-          <Info size={13} color="var(--text-tertiary)" />
-        </span>
-        <span className="muted" style={{ marginLeft: 'auto' }}>{projections.length} kayıt</span>
-      </div>
-      <div className="table-scroll">
-        <table>
-          <thead>
-            <tr>
-              <th>Araç</th>
-              <th>Periyot</th>
-              <th>Tahmini Aralık</th>
-              <th>Kalan KM</th>
-              <th>Durum</th>
-            </tr>
-          </thead>
-          <tbody>
-            {projections.map((p, i) => (
-              <tr
-                key={i}
-                className={p.maintenance_id ? 'clickable-row' : ''}
-                onClick={() => p.maintenance_id && onOpenMaintenance(p.maintenance_id)}
-              >
-                <td><span className="vehicle-code">{p.vehicle.code}</span></td>
-                <td>
-                  {p.plan_name}
-                  {p.covered_tiers && p.covered_tiers.length > 1 && (
-                    <span className="muted" style={{ fontSize: 11.5, marginLeft: 6 }}>
-                      ({p.covered_tiers.length} periyot birleşik)
-                    </span>
-                  )}
-                </td>
-                <td>{fmtDateShort(p.window_start)} – {fmtDateShort(p.window_end)}</td>
-                <td>{p.remaining_km > 0 ? `${p.remaining_km.toLocaleString('tr-TR')} km` : 'Hedefe ulaşıldı'}</td>
-                <td>
-                  {p.status ? (
-                    <Badge tone={p.status}>{STATUS_TR[p.status]}</Badge>
-                  ) : (
-                    <Badge tone="neutral">Henüz açılmadı</Badge>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
-}
-
 // ---------------------------------------------------------- Takvim sayfası
 export default function CalendarPage({
+  perms,
   onOpenMaintenance,
 }: {
+  perms: Record<string, boolean>
   onOpenMaintenance: (id: number) => void
 }) {
-  const [view, setView] = useState<ViewMode>('month')
-  const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()))
-  const [dateField, setDateField] = useState<DateField>('created')
-  const [list, setList] = useState<Maintenance[] | null>(null)
-  const [projections, setProjections] = useState<CalendarProjection[]>([])
-  const [error, setError] = useState('')
+  // Faz 26 — Bakım başlatma onayı: Bakımlar sayfasındaki gibi burada da iki
+  // ayrı bölüm var — "Planlananlar" (başlatılmış, mevcut takvim görünümü,
+  // varsayılan) ve "Planlamayı Bekleyenler" (henüz başlatılmamış adaylar).
+  // Teknisyenin start_maintenance yetkisi olmadığından sekme hiç gösterilmez
+  // ve teknisyen her zaman yalnızca Planlananlar'ı (mevcut takvim
+  // görünümünü) görür.
+  const [mainView, setMainView] = useState<'planned' | 'pending'>('planned')
+  const [pendingStart, setPendingStart] = useState<Maintenance[] | null>(null)
+  const [pendingStartBusy, setPendingStartBusy] = useState<number | null>(null)
+  const [pendingStartError, setPendingStartError] = useState('')
 
-  const { from, to } = useMemo(() => getRange(anchor, view), [anchor, view])
+  const loadPendingStart = useCallback(() => {
+    if (!perms.start_maintenance) return
+    api<Maintenance[]>('/maintenances/pending-start')
+      .then(setPendingStart)
+      .catch(() => setPendingStart([]))
+  }, [perms.start_maintenance])
 
   useEffect(() => {
-    setList(null)
+    loadPendingStart()
+  }, [loadPendingStart])
+
+  const [view, setView] = useState<ViewMode>('month')
+  const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()))
+  const [list, setList] = useState<Maintenance[] | null>(null)
+  const [error, setError] = useState('')
+
+  // Bakımlar sayfasıyla aynı yaklaşım: tarih aralığına göre sunucu tarafında
+  // filtrelemek yerine tüm başlatılmış iş emirlerini bir kez çeker (dataset
+  // büyüklüğü Bakımlar sayfasında zaten kanıtlanmış) — her iş emri açılış
+  // tarihinden en geç bitirilmesi gereken tarihe kadar birden fazla günde
+  // gösterilebildiğinden (bkz. eventsByDay), tek bir gün/aralık filtresi
+  // yeterli olmazdı.
+  const loadList = useCallback(() => {
     setError('')
-    api<Maintenance[]>(
-      `/maintenances?date_field=${dateField}&date_from=${toISODate(from)}&date_to=${toISODate(to)}`,
-    )
+    api<Maintenance[]>('/maintenances')
       .then(setList)
       .catch((e) => {
         setError((e as Error).message)
         setList([])
       })
-  }, [from, to, dateField])
-
-  // Tahmini bakım pencereleri tarih aralığından bağımsızdır (mevcut km'ye
-  // göre hesaplanır) — bir kez çekilir, tüm görünümlerde aynı veri kullanılır.
-  useEffect(() => {
-    api<CalendarProjection[]>('/maintenances/projections')
-      .then(setProjections)
-      .catch(() => setProjections([]))
   }, [])
 
-  const byDate = useMemo(() => {
+  useEffect(() => {
+    loadList()
+  }, [loadList])
+
+  async function startPendingMaintenance(id: number) {
+    setPendingStartBusy(id)
+    setPendingStartError('')
+    try {
+      await api(`/maintenances/${id}/start`, { method: 'POST' })
+      loadPendingStart()
+      // Başlatılan bakım artık "Planlananlar" görünümüne dahil olmalı.
+      loadList()
+    } catch (e) {
+      setPendingStartError((e as Error).message)
+    } finally {
+      setPendingStartBusy(null)
+    }
+  }
+
+  const { from, to } = useMemo(() => getRange(anchor, view), [anchor, view])
+
+  // Bir iş emrinin takvimde görüneceği [başlangıç, bitiş] gün aralığı:
+  // - Tamamlanmışsa YALNIZCA tamamlandığı gün gösterilir (devamında
+  //   gösterilmesine gerek kalmaz).
+  // - Tamamlanmamışsa açılış tarihinden, planın üst tolerans sınırına göre
+  //   en geç bitirilmesi gereken tahmini tarihe kadar HER GÜN gösterilir —
+  //   süresi geçmiş ama hâlâ tamamlanmamışsa (nadir durum), gözden
+  //   kaybolmasın diye en azından bugüne kadar uzatılır.
+  function displayRange(m: Maintenance, todayISO: string): { startISO: string; endISO: string } | null {
+    if (m.status === 'completed') {
+      if (!m.completed_at) return null
+      const day = toISODate(new Date(m.completed_at))
+      return { startISO: day, endISO: day }
+    }
+    if (!m.created_at) return null
+    const startISO = toISODate(new Date(m.created_at))
+    const deadlineISO = toISODate(latestDeadline(m))
+    const endISO = deadlineISO > todayISO ? deadlineISO : todayISO
+    return { startISO, endISO: endISO > startISO ? endISO : startISO }
+  }
+
+  const eventsByDay = useMemo(() => {
+    const todayISO = toISODate(new Date())
+    const days = gridDays(from, to).map(toISODate)
     const map = new Map<string, Maintenance[]>()
+    for (const d of days) map.set(d, [])
     for (const m of list ?? []) {
-      const raw = eventDate(m, dateField)
-      if (!raw) continue
-      const key = toISODate(new Date(raw))
-      if (!map.has(key)) map.set(key, [])
-      map.get(key)!.push(m)
+      const range = displayRange(m, todayISO)
+      if (!range) continue
+      for (const d of days) {
+        if (d >= range.startISO && d <= range.endISO) map.get(d)!.push(m)
+      }
     }
     for (const arr of map.values()) {
-      arr.sort((a, b) => new Date(eventDate(a, dateField)!).getTime() - new Date(eventDate(b, dateField)!).getTime())
+      arr.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
     }
     return map
-  }, [list, dateField])
+  }, [list, from, to])
 
-  const projectionsByDay = useMemo(() => {
-    const map = new Map<string, CalendarProjection[]>()
-    for (const d of gridDays(from, to)) {
-      const key = toISODate(d)
-      map.set(key, projections.filter((p) => projectionCoversDay(p, key)))
-    }
-    return map
-  }, [projections, from, to])
-
-  const visibleProjections = useMemo(() => {
+  // Görünen aralıkla kesişen (spanning) iş emirleri — üstteki özet
+  // rozetlerinde ve boş durum kontrolünde tekrarsız sayı için kullanılır.
+  const visibleMaintenances = useMemo(() => {
+    const todayISO = toISODate(new Date())
     const fromISO = toISODate(from)
     const toISO = toISODate(to)
-    return projections
-      .filter((p) => projectionOverlapsRange(p, fromISO, toISO))
-      .sort((a, b) => a.window_start.localeCompare(b.window_start))
-  }, [projections, from, to])
+    return (list ?? []).filter((m) => {
+      const range = displayRange(m, todayISO)
+      if (!range) return false
+      return range.startISO <= toISO && range.endISO >= fromISO
+    })
+  }, [list, from, to])
 
   function shift(delta: number) {
     if (view === 'day') setAnchor((a) => addDays(a, delta))
@@ -330,35 +309,118 @@ export default function CalendarPage({
     else setAnchor((a) => new Date(a.getFullYear(), a.getMonth() + delta, 1))
   }
 
-  const totalEvents = list?.length ?? 0
+  const totalEvents = visibleMaintenances.length
 
   const statusCounts = useMemo(() => {
     const counts = { pending: 0, in_progress: 0, completed: 0 }
-    for (const m of list ?? []) counts[m.status]++
+    for (const m of visibleMaintenances) counts[m.status]++
     return counts
-  }, [list])
+  }, [visibleMaintenances])
 
   return (
     <>
       <PageHeader
         title="Takvim"
-        subtitle="Bakım iş emirlerini ve tahmini bakım pencerelerini günlük, haftalık ve aylık görünümde inceleyin."
-        actions={
-          <div className="row" style={{ gap: 8 }}>
-            <label className="row" style={{ gap: 6, fontSize: 12.5 }}>
-              <span className="muted">Takvimde göster:</span>
-              <select value={dateField} onChange={(e) => setDateField(e.target.value as DateField)}>
-                <option value="created">İş emrinin açılış tarihi</option>
-                <option value="completed">İş emrinin tamamlanma tarihi</option>
-              </select>
-            </label>
-          </div>
-        }
       />
 
-      <div className="card" style={{ marginBottom: 12 }}>
-        <div className="row" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
-          <div className="row" style={{ gap: 8 }}>
+      {!!perms.start_maintenance && (
+        <div className="row calendar-view-tabs" style={{ gap: 10, marginBottom: 16 }}>
+          <button
+            className={mainView === 'planned' ? 'primary' : ''}
+            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
+            onClick={() => setMainView('planned')}
+          >
+            <CalendarDays size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
+            Planlananlar
+          </button>
+          <button
+            className={mainView === 'pending' ? 'primary' : ''}
+            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
+            onClick={() => setMainView('pending')}
+          >
+            <PlayCircle size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
+            Planlamayı Bekleyenler
+            {!!pendingStart && pendingStart.length > 0 && (
+              <span
+                style={{
+                  marginLeft: 8, background: mainView === 'pending' ? 'rgba(255,255,255,0.28)' : 'var(--amber-light)',
+                  color: mainView === 'pending' ? '#fff' : 'var(--amber)',
+                  borderRadius: 999, padding: '1px 9px', fontSize: 12.5, fontWeight: 700,
+                }}
+              >
+                {pendingStart.length}
+              </span>
+            )}
+          </button>
+        </div>
+      )}
+
+      {mainView === 'pending' && !!perms.start_maintenance && (
+        <div className="card fade-in" style={{ marginBottom: 16 }}>
+          <div className="card-head">
+            <div>
+              <div className="card-title">
+                <PlayCircle size={15} style={{ marginRight: 6, verticalAlign: -3, color: 'var(--primary-600)' }} />
+                Başlatılmayı Bekleyenler
+              </div>
+              <div className="card-subtitle">
+                Otomatik olarak açılan bu bakımlar henüz başlatılmadı — başlatılmadıkça Takvim'de ve
+                Bakımlar listesinde görünmezler.
+              </div>
+            </div>
+            <Badge tone="pending">{pendingStart?.length ?? 0}</Badge>
+          </div>
+          {pendingStartError && <div className="error">{pendingStartError}</div>}
+          {pendingStart && pendingStart.length === 0 && (
+            <EmptyState
+              icon={<PlayCircle size={22} />}
+              title="Başlatılmayı bekleyen bakım yok"
+              description="Otomatik açılan tüm adaylar zaten başlatılmış."
+            />
+          )}
+          {pendingStart && pendingStart.length > 0 && (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Araç</th>
+                    <th>Periyot</th>
+                    <th>Hedef</th>
+                    <th>Açılış KM</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingStart.map((m) => (
+                    <tr key={m.id}>
+                      <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
+                      <td>{m.plan.name}</td>
+                      <td>{hedefLabel(m)}</td>
+                      <td>{fmtKm(m.km_at_open)} km</td>
+                      <td>
+                        <button
+                          className="small primary"
+                          disabled={pendingStartBusy === m.id}
+                          onClick={() => startPendingMaintenance(m.id)}
+                        >
+                          <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                          {pendingStartBusy === m.id ? 'Başlatılıyor…' : 'Başlat'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mainView === 'planned' && (
+      <>
+      <div className="card calendar-controls" style={{ marginBottom: 12 }}>
+        <div className="row calendar-controls-main" style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}>
+          <div className="row calendar-navigation" style={{ gap: 8 }}>
             <button className="small ghost" onClick={() => shift(-1)}>
               <ChevronLeft size={14} />
             </button>
@@ -378,7 +440,7 @@ export default function CalendarPage({
               style={{ fontSize: 12.5, padding: '6px 10px' }}
               title="Tarihe git"
             />
-            <span style={{ fontWeight: 700, fontSize: 15, marginLeft: 6 }}>
+            <span className="calendar-range-title">
               {rangeTitle(anchor, view)}
             </span>
           </div>
@@ -393,7 +455,7 @@ export default function CalendarPage({
           />
         </div>
         <div
-          className="row"
+          className="row calendar-meta"
           style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}
         >
           <CalendarLegend />
@@ -416,16 +478,15 @@ export default function CalendarPage({
             <EmptyState
               icon={<Wrench size={22} />}
               title="Bu gün için bakım kaydı yok"
-              description={`${from.toLocaleDateString('tr-TR')} tarihinde oluşturulmuş/tamamlanmış bir iş emri bulunamadı.`}
+              description={`${from.toLocaleDateString('tr-TR')} tarihinde açık ya da tamamlanmış bir iş emri bulunamadı.`}
             />
           ) : (
-            <DayAgenda events={byDate.get(toISODate(from)) ?? []} dateField={dateField} onOpenMaintenance={onOpenMaintenance} />
+            <DayAgenda events={eventsByDay.get(toISODate(from)) ?? []} onOpenMaintenance={onOpenMaintenance} />
           )}
-          <ProjectionsPanel projections={visibleProjections} onOpenMaintenance={onOpenMaintenance} />
         </>
       ) : (
         <>
-          <div className="card cal-card">
+          <div className="card cal-card fade-in">
             <div className="cal-grid cal-weekday-header">
               {DOW_TR.map((d) => (
                 <div key={d} className="cal-weekday">{d}</div>
@@ -437,8 +498,7 @@ export default function CalendarPage({
                   key={toISODate(d)}
                   date={d}
                   inMonth={view === 'week' ? true : d.getMonth() === anchor.getMonth()}
-                  events={byDate.get(toISODate(d)) ?? []}
-                  projections={projectionsByDay.get(toISODate(d)) ?? []}
+                  events={eventsByDay.get(toISODate(d)) ?? []}
                   onOpenMaintenance={onOpenMaintenance}
                   onOpenDay={(day) => {
                     setAnchor(day)
@@ -448,15 +508,16 @@ export default function CalendarPage({
               ))}
             </div>
           </div>
-          <ProjectionsPanel projections={visibleProjections} onOpenMaintenance={onOpenMaintenance} />
-          {totalEvents === 0 && visibleProjections.length === 0 && (
+          {totalEvents === 0 && (
             <EmptyState
               icon={<CalendarDays size={22} />}
               title="Bu aralıkta bakım yok"
-              description="Seçili tarih aralığında iş emri veya tahmini bakım penceresi bulunamadı."
+              description="Seçili tarih aralığında başlatılmış bir iş emri bulunamadı."
             />
           )}
         </>
+      )}
+      </>
       )}
     </>
   )
@@ -475,11 +536,9 @@ function gridDays(from: Date, to: Date): Date[] {
 // ---------------------------------------------------------- Günlük ajanda
 function DayAgenda({
   events,
-  dateField,
   onOpenMaintenance,
 }: {
   events: Maintenance[]
-  dateField: DateField
   onOpenMaintenance: (id: number) => void
 }) {
   return (
@@ -488,20 +547,20 @@ function DayAgenda({
         <table>
           <thead>
             <tr>
-              <th>Saat</th>
               <th>Araç</th>
               <th>Periyot</th>
               <th>Durum</th>
+              <th>Açılış</th>
               <th></th>
             </tr>
           </thead>
           <tbody>
             {events.map((m) => (
               <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
-                <td style={{ fontWeight: 600 }}>{fmtTime(eventDate(m, dateField))}</td>
                 <td><span className="vehicle-code">{m.vehicle.code}</span></td>
                 <td>{m.plan.name}</td>
                 <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
+                <td className="muted">{fmtTime(m.created_at)}</td>
                 <td className="muted">#{m.id}</td>
               </tr>
             ))}

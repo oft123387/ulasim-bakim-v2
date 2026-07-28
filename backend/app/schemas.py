@@ -1,6 +1,7 @@
-from datetime import datetime
+from datetime import date, datetime
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ORM(BaseModel):
@@ -122,6 +123,9 @@ class VehicleOut(ORM):
     last_km_update_at: datetime | None
     production_year: int | None = None
     photo_filename: str = ""
+    # Süre bazlı (aylık/yıllık) bakım planlarının "kaç ay geçti" hesabı için
+    # referans tarih. Belirtilmezse araç oluşturulurken bugüne ayarlanır.
+    commissioning_date: date | None = None
 
 
 class VehicleCreate(BaseModel):
@@ -133,6 +137,7 @@ class VehicleCreate(BaseModel):
     chassis_no: str = ""
     notes: str = ""
     production_year: int | None = Field(default=None, ge=1900, le=2100)
+    commissioning_date: date | None = None
 
 
 class VehicleUpdate(BaseModel):
@@ -142,6 +147,7 @@ class VehicleUpdate(BaseModel):
     chassis_no: str | None = None
     notes: str | None = None
     production_year: int | None = Field(default=None, ge=1900, le=2100)
+    commissioning_date: date | None = None
 
 
 class VehicleKmUpdate(BaseModel):
@@ -171,33 +177,116 @@ class PlanOut(ORM):
     id: int
     name: str
     interval_km: int
+    threshold_type: str = "percent"
     lower_pct: float
     upper_pct: float
+    lower_km: float = 0.0
+    upper_km: float = 0.0
     is_active: bool
     vehicle_model: str = ""
+    # "km" (varsayılan) veya "time" (süre bazlı — aylık/yıllık).
+    plan_type: str = "km"
+    interval_months: int | None = None
+    # True ise: bu plan bir temel periyodun katıdır (ör. 800.000 km, 200.000
+    # km'nin katı) — Bakım Planları sayfasında gizlenir, kendi başına bakım
+    # tetiklemez, ama Bakım Ağacı sayfasında (katalog içeriği kaybolmasın diye)
+    # görünür/düzenlenebilir kalır.
+    is_catalog_only: bool = False
 
 
 class PlanCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-    interval_km: int = Field(gt=0)
-    lower_pct: float = Field(default=50.0, ge=0, le=100)
+    name: str = Field(default="", max_length=100)
+    # "km" planlarında zorunlu (>0); "time" planlarında kullanılmaz (0 kalır).
+    interval_km: int = Field(default=0, ge=0)
+    # "percent" (varsayılan) veya "km" — açılma penceresinin yüzde mi yoksa
+    # sabit kalan kilometre ile mi tanımlanacağını belirler. Yalnızca
+    # plan_type="km" için geçerlidir.
+    threshold_type: Literal["percent", "km"] = "percent"
+    lower_pct: float = Field(default=5.0, ge=0, le=100)
     upper_pct: float = Field(default=10.0, ge=0, le=100)
+    lower_km: float = Field(default=0.0, ge=0)
+    upper_km: float = Field(default=0.0, ge=0)
     vehicle_model: str = ""
+    plan_type: Literal["km", "time"] = "km"
+    # "time" planlarında zorunlu (>0), ay cinsinden (1, 3, 6, 12, 24, 72...).
+    interval_months: int | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def _validate_type(self):
+        if self.plan_type == "km" and self.interval_km <= 0:
+            raise ValueError("km planı için interval_km > 0 olmalı")
+        if self.plan_type == "time" and not self.interval_months:
+            raise ValueError("time planı için interval_months > 0 olmalı")
+        return self
 
 
 class PlanUpdate(BaseModel):
     name: str | None = None
     interval_km: int | None = Field(default=None, gt=0)
+    threshold_type: Literal["percent", "km"] | None = None
     lower_pct: float | None = Field(default=None, ge=0, le=100)
     upper_pct: float | None = Field(default=None, ge=0, le=100)
+    lower_km: float | None = Field(default=None, ge=0)
+    upper_km: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
     vehicle_model: str | None = None
+    interval_months: int | None = Field(default=None, gt=0)
 
 
 class ImportTreeResult(BaseModel):
     plans: list[PlanOut]
     nodes_created: int
     maintenances_reset: int = 0
+
+
+# ---------- Araç modeli birleştirme (admin) ----------
+class VehicleModelMergeIn(BaseModel):
+    from_model: str = Field(min_length=1, max_length=100)
+    to_model: str = Field(min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def _validate(self):
+        if self.from_model.strip() == self.to_model.strip():
+            raise ValueError("Kaynak ve hedef model aynı olamaz")
+        return self
+
+
+class VehicleModelMergeResult(BaseModel):
+    vehicles_moved: int
+    plans_renamed: list[dict] = []
+    plans_merged: list[dict] = []
+
+
+# ---------- Toplu Bakım Kataloğu İçe Aktarma (ARAÇ/BÖLGE/SİSTEM/EKİPMAN/BAKIM/BAKIM KALEMİ/KART KODU) ----------
+class BulkCatalogSkippedRow(BaseModel):
+    row: int
+    reason: str
+    data: list[str] = []
+
+
+class BulkCatalogImportResult(BaseModel):
+    vehicle_models: list[str]
+    plans_created: int
+    plans_updated: int
+    nodes_created: int
+    leaves_created: int
+    skipped: list[BulkCatalogSkippedRow] = []
+    # BAKIM hücresi yorumlanamayan (ör. "?") ama boş olmayan satırlar —
+    # atlanmadı, "Periyodu Belirsiz (?)" planı altında ağaca eklendi.
+    unresolved_period: list[BulkCatalogSkippedRow] = []
+    # Bir temel periyodun (ör. 200.000 km) TAM KATI olan periyotlar (ör.
+    # 800.000 km = 200.000'in 4 katı): kendi bakım ağacı/planı yine
+    # oluşturulur (Bakım Ağacı sayfasında görünür), ama "katalog-amaçlı"
+    # (is_catalog_only=True) işaretlenir — Bakım Planları sayfasında
+    # gösterilmez ve kendi başına bakım açmaz, çünkü temel periyodun (ör.
+    # 200.000 km) planı zaten onun katlarında da otomatik tetiklenir (bkz.
+    # excel_utils.canonical_base_interval). Serbest biçimli (heterojen
+    # alanlar) olduğu için düz dict olarak taşınır.
+    catalog_only_periods: list[dict] = []
+    # True ise bu bir ÖNİZLEMEYDİ — veritabanına hiçbir şey YAZILMADI, yalnızca
+    # gerçek yüklemede ne olacağının bir raporu üretildi (bkz. main.py
+    # import_bulk_catalog `dry_run` parametresi).
+    dry_run: bool = False
 
 
 # ---------- Node attachments (Faz 10) ----------
@@ -239,6 +328,12 @@ class PartCatalogItemOut(ORM):
     parent_id: int | None = None
     attachments: list[PartCatalogAttachmentOut] = []
     children: list["PartCatalogItemOut"] = []
+    # Parça stok takibi — bkz. models.PartCatalogItem.stock_qty. min_stock=0
+    # "stok takibi tanımlanmadı" demektir. float: "1 kg'lık üründen 0.2 kg
+    # kullanımı" gibi kesirli miktarları desteklemek için (Integer değil).
+    stock_qty: float = 0
+    min_stock: float = 0
+    unit: str = "adet"
 
 
 class PartCatalogItemCreate(BaseModel):
@@ -247,6 +342,9 @@ class PartCatalogItemCreate(BaseModel):
     # Belirtilirse yeni parça bu parçanın ALT parçası olarak oluşturulur
     # (ör. "Motorlu Boji" içine "Motor" eklemek gibi).
     parent_id: int | None = None
+    stock_qty: float = Field(default=0, ge=0)
+    min_stock: float = Field(default=0, ge=0)
+    unit: str = Field(default="adet", max_length=20)
 
 
 class PartCatalogItemUpdate(BaseModel):
@@ -258,6 +356,8 @@ class PartCatalogItemUpdate(BaseModel):
     # alanın gövdede GEÇİP GEÇMEDİĞİNİ (model_fields_set) kontrol ederek
     # ayırt eder — vardiya (shift_id) alanındaki ile aynı desen.
     parent_id: int | None = None
+    min_stock: float | None = Field(default=None, ge=0)
+    unit: str | None = Field(default=None, max_length=20)
 
 
 class PartReorderBody(BaseModel):
@@ -269,6 +369,63 @@ class PartReorderBody(BaseModel):
     ordered_ids: list[int] = Field(min_length=1)
 
 
+class PartRepairMaterialOut(BaseModel):
+    id: int
+    part_id: int
+    material_part_id: int | None = None
+    # Katalogdan seçilmişse malzemenin adı/stoğu (görüntüleme için) — serbest
+    # metin satırlarında material_name boş, free_text dolu olur.
+    material_name: str = ""
+    material_stock_qty: float | None = None
+    material_unit: str = ""
+    free_text: str = ""
+    qty: float = 1
+
+
+class PartRepairMaterialIn(BaseModel):
+    # İkisinden biri verilmeli: material_part_id (katalogdan) YA DA free_text
+    # (serbest metin, stok bağlantısı olmaz).
+    material_part_id: int | None = None
+    free_text: str = Field(default="", max_length=200)
+    # float: "körüğün tamirinde 1 kg yapıştırıcının 0.2 kg'ı kullanılır" gibi
+    # kesirli miktarları desteklemek için (Integer değil).
+    qty: float = Field(default=1, gt=0)
+
+
+class PartRepairIn(BaseModel):
+    note: str = Field(default="", max_length=300)
+
+
+class PartRepairResult(BaseModel):
+    ok: bool = True
+    materials_deducted: list[str] = []  # ör. ["Vida M6 x4"] — stoktan düşülenler
+    materials_skipped: list[str] = []  # serbest metin satırlar — stok bağlantısı yok
+
+
+class PartStockAdjustIn(BaseModel):
+    """Manuel stok hareketi — yeni parça geldiğinde (+) veya sayım/fire
+    düzeltmesinde (-) kullanılır. Otomatik bakım-bazlı düşüm bunu KULLANMAZ
+    (bkz. services._adjust_stock_for_node); bu yalnızca elle giriş içindir."""
+
+    delta: float
+    note: str = Field(default="", max_length=300)
+
+
+class TreeNodePartUsageOut(BaseModel):
+    id: int
+    tree_node_id: int
+    part_id: int
+    part_name: str = ""
+    qty: float = 1
+
+
+class TreeNodePartUsageIn(BaseModel):
+    part_id: int
+    # float: "bu maddede 1 kg'lık üründen 0.2 kg kullanılır" gibi kesirli
+    # miktarları desteklemek için (Integer değil).
+    qty: float = Field(default=1, gt=0)
+
+
 # ---------- Tree template ----------
 class TreeNodeOut(ORM):
     id: int
@@ -277,6 +434,7 @@ class TreeNodeOut(ORM):
     name: str
     order_index: int
     note: str = ""
+    card_code: str = ""
     children: list["TreeNodeOut"] = []
     attachments: list[NodeAttachmentOut] = []
 
@@ -286,6 +444,7 @@ class TreeNodeCreate(BaseModel):
     plan_id: int | None = None  # yalnızca kök düğüm (parent_id=None) için anlamlıdır
     name: str = Field(min_length=1, max_length=200)
     order_index: int = 0
+    card_code: str = Field(default="", max_length=50)
 
 
 class TreeNodeUpdate(BaseModel):
@@ -293,6 +452,7 @@ class TreeNodeUpdate(BaseModel):
     parent_id: int | None = None
     order_index: int | None = None
     note: str | None = None
+    card_code: str | None = Field(default=None, max_length=50)
 
 
 class TreeNodeFlatOut(ORM):
@@ -301,6 +461,28 @@ class TreeNodeFlatOut(ORM):
     id: int
     parent_id: int | None
     name: str
+
+
+class MergedTreeNodeOut(BaseModel):
+    """"Tümü" (birleşik) görünüm — bir araç modelindeki TÜM planların (temel
+    + katalog-amaçlı/is_catalog_only) ağaçları, ortak Bölge/Sistem/Ekipman
+    dallarında birleştirilmiş, salt-okunur bir görünüm. Gerçek TreeNode
+    kayıtlarına birebir karşılık gelmez (yapay/sentetik id'ler taşır);
+    yalnızca görüntüleme içindir, düzenlenemez. Yaprak (kalem) düğümlerde
+    hangi periyottan geldiği `period_label`/`plan_id` ile işaretlenir."""
+
+    id: int
+    name: str
+    card_code: str = ""
+    note: str = ""
+    period_label: str | None = None
+    plan_id: int | None = None
+    is_catalog_only: bool = False
+    # Yalnızca "tüm modeller" (all_models=true) görünümünde doludur — yaprağın
+    # hangi araç modeline (ör. "Sirio", "Bozankaya Tip-1") ait olduğunu, ya da
+    # "Genel" planlarda boş string olarak gösterir.
+    vehicle_model: str | None = None
+    children: list["MergedTreeNodeOut"] = []
 
 
 # ---------- Maintenance ----------
@@ -314,6 +496,7 @@ class ItemOut(ORM):
     completed_at: datetime | None
     completed_by: UserOut | None
     note: str = ""  # Faz 10: bağlı şablon maddesinin açıklaması
+    card_code: str = ""  # bağlı şablon maddesinin "KART KODU"su (varsa)
     attachments: list[NodeAttachmentOut] = []  # Faz 10: bağlı ekler
     # Kademeli bakımda bu maddenin ait olduğu periyotlar (km). ORM'deki
     # 'tiers' (str) ile çakışmasın diye farklı ada sahip; elle doldurulur.
@@ -328,7 +511,9 @@ class ItemOut(ORM):
 
 class MaintenanceOut(ORM):
     id: int
-    target_km: int
+    target_km: int | None
+    # Yalnızca süre bazlı (plan.plan_type=="time") iş emirlerinde dolu.
+    target_date: date | None = None
     km_at_open: int
     status: str
     created_at: datetime
@@ -337,6 +522,20 @@ class MaintenanceOut(ORM):
     vehicle: VehicleOut
     plan: PlanOut
     assigned_to: UserOut | None
+    # Faz 26 — Bakım başlatma onayı
+    is_activated: bool = True
+    activated_at: datetime | None = None
+    activated_by: UserOut | None = None
+
+    @model_validator(mode="after")
+    def _hide_time_sentinel(self):
+        """Süre bazlı bakımlarda target_km, ORM'de dahili benzersizlik amaçlı
+        NEGATİF bir sentinel değer tutar (bkz. models.Maintenance yorumu) —
+        bu asla API üzerinden dışa sızmamalı, istemci her zaman target_date'e
+        bakmalı. Burada tek yerde temizlenir, her endpoint'te tekrarlanmaz."""
+        if self.target_km is not None and self.target_km < 0:
+            self.target_km = None
+        return self
 
 
 class NoteOut(ORM):
@@ -359,6 +558,17 @@ class MaintenanceDetail(MaintenanceOut):
     # bakımda birden fazla; tek periyotlu bakımda tek eleman.
     covered_tiers: list[int] = []
     notes: list[NoteOut] = []
+
+
+class MaintenanceManualCreate(BaseModel):
+    """Faz 28 — Manuel bakım ekleme: admin/mühendis/amir'in otomatik tespiti
+    beklemeden araç + periyot + hedef km seçerek elle bir iş emri açması."""
+
+    vehicle_id: int
+    plan_id: int
+    # Plan bir "km" planıysa target_km, "time" planıysa target_date verilir.
+    target_km: int | None = Field(default=None, gt=0)
+    target_date: date | None = None
 
 
 class AssignBody(BaseModel):
@@ -385,8 +595,11 @@ class CompleteItemBody(BaseModel):
 class UpcomingItem(BaseModel):
     vehicle: VehicleOut
     plan_name: str
-    target_km: int
-    remaining_km: int
+    target_km: int = 0
+    remaining_km: int = 0
+    # Süre bazlı bir plandan geliyorsa dolu (target_km/remaining_km bu
+    # durumda 0'dır, arayüz target_date'i gösterir).
+    target_date: date | None = None
     covered_tiers: list[int] = []
     # Günlük ort. 300 km varsayımıyla tahmini gün sayısı ve bu bakımın
     # "acil" (<=14 gün) olup olmadığı — dashboard/Araçlar sayfasında daha
@@ -446,6 +659,33 @@ class DashboardOut(BaseModel):
     recent_completed: list[MaintenanceOut]
     by_plan: list[PlanSummary] = []
     by_vehicle: list[VehicleSummary] = []
+    # Toplu katalog içe aktarmasından kalan, BAKIM periyodu hâlâ "?"
+    # (yorumlanamamış) olan madde sayısı — yalnızca admin'e gösterilir (bkz.
+    # main.py dashboard()), kaynak Excel netleşene kadar unutulmasın diye.
+    unresolved_period_count: int = 0
+
+
+# ---------- Sistem Durumu (admin) ----------
+class SystemStatusOut(BaseModel):
+    db_backend: str  # "sqlite" | "postgresql" | ...
+    db_location: str  # sqlite: çözümlenmiş mutlak dosya yolu; diğer: şifresiz bağlantı özeti
+    foreign_keys_enforced: bool | None = None  # yalnızca sqlite için anlamlı
+    started_at: datetime
+    uptime_seconds: float
+    vehicle_count: int
+    active_vehicle_count: int
+    user_count: int
+    plan_count: int
+    catalog_only_plan_count: int
+    unresolved_period_count: int
+    tree_node_count: int
+    maintenance_pending: int
+    maintenance_in_progress: int
+    maintenance_completed: int
+    backup_dir: str
+    upload_dir: str
+    log_dir: str
+    last_backup_at: datetime | None = None
 
 
 # ---------- 3D Model / Parça Eşleşmesi ----------
@@ -558,6 +798,19 @@ class PermissionUpdateBody(BaseModel):
     allowed: bool
 
 
+class PermissionResetBody(BaseModel):
+    role: str = Field(pattern="^(engineer|technician|amir)$")
+
+
+class PermissionDefOut(BaseModel):
+    """Yetki Yönetimi sayfasında gruplama/açıklama için — bkz.
+    services.get_permission_defs."""
+
+    key: str
+    category: str
+    description: str = ""
+
+
 class BackupInfo(BaseModel):
     filename: str
     size_bytes: int
@@ -642,8 +895,9 @@ class AlarmItem(BaseModel):
     level: str
     vehicle: VehicleOut
     plan_name: str
-    target_km: int
-    remaining_km: int
+    target_km: int = 0
+    remaining_km: int = 0
+    target_date: date | None = None
     estimated_days: int | None = None
     overdue: bool = False
     # İş emri zaten açıldıysa: bakım id'si ve açılışından bu yana geçen gün.
@@ -668,7 +922,7 @@ class NotificationOut(BaseModel):
     hesaplanır (id negatiftir, bakım id'sinden türetilir)."""
 
     id: int
-    category: str  # work_order | completed | unlock | user | overdue
+    category: str  # work_order | completed | unlock | user | overdue | suggestion | low_stock
     title: str
     detail: str = ""
     created_at: datetime

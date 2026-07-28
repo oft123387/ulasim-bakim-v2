@@ -3,6 +3,7 @@ import { api } from '../api'
 import type { AlarmCenter, AlarmItem, AlarmPriority, User } from '../types'
 import { ALARM_LEVEL_TR, ALARM_PRIORITY_TR } from '../types'
 import { PageHeader, EmptyState, SkeletonTableRows, Badge } from '../components/ui'
+import { useLiveEvent } from '../liveEvents'
 import { Siren, AlertTriangle, Clock, ShieldCheck, RefreshCw, Truck, Check, CheckCircle2, XCircle, EyeOff } from 'lucide-react'
 
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
@@ -10,6 +11,17 @@ const fmtKm = (n: number) => n.toLocaleString('tr-TR')
 // Hedef zaten geçildiyse "X km geçti", değilse "X km kaldı".
 const kmDisplay = (remaining: number) =>
   remaining <= 0 ? `${fmtKm(Math.abs(remaining))} km geçti` : `${fmtKm(remaining)} km kaldı`
+
+// Süre bazlı (aylık/yıllık) alarmlarda target_date doludur ve remaining_km
+// alanı gerçekte gün sayısıdır (km'ye çevirmek anlamsız/yanlış olur).
+const remainingDisplay = (a: AlarmItem) =>
+  a.target_date
+    ? a.remaining_km <= 0
+      ? `${Math.abs(a.remaining_km)} gün geçti`
+      : `${a.remaining_km} gün kaldı`
+    : kmDisplay(a.remaining_km)
+const hedefDisplay = (a: AlarmItem) =>
+  a.target_date ? new Date(a.target_date).toLocaleDateString('tr-TR') : `${fmtKm(a.target_km)} km`
 
 const LEVELS: AlarmItem['level'][] = ['critical', 'warning', 'normal']
 
@@ -59,10 +71,14 @@ export default function AlarmCenterPage({
   }
   useEffect(() => {
     load()
-    // Canlı kalması için 60 sn'de bir tazele.
+    // Canlı kalması için 60 sn'de bir tazele (SSE koparsa yedek).
     const id = setInterval(load, 60000)
     return () => clearInterval(id)
   }, [includeClosed])
+
+  // Canlı Güncelleme (SSE) — biri bir alarmı onaylayınca/atayınca ya da yeni
+  // bir bakım/km değişikliği alarm durumunu etkileyebileceği için anında yenile.
+  useLiveEvent(['alarm', 'maintenance', 'vehicle'], load)
 
   useEffect(() => {
     api<User[]>('/users').then(setUsers).catch(() => setUsers([]))
@@ -105,12 +121,15 @@ export default function AlarmCenterPage({
     <>
       <PageHeader
         title="Canlı Alarm Merkezi"
-        subtitle="Geciken ve zamanı yaklaşan bakımlar önem sırasına göre canlı olarak listelenir (60 sn'de bir yenilenir)."
+        subtitle="Önceliklendirin, sorumlu atayın ve müdahale durumunu buradan takip edin."
         actions={
-          <button className="ghost" onClick={load} disabled={refreshing}>
-            <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
-            {refreshing ? 'Yenileniyor…' : 'Yenile'}
-          </button>
+          <div className="alarm-header-actions">
+            <span className="alarm-live-status"><span className="live-dot" /> Canlı</span>
+            <button className="ghost" onClick={load} disabled={refreshing}>
+              <RefreshCw size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
+              {refreshing ? 'Yenileniyor…' : 'Yenile'}
+            </button>
+          </div>
         }
       />
 
@@ -131,13 +150,14 @@ export default function AlarmCenterPage({
         ))}
       </div>
 
-      <div className="table-card fade-in">
-        <div className="table-toolbar">
-          <div className="card-title">
+      <div className="table-card fade-in alarm-list-card">
+        <div className="table-toolbar alarm-toolbar">
+          <div className="card-title alarm-list-title">
             <Siren size={15} style={{ verticalAlign: -2, marginRight: 6 }} />
             Alarmlar
+            {data !== null && <span className="muted">{items.length} kayıt</span>}
           </div>
-          <div className="row" style={{ gap: 6, marginLeft: 'auto' }}>
+          <div className="row alarm-filters" style={{ gap: 6, marginLeft: 'auto' }}>
             <button className={`small${filter === 'all' ? ' primary' : ''}`} onClick={() => setFilter('all')}>
               Tümü
             </button>
@@ -193,11 +213,11 @@ export default function AlarmCenterPage({
                       <td>
                         {a.plan_name}
                         <div className="muted" style={{ fontSize: 12 }}>
-                          Hedef {fmtKm(a.target_km)} km
+                          Hedef {hedefDisplay(a)}
                         </div>
                       </td>
                       <td style={{ fontWeight: 600, color: a.overdue ? 'var(--red)' : undefined }}>
-                        {kmDisplay(a.remaining_km)}
+                        {remainingDisplay(a)}
                       </td>
                       <td>{a.estimated_days != null ? (a.overdue ? 'Gecikti' : `~${a.estimated_days} gün`) : '—'}</td>
                       <td>

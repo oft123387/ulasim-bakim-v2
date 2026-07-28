@@ -35,6 +35,22 @@ yüklenir.
 * Durdurmak: `docker compose down` · Logları izlemek: `docker compose logs -f`
 * Üretimde `docker-compose.yml` içindeki `SECRET_KEY` değerini mutlaka değiştirin.
 
+### Sunucuda otomatik güncelleme (elle komut yazmadan)
+
+Bir sunucuda çalıştırıyorsanız, her kod değişikliğinde elle `docker compose
+up -d --build` yazmanıza gerek yok:
+
+1. GitHub Actions her push'ta imajı otomatik derleyip GHCR'a (`ghcr.io`) yükler.
+2. Sunucuda **bir kez** `docker compose up -d` çalıştırın (ilk kurulum).
+3. Bundan sonra `docker-compose.yml` içindeki `watchtower` servisi GHCR'ı
+   periyodik (5 dakikada bir) kontrol eder, yeni bir sürüm görürse imajı
+   indirip uygulamayı kendisi yeniden başlatır — tamamen otomatik.
+
+GHCR paketi varsayılan olarak **private**'tır; Watchtower'ın indirebilmesi için
+sunucuda bir kez `docker login ghcr.io -u <kullanıcı-adınız> -p <PAT>` ile
+giriş yapın (PAT'a `read:packages` yetkisi yeterli), ya da paketi GHCR
+ayarlarından **public** yapın (bu durumda login gerekmez).
+
 Sıfırdan başlamak (tüm veriyi silmek) isterseniz: `docker compose down -v`.
 
 ## Kurulum (Docker'sız, elle)
@@ -161,11 +177,16 @@ etkilenmez.
 
 ## Testler
 
-Backend çalışırken (port 8000):
+pytest tabanlı uçtan uca test paketi (kullanıcı, bakım, ağaç, dashboard,
+Excel, 3D model/hotspot, plan/araç silme akışları) canlı bir sunucu
+gerektirmez — FastAPI'nin TestClient'ı ile izole, geçici bir SQLite
+veritabanına karşı çalışır ve her push/PR'da GitHub Actions'ta
+(`.github/workflows/ci.yml`) otomatik çalışır:
 
 ```
 cd backend
-python test_e2e.py    # uçtan uca senaryolar (kullanıcı, bakım, ağaç, dashboard, Excel, diyagram/hotspot)
+pip install -r requirements-dev.txt
+pytest -v
 ```
 
 ## PostgreSQL'e Geçiş

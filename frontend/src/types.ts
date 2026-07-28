@@ -32,16 +32,32 @@ export interface Vehicle {
   last_km_update_at: string | null
   production_year: number | null
   photo_filename: string
+  // Süre bazlı (aylık/yıllık) bakımların "geçen ay" hesabı için baz tarih —
+  // verilmezse araç oluşturulduğu tarih kullanılır.
+  commissioning_date: string | null
 }
 
 export interface Plan {
   id: number
   name: string
   interval_km: number
+  threshold_type: 'percent' | 'km'
   lower_pct: number
   upper_pct: number
+  lower_km: number
+  upper_km: number
   is_active: boolean
   vehicle_model?: string
+  // 'km' (varsayılan) ya da 'time' — time ise interval_months dolu, interval_km 0'dır.
+  // 'unknown': toplu katalogda BAKIM periyodu yorumlanamamış (ör. "?") satırlar için —
+  // interval_km=0 ve interval_months=null, otomatik motorlardan hariç tutulur.
+  plan_type: 'km' | 'time' | 'unknown'
+  interval_months: number | null
+  // True ise bu plan bir temel periyodun tam katıdır (ör. 800.000 km,
+  // 200.000 km'nin katı) — Bakım Planları sayfasında (varsayılan
+  // GET /api/plans) gösterilmez, kendi başına bakım tetiklemez, ama Bakım
+  // Ağacı sayfasında (?include_catalog_only=true) görünür/düzenlenebilir.
+  is_catalog_only?: boolean
 }
 
 export interface NodeAttachment {
@@ -62,8 +78,21 @@ export interface TreeNode {
   name: string
   order_index: number
   note: string
+  // Toplu bakım kataloğu içe aktarmasından gelen üretici kart/talimat kodu
+  // (ör. "SKA-MRM-07-A05"). Boşsa rozet gösterilmez.
+  card_code: string
   children: TreeNode[]
   attachments: NodeAttachment[]
+}
+
+// Bir bakım ağacı maddesi tamamlanınca hangi parçadan kaç adet otomatik
+// düşüleceğini tanımlar — bkz. PartCatalogItem.stock_qty.
+export interface TreeNodePartUsage {
+  id: number
+  tree_node_id: number
+  part_id: number
+  part_name: string
+  qty: number
 }
 
 export interface Item {
@@ -76,6 +105,7 @@ export interface Item {
   completed_at: string | null
   completed_by: User | null
   note: string
+  card_code: string
   attachments: NodeAttachment[]
   tier_kms: number[]
   exec_note: string
@@ -93,7 +123,10 @@ export interface MaintenanceNote {
 
 export interface Maintenance {
   id: number
-  target_km: number
+  // Süre bazlı bakımlarda backend bu alanı gizler (null döner) — o durumda
+  // gerçek hedef target_date'dedir.
+  target_km: number | null
+  target_date: string | null
   km_at_open: number
   status: 'pending' | 'in_progress' | 'completed'
   created_at: string
@@ -105,12 +138,19 @@ export interface Maintenance {
   items?: Item[]
   covered_tiers?: number[]
   notes?: MaintenanceNote[]
+  // Faz 26 — Bakım başlatma onayı
+  is_activated: boolean
+  activated_at: string | null
+  activated_by: User | null
 }
 
 export interface UpcomingItem {
   vehicle: Vehicle
   plan_name: string
+  // Süre bazlı maddelerde target_km=0'dır — gerçek hedef target_date'dedir;
+  // remaining_km de o zaman km değil gün sayısıdır (negatif=gecikti).
   target_km: number
+  target_date?: string | null
   remaining_km: number
   covered_tiers?: number[]
   estimated_days?: number | null
@@ -123,6 +163,7 @@ export interface CalendarProjection {
   vehicle: Vehicle
   plan_name: string
   target_km: number
+  target_date?: string | null
   remaining_km: number
   covered_tiers?: number[]
   window_start: string
@@ -159,12 +200,106 @@ export interface Dashboard {
   recent_completed: Maintenance[]
   by_plan: PlanSummary[]
   by_vehicle: VehicleSummary[]
+  // Toplu katalog içe aktarmasından kalan, periyodu hâlâ "?" olan madde
+  // sayısı (yalnızca admin/mühendis/amir için hesaplanır, diğerlerinde 0).
+  unresolved_period_count?: number
+}
+
+// ---------- Sistem Durumu (admin) ----------
+export interface SystemStatus {
+  db_backend: string
+  db_location: string
+  foreign_keys_enforced: boolean | null
+  started_at: string
+  uptime_seconds: number
+  vehicle_count: number
+  active_vehicle_count: number
+  user_count: number
+  plan_count: number
+  catalog_only_plan_count: number
+  unresolved_period_count: number
+  tree_node_count: number
+  maintenance_pending: number
+  maintenance_in_progress: number
+  maintenance_completed: number
+  backup_dir: string
+  upload_dir: string
+  log_dir: string
+  last_backup_at: string | null
 }
 
 export interface ImportTreeResult {
   plans: Plan[]
   nodes_created: number
   maintenances_reset: number
+}
+
+// ---------- Araç modeli birleştirme (admin) ----------
+export interface VehicleModelMergeResult {
+  vehicles_moved: number
+  plans_renamed: { plan_id: number; name: string; interval_km: number }[]
+  plans_merged: {
+    plan_id: number
+    name: string
+    interval_km: number
+    merged_into_plan_id: number
+    action: string
+    moved_completed: number
+    removed_open: number
+  }[]
+}
+
+// ---------- Toplu Bakım Kataloğu İçe Aktarma (KB TOPLU LİSTE formatı) ----------
+export interface BulkCatalogSkippedRow {
+  row: number
+  reason: string
+  data: string[]
+}
+
+export interface BulkCatalogImportResult {
+  vehicle_models: string[]
+  plans_created: number
+  plans_updated: number
+  nodes_created: number
+  leaves_created: number
+  skipped: BulkCatalogSkippedRow[]
+  // BAKIM hücresi yorumlanamayan (ör. "?") ama boş olmayan satırlar —
+  // atlanmadı, "Periyodu Belirsiz (?)" planı altında ağaca eklendi.
+  unresolved_period: BulkCatalogSkippedRow[]
+  // Bir temel periyodun (ör. 200.000 km) tam katı olan periyotlar (ör.
+  // 800.000 km = 4×200.000). Kendi ayrı planı/ağacı yine oluşur (Bakım
+  // Ağacı'nda görünür), ama is_catalog_only=True işaretlenir — Bakım
+  // Planları sayfasında gösterilmez, kendi başına bakım tetiklemez.
+  catalog_only_periods?: BulkCatalogCatalogOnlyRow[]
+  // true ise bu bir önizlemedir (dry_run=true ile gönderildi) — hiçbir şey
+  // veritabanına kaydedilmedi, sayaçlar yalnızca "eğer yüklenseydi ne
+  // olurdu" bilgisini gösterir.
+  dry_run?: boolean
+}
+
+export interface BulkCatalogCatalogOnlyRow {
+  reason: string
+  km?: number
+  base_km?: number
+  vehicle_model?: string
+}
+
+// "Tümü" (birleşik) görünüm — GET /api/tree/merged. Salt-okunur; gerçek
+// TreeNode kayıtlarına birebir karşılık gelmez, yaprak maddelerde hangi
+// periyottan geldiği period_label/plan_id ile işaretlenir.
+export interface MergedTreeNode {
+  id: number
+  name: string
+  card_code: string
+  note: string
+  period_label: string | null
+  plan_id: number | null
+  is_catalog_only: boolean
+  // Yalnızca "tüm modeller" (Genel/mevcut filo) birleşik görünümünde
+  // doludur — yaprağın hangi araç modeline ait olduğunu gösterir (boş
+  // string = Genel plan).
+  vehicle_model: string | null
+  children: MergedTreeNode[]
 }
 
 export interface TreeNodeFlat {
@@ -301,6 +436,27 @@ export interface PartCatalogAttachment {
   created_at: string
 }
 
+// Bir parçanın (ör. "Körük") tamirinde/bakımında kullanılan malzeme satırı.
+// material_part_id doluysa katalogdan seçilmiş, stok takipli bir malzeme —
+// "Tamir Edildi" denince stoğu otomatik düşer. Boşsa free_text (serbest
+// metin) doludur — yalnızca bilgi amaçlıdır, stok bağlantısı yoktur.
+export interface PartRepairMaterial {
+  id: number
+  part_id: number
+  material_part_id: number | null
+  material_name: string
+  material_stock_qty: number | null
+  material_unit: string
+  free_text: string
+  qty: number
+}
+
+export interface PartRepairResult {
+  ok: boolean
+  materials_deducted: string[]
+  materials_skipped: string[]
+}
+
 export interface PartCatalogItem {
   id: number
   name: string
@@ -311,6 +467,11 @@ export interface PartCatalogItem {
   parent_id: number | null
   attachments: PartCatalogAttachment[]
   children: PartCatalogItem[]
+  // Parça stok takibi — min_stock=0 stok takibi tanımlanmadığı anlamına
+  // gelir (Bildirim Merkezi'nde düşük stok uyarısı üretilmez).
+  stock_qty: number
+  min_stock: number
+  unit: string
 }
 
 export interface BackupInfo {
@@ -331,16 +492,24 @@ export type PermissionKey =
   | 'edit_maintenance'
   | 'delete_maintenance'
   | 'approve_maintenance'
+  | 'start_maintenance'
+  | 'create_maintenance'
+  | 'delete_all_maintenance'
   | 'export_excel'
   | 'manage_users'
+  | 'view_dashboard_analytics'
 
 export const PERMISSION_KEYS: PermissionKey[] = [
   'view_maintenance',
   'edit_maintenance',
   'delete_maintenance',
   'approve_maintenance',
+  'start_maintenance',
+  'create_maintenance',
+  'delete_all_maintenance',
   'export_excel',
   'manage_users',
+  'view_dashboard_analytics',
 ]
 
 export const PERMISSION_TR: Record<PermissionKey, string> = {
@@ -348,8 +517,20 @@ export const PERMISSION_TR: Record<PermissionKey, string> = {
   edit_maintenance: 'Düzenleyebilir',
   delete_maintenance: 'Silebilir',
   approve_maintenance: 'Onaylayabilir',
+  start_maintenance: 'Aday iş emrini başlatabilir',
+  create_maintenance: 'Elle bakım iş emri açabilir',
+  delete_all_maintenance: 'Tüm bakım geçmişini silebilir',
   export_excel: 'Excel aktarabilir',
   manage_users: 'Kullanıcı ekleyebilir',
+  view_dashboard_analytics: 'Dashboard analiz bölümünü görebilir',
+}
+
+// Yetki Yönetimi sayfasında kategorilere göre gruplamak/açıklama göstermek
+// için — bkz. backend services.get_permission_defs.
+export interface PermissionDef {
+  key: string
+  category: string
+  description: string
 }
 
 export interface PermissionsMatrix {
@@ -404,6 +585,7 @@ export interface AlarmItem {
   vehicle: Vehicle
   plan_name: string
   target_km: number
+  target_date: string | null
   remaining_km: number
   estimated_days: number | null
   overdue: boolean
@@ -436,7 +618,7 @@ export const ALARM_PRIORITY_TR: Record<AlarmPriority, string> = {
 // ---------- Bildirim Merkezi ----------
 export interface NotificationItem {
   id: number
-  category: 'work_order' | 'completed' | 'unlock' | 'user' | 'overdue' | 'suggestion'
+  category: 'work_order' | 'completed' | 'unlock' | 'user' | 'overdue' | 'suggestion' | 'low_stock'
   title: string
   detail: string
   created_at: string

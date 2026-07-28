@@ -3,6 +3,7 @@ import { api, apiDownload, apiUpload, apiUploadWithFields } from '../api'
 import type { KmSimConfig, KmSimRunResult, Maintenance, UpcomingItem, User, Vehicle, VehicleAttachment, VehicleProfile } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Badge, SearchInput, EmptyState, SkeletonTableRows, StatCard } from '../components/ui'
+import { showToast } from '../components/toast'
 import {
   ArrowLeft,
   Truck,
@@ -25,6 +26,8 @@ import {
   Link as LinkIcon,
   FolderOpen,
   QrCode,
+  Star,
+  Printer,
 } from 'lucide-react'
 
 function vehicleAttIcon(kind: string) {
@@ -34,6 +37,24 @@ function vehicleAttIcon(kind: string) {
   if (kind === 'cad') return <Box size={14} />
   if (kind === 'link') return <LinkIcon size={14} />
   return <Download size={14} />
+}
+
+// ------------------------------------------------- Favori / son açılan araçlar
+const FAV_VEHICLES_KEY = 'ulasim_bakim_fav_vehicle_ids'
+const RECENT_VEHICLES_KEY = 'ulasim_bakim_recent_vehicle_ids'
+const RECENT_VEHICLES_MAX = 6
+
+function readIdList(key: string): number[] {
+  try {
+    const raw = localStorage.getItem(key)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr.filter((n) => typeof n === 'number') : []
+  } catch {
+    return []
+  }
+}
+function writeIdList(key: string, ids: number[]) {
+  localStorage.setItem(key, JSON.stringify(ids))
 }
 
 const fmtKmN = (n: number) => n.toLocaleString('tr-TR')
@@ -116,12 +137,7 @@ function KmSimCard({ onChanged }: { onChanged: () => void }) {
             <Gauge size={15} style={{ verticalAlign: -2, marginRight: 6 }} />
             Otomatik KM Simülasyonu
           </div>
-          <div className="card-subtitle">
-            Araçlar sahada günde ortalama {cfg.min_km}–{cfg.max_km} km ilerler. Sistem her gün
-            (kapalıysa açılışta kaçırılan günleri telafi ederek) tüm aktif araçların kilometresini
-            otomatik artırır; bu da gereken bakımları kendiliğinden açar. "Otomatik Güncelle"
-            butonu, son güncellenen tarihten bugüne kadar kaç gün geçtiyse o kadar ilerletir.
-          </div>
+          <div className="card-subtitle">Aktif araç kilometreleri günlük otomatik güncellenir.</div>
         </div>
       </div>
 
@@ -176,6 +192,16 @@ function KmSimCard({ onChanged }: { onChanged: () => void }) {
 
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
+// Süre bazlı (aylık/yıllık) maddelerde remaining_km alanı gün sayısıdır ve
+// target_km backend'de gizlenmiş (null) olabilir — target_date varsa buna göre göster.
+const remainingDisplayV = (u: UpcomingItem) =>
+  u.target_date
+    ? u.remaining_km <= 0
+      ? `${Math.abs(u.remaining_km)} gün geçti`
+      : `${u.remaining_km} gün kaldı`
+    : kmDisplayV(u.remaining_km)
+const hedefLabelV = (m: Maintenance) =>
+  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
 
 // ---------------------------------------------------------- Araç Profil Sayfası
 function InfoField({ label, value }: { label: string; value: React.ReactNode }) {
@@ -301,9 +327,17 @@ function VehicleDetail({
 
   return (
     <div className="fade-in">
-      <button className="ghost" onClick={onBack} style={{ marginBottom: 14, paddingLeft: 8 }}>
-        <ArrowLeft size={14} style={{ marginRight: 6, verticalAlign: -2 }} /> Araç Listesi
-      </button>
+      <div className="row" style={{ marginBottom: 14, justifyContent: 'space-between' }}>
+        <button className="ghost" onClick={onBack} style={{ paddingLeft: 8 }}>
+          <ArrowLeft size={14} style={{ marginRight: 6, verticalAlign: -2 }} /> Araç Listesi
+        </button>
+        <button className="small ghost" onClick={() => window.print()} title="Bu sayfayı yazdır">
+          <Printer size={13} style={{ marginRight: 5, verticalAlign: -2 }} /> Yazdır
+        </button>
+      </div>
+      <div className="print-only" style={{ marginBottom: 10, fontSize: 12, color: '#555' }}>
+        Ulaşım Bakım — {v.code} {v.name ? `(${v.name})` : ''} · Yazdırma tarihi: {new Date().toLocaleString('tr-TR')}
+      </div>
 
       {/* Profil başlığı: fotoğraf + kimlik bilgileri */}
       <div className="card">
@@ -332,6 +366,14 @@ function VehicleDetail({
               <InfoField label="Model" value={v.model || '—'} />
               <InfoField label="Üretim Yılı" value={v.production_year ?? '—'} />
               <InfoField label="Şasi No" value={v.chassis_no || '—'} />
+              <InfoField
+                label="Hizmete Başlama Tarihi"
+                value={
+                  v.commissioning_date
+                    ? new Date(v.commissioning_date).toLocaleDateString('tr-TR')
+                    : '—'
+                }
+              />
               <InfoField label="Son KM Güncelleme" value={fmt(v.last_km_update_at)} />
             </div>
             <div className="row" style={{ gap: 8, marginTop: 14 }}>
@@ -348,6 +390,7 @@ function VehicleDetail({
                 ref={photoRef}
                 type="file"
                 accept="image/*"
+                capture="environment"
                 style={{ display: 'none' }}
                 onChange={(e) => e.target.files?.[0] && uploadPhoto(e.target.files[0])}
               />
@@ -366,7 +409,7 @@ function VehicleDetail({
             <div className="muted" style={{ fontSize: 11, marginTop: 4 }}>Okutunca bakım geçmişi açılır</div>
             <a
               href={`/api/vehicles/${v.id}/qrcode?download=true`}
-              className="small ghost"
+              className="small ghost no-print"
               style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 6 }}
               download
             >
@@ -386,7 +429,7 @@ function VehicleDetail({
           label="Yaklaşan Bakım"
           value={
             profile?.next_upcoming
-              ? kmDisplayV(profile.next_upcoming.remaining_km)
+              ? remainingDisplayV(profile.next_upcoming)
               : 'Yok'
           }
           tone={profile?.next_upcoming?.critical ? 'danger' : undefined}
@@ -407,7 +450,7 @@ function VehicleDetail({
               onClick={() => onOpenMaintenance(profile.last_completed!.id)}
             >
               <div style={{ fontWeight: 600 }}>
-                {profile.last_completed.plan.name} · {fmtKm(profile.last_completed.target_km)} km
+                {profile.last_completed.plan.name} · {hedefLabelV(profile.last_completed)}
               </div>
               <div className="muted" style={{ fontSize: 12.5 }}>
                 Bitiş: {fmt(profile.last_completed.completed_at)} · İş Emri #{profile.last_completed.id}
@@ -513,7 +556,7 @@ function VehicleDetail({
                 <tr>
                   <th>İş Emri</th>
                   <th>Periyot</th>
-                  <th>Hedef KM</th>
+                  <th>Hedef</th>
                   <th>Durum</th>
                   <th>Oluşturma</th>
                   <th>Bitiş</th>
@@ -525,7 +568,7 @@ function VehicleDetail({
                   <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
                     <td style={{ fontWeight: 600 }}>#{m.id}</td>
                     <td>{m.plan.name}</td>
-                    <td>{fmtKm(m.target_km)} km</td>
+                    <td>{hedefLabelV(m)}</td>
                     <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                     <td>{fmt(m.created_at)}</td>
                     <td>{fmt(m.completed_at)}</td>
@@ -566,6 +609,7 @@ export default function VehiclesPage({
   const [model, setModel] = useState('')
   const [chassisNo, setChassisNo] = useState('')
   const [productionYear, setProductionYear] = useState('')
+  const [commissioningDate, setCommissioningDate] = useState('')
   const [notes, setNotes] = useState('')
   const [error, setError] = useState('')
   const [kmEdit, setKmEdit] = useState<Record<number, string>>({})
@@ -575,8 +619,31 @@ export default function VehiclesPage({
 
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('active')
+  const [modelFilter, setModelFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [knownModels, setKnownModels] = useState<string[]>([])
+  const [favIds, setFavIds] = useState<number[]>(() => readIdList(FAV_VEHICLES_KEY))
+  const [recentIds, setRecentIds] = useState<number[]>(() => readIdList(RECENT_VEHICLES_KEY))
+
+  function toggleFavorite(vehicleId: number) {
+    setFavIds((prev) => {
+      const next = prev.includes(vehicleId) ? prev.filter((id) => id !== vehicleId) : [vehicleId, ...prev]
+      writeIdList(FAV_VEHICLES_KEY, next)
+      return next
+    })
+  }
+
+  // Bir araç profili her açıldığında (tablo satırına tıklama, global arama,
+  // QR kod, "Son Açılanlar" çipi — hepsi selectedId'yi değiştirir) o aracı
+  // "son açılanlar" listesinin başına taşır.
+  useEffect(() => {
+    if (selectedId == null) return
+    setRecentIds((prev) => {
+      const next = [selectedId, ...prev.filter((id) => id !== selectedId)].slice(0, RECENT_VEHICLES_MAX)
+      writeIdList(RECENT_VEHICLES_KEY, next)
+      return next
+    })
+  }, [selectedId])
 
   const load = () => {
     api<Vehicle[]>('/vehicles').then(setList).catch(() => setList([]))
@@ -588,9 +655,13 @@ export default function VehiclesPage({
   }, [])
 
   // Global aramadan / alarm merkezinden bir araç profili açılmak istendiğinde
-  // doğrudan o aracın detayına geç.
+  // doğrudan o aracın detayına geç. initialVehicleId null'a döndüğünde
+  // (ör. Dashboard'daki "Araçlar"a normal menüden tekrar girildiğinde,
+  // App.tsx'teki navigate() bunu temizler) burada da seçili aracı EXPLICIT
+  // olarak null'a çekip listeye dönülür — sayfa yeniden mount edilmese
+  // bile önceden açılmış bir araç profili "yapışık" kalmaz.
   useEffect(() => {
-    if (initialVehicleId != null) setSelectedId(initialVehicleId)
+    setSelectedId(initialVehicleId)
   }, [initialVehicleId])
 
   const alertByVehicleId = useMemo(() => {
@@ -611,15 +682,40 @@ export default function VehiclesPage({
     [alertByVehicleId],
   )
 
+  // Filoda kullanılan tipleri doğrudan araç kayıtlarından üret. Böylece Sirio,
+  // Bozankaya ya da sonradan eklenen başka bir model için ayrıca tanım gerekmez.
+  const vehicleModels = useMemo(() => {
+    const counts = new Map<string, number>()
+    for (const v of list ?? []) {
+      const value = v.model.trim()
+      if (value) counts.set(value, (counts.get(value) ?? 0) + 1)
+    }
+    return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b, 'tr'))
+  }, [list])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    return (list ?? []).filter((v) => {
+    const base = (list ?? []).filter((v) => {
       if (statusFilter === 'active' && !v.is_active) return false
       if (statusFilter === 'inactive' && v.is_active) return false
-      if (q && !(v.code.toLowerCase().includes(q) || v.name.toLowerCase().includes(q))) return false
+      if (modelFilter && v.model !== modelFilter) return false
+      if (q && !(
+        v.code.toLowerCase().includes(q) ||
+        v.name.toLowerCase().includes(q) ||
+        v.manufacturer.toLowerCase().includes(q) ||
+        v.model.toLowerCase().includes(q)
+      )) return false
       return true
     })
-  }, [list, search, statusFilter])
+    // Favori araçlar her zaman listenin en üstünde — mühendis sürekli aynı
+    // birkaç tramvayı arıyorsa aşağı kaydırmasın.
+    return [...base].sort((a, b) => Number(favIds.includes(b.id)) - Number(favIds.includes(a.id)))
+  }, [list, search, statusFilter, modelFilter, favIds])
+
+  const recentVehicles = useMemo(
+    () => recentIds.map((id) => (list ?? []).find((v) => v.id === id)).filter((v): v is Vehicle => !!v),
+    [recentIds, list],
+  )
 
   async function add(e: React.FormEvent) {
     e.preventDefault()
@@ -635,6 +731,7 @@ export default function VehiclesPage({
           model,
           chassis_no: chassisNo,
           production_year: productionYear ? Number(productionYear) : null,
+          commissioning_date: commissioningDate || null,
           notes,
         },
       })
@@ -645,8 +742,10 @@ export default function VehiclesPage({
       setModel('')
       setChassisNo('')
       setProductionYear('')
+      setCommissioningDate('')
       setNotes('')
       load()
+      showToast('✓ Araç eklendi')
     } catch (err) {
       setError((err as Error).message)
     }
@@ -660,6 +759,7 @@ export default function VehiclesPage({
       await api(`/vehicles/${v.id}/km`, { method: 'PUT', body: { current_km: value } })
       setKmEdit((s) => ({ ...s, [v.id]: '' }))
       load()
+      showToast('✓ KM güncellendi')
     } catch (err) {
       setError((err as Error).message)
     }
@@ -676,6 +776,7 @@ export default function VehiclesPage({
     try {
       await api(`/vehicles/${v.id}`, { method: 'DELETE' })
       load()
+      showToast(`"${v.code}" silindi`, 'info')
     } catch (err) {
       setError((err as Error).message)
     }
@@ -703,7 +804,11 @@ export default function VehiclesPage({
   async function handleExport() {
     setError('')
     try {
-      await apiDownload('/vehicles/export', 'araclar.xlsx')
+      // Tablodaki durum filtresiyle (Tümü/Yalnızca Aktif/Yalnızca Pasif)
+      // aynı kapsamda dışa aktarır — önceden bu seçim yalnızca ekrandaki
+      // tabloyu etkiliyordu, indirilen Excel her zaman filtreden bağımsız
+      // TÜM araçları içeriyordu.
+      await apiDownload(`/vehicles/export?status=${statusFilter}`, 'araclar.xlsx')
     } catch (err) {
       setError((err as Error).message)
     }
@@ -725,7 +830,7 @@ export default function VehiclesPage({
     <>
       <PageHeader
         title="Araçlar"
-        subtitle="Filodaki tüm araçları yönetin, kilometre güncelleyin ve Excel ile toplu içe/dışa aktarın."
+        subtitle="Filo tipini seçin; araç, üretici veya model adına göre anında filtreleyin."
       />
 
       {user.role === 'admin' && <KmSimCard onChanged={load} />}
@@ -754,9 +859,18 @@ export default function VehiclesPage({
               />
             </label>
             {perms.export_excel && (
-              <button onClick={handleExport}>
+              <button
+                onClick={handleExport}
+                title={
+                  statusFilter === 'all'
+                    ? 'Tüm araçlar (aktif + pasif) indirilir'
+                    : statusFilter === 'active'
+                      ? 'Yalnızca aktif araçlar indirilir — aşağıdaki tablo filtresini "Tümü" yapın diğerlerini de dahil etmek için'
+                      : 'Yalnızca pasif araçlar indirilir — aşağıdaki tablo filtresini "Tümü" yapın diğerlerini de dahil etmek için'
+                }
+              >
                 <Download size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
-                Excel'e Aktar
+                Excel'e Aktar ({statusFilter === 'all' ? 'Tümü' : statusFilter === 'active' ? 'Aktif' : 'Pasif'})
               </button>
             )}
           </div>
@@ -795,6 +909,13 @@ export default function VehiclesPage({
               onChange={(e) => setProductionYear(e.target.value)}
               style={{ width: 120 }}
             />
+            <input
+              type="date"
+              value={commissioningDate}
+              onChange={(e) => setCommissioningDate(e.target.value)}
+              title="Hizmete başlama tarihi — aylık/yıllık (süre bazlı) bakımların hesabında baz alınır. Boş bırakılırsa aracın eklendiği tarih kullanılır."
+              style={{ width: 160 }}
+            />
             <input placeholder="Not" value={notes} onChange={(e) => setNotes(e.target.value)} style={{ minWidth: 220 }} />
             <button className="primary">
               <PlusCircle size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
@@ -805,14 +926,41 @@ export default function VehiclesPage({
       </div>
       {error && <div className="error">{error}</div>}
 
-      <div className="table-card fade-in">
-        <div className="table-toolbar">
-          <SearchInput value={search} onChange={setSearch} placeholder="Kod veya ada göre ara…" />
+      {recentVehicles.length > 0 && (
+        <div className="recent-vehicles-row fade-in">
+          <span className="label">Son Açılanlar:</span>
+          {recentVehicles.map((v) => (
+            <button key={v.id} className="recent-vehicle-chip" onClick={() => setSelectedId(v.id)}>
+              {v.code}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <div className="table-card fade-in vehicle-list-card">
+        <div className="table-toolbar vehicle-toolbar">
+          <SearchInput value={search} onChange={setSearch} placeholder="Kod, ad, üretici veya model ara…" />
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}>
             <option value="active">Yalnızca Aktif</option>
             <option value="inactive">Yalnızca Pasif</option>
             <option value="all">Tümü</option>
           </select>
+          <select
+            className="vehicle-model-filter"
+            value={modelFilter}
+            onChange={(e) => setModelFilter(e.target.value)}
+            aria-label="Araç tipi filtrele"
+          >
+            <option value="">Tüm araç tipleri</option>
+            {vehicleModels.map(([modelName, count]) => (
+              <option key={modelName} value={modelName}>{modelName} ({count})</option>
+            ))}
+          </select>
+          {modelFilter && (
+            <button className="small ghost" onClick={() => setModelFilter('')}>
+              Tip filtresini temizle
+            </button>
+          )}
           {alerts.length > 0 && (
             <span className="alert-pill">
               <AlertTriangle size={12} /> {alertByVehicleId.size} araçta bakım yaklaşıyor
@@ -836,6 +984,7 @@ export default function VehiclesPage({
           <table>
             <thead>
               <tr>
+                <th style={{ width: 34 }}></th>
                 <th>Kod</th>
                 <th>Ad</th>
                 <th>Anlık KM</th>
@@ -848,18 +997,31 @@ export default function VehiclesPage({
               </tr>
             </thead>
             <tbody>
-              {list === null && <SkeletonTableRows columns={9} />}
+              {list === null && <SkeletonTableRows columns={10} />}
               {list !== null && filtered.map((v) => {
                 const alert = alertByVehicleId.get(v.id)
                 const rowClass = alert ? (alert.critical ? 'critical-row' : alert.urgent ? 'urgent-row' : 'alert-row') : ''
+                const isFav = favIds.includes(v.id)
                 return (
                   <tr key={v.id} className={rowClass}>
+                    <td>
+                      <button
+                        className={`fav-star-btn ${isFav ? 'active' : ''}`}
+                        title={isFav ? 'Favorilerden çıkar' : 'Favorilere ekle'}
+                        onClick={(e) => { e.stopPropagation(); toggleFavorite(v.id) }}
+                      >
+                        <Star size={16} />
+                      </button>
+                    </td>
                     <td className="clickable-row" onClick={() => setSelectedId(v.id)}>
                       <span className="vehicle-code">{v.code}</span>
                     </td>
                     <td className="clickable-row" onClick={() => setSelectedId(v.id)}>{v.name}</td>
                     <td>{fmtKm(v.current_km)}</td>
-                    <td>{[v.manufacturer, v.model].filter(Boolean).join(' / ') || '—'}</td>
+                    <td className="vehicle-model-cell">
+                      {v.model ? <span className="vehicle-model-name">{v.model}</span> : <span>—</span>}
+                      {v.manufacturer && <span className="vehicle-manufacturer">{v.manufacturer}</span>}
+                    </td>
                     <td>{v.chassis_no || '—'}</td>
                     <td>{fmt(v.last_km_update_at)}</td>
                     <td>
@@ -867,19 +1029,19 @@ export default function VehiclesPage({
                         alert.critical ? (
                           <span
                             className="critical-pill"
-                            title={`${alert.plan_name} — ${kmDisplayV(alert.remaining_km)}, tahmini ~${alert.estimated_days} gün`}
+                            title={`${alert.plan_name} — ${remainingDisplayV(alert)}, tahmini ~${alert.estimated_days} gün`}
                           >
                             <AlertTriangle size={12} /> Çok Kritik!
                           </span>
                         ) : alert.urgent ? (
                           <span
                             className="urgent-pill"
-                            title={`${alert.plan_name} yaklaşıyor (${kmDisplayV(alert.remaining_km)}, tahmini ~${alert.estimated_days} gün)`}
+                            title={`${alert.plan_name} yaklaşıyor (${remainingDisplayV(alert)}, tahmini ~${alert.estimated_days} gün)`}
                           >
                             <AlertTriangle size={12} /> ~{alert.estimated_days} Gün Kaldı!
                           </span>
                         ) : (
-                          <span className="alert-pill" title={`${alert.plan_name} yaklaşıyor (${kmDisplayV(alert.remaining_km)})`}>
+                          <span className="alert-pill" title={`${alert.plan_name} yaklaşıyor (${remainingDisplayV(alert)})`}>
                             <AlertTriangle size={12} /> Bakım Yaklaşıyor
                           </span>
                         )

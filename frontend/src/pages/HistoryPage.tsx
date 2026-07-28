@@ -7,6 +7,9 @@ import { ChevronRight, Download, ListFilter, History as HistoryIcon, Truck } fro
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
+// Süre bazlı iş emirlerinde gerçek hedef target_date'dedir (target_km gizli/null).
+const hedefLabel = (m: Maintenance) =>
+  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
 
 interface Filters {
   status: string
@@ -112,7 +115,6 @@ export default function HistoryPage({
     <>
       <PageHeader
         title="Bakım Geçmişi"
-        subtitle="Tamamlanan bakımlar araç bazında, en yeni üstte listelenir. Tarih aralığı, araç, periyot, personel ve kilometreye göre filtreleyip Excel'e aktarabilirsiniz."
       />
 
       <div className="table-card fade-in">
@@ -209,7 +211,7 @@ export default function HistoryPage({
                     <tr>
                       <th>İş Emri</th>
                       <th>Periyot</th>
-                      <th>Hedef KM</th>
+                      <th>Hedef</th>
                       <th>Durum</th>
                       <th>Bitiş</th>
                       <th></th>
@@ -220,7 +222,7 @@ export default function HistoryPage({
                       <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
                         <td style={{ fontWeight: 600 }}>#{m.id}</td>
                         <td>{m.plan.name}</td>
-                        <td>{fmtKm(m.target_km)} km</td>
+                        <td>{hedefLabel(m)}</td>
                         <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                         <td>{fmt(m.completed_at)}</td>
                         <td>

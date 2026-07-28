@@ -81,18 +81,22 @@ def _dt(v) -> str:
 # ================================================================= Satır çıkarma (Bakımlar / Audit)
 def maintenance_rows(maintenances: list) -> tuple[list[str], list[list[str]]]:
     headers = [
-        "İş Emri", "Araç Kodu", "Araç Adı", "Periyot", "Hedef KM", "Açılış KM",
+        "İş Emri", "Araç Kodu", "Araç Adı", "Periyot", "Hedef", "Açılış KM",
         "Durum", "İlerleme", "Atanan", "Oluşturma", "Başlangıç", "Bitiş",
     ]
     rows = []
     for m in maintenances:
         done, total = excel_utils._count_leaves(list(m.items))
+        # Süre bazlı bakımlarda target_km dahili bir sentinel değerdir (bkz.
+        # models.Maintenance) — dışa aktarımda her zaman gerçek hedefi (km ya
+        # da tarih) gösterilir.
+        hedef = m.target_date.strftime("%d.%m.%Y") if m.target_date else str(m.target_km)
         rows.append([
             str(m.id),
             m.vehicle.code if m.vehicle else "",
             m.vehicle.name if m.vehicle else "",
             m.plan.name if m.plan else "",
-            str(m.target_km),
+            hedef,
             str(m.km_at_open),
             _STATUS_TR.get(m.status, m.status),
             f"{done}/{total}",

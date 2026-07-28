@@ -62,11 +62,7 @@ function BackupsPanel() {
             <DatabaseBackup size={16} style={{ verticalAlign: -3, marginRight: 6 }} />
             Veritabanı Yedekleri
           </div>
-          <div className="card-subtitle">
-            Her gün otomatik olarak yedek alınır ve en eski yedekler otomatik silinir (son 30 yedek saklanır).
-            Sunucunun kendisi tamamen kaybolursa veriyi koruyabilmek için, arada bir bir yedeği kendi
-            bilgisayarınıza veya bulut depolamanıza indirmeniz önerilir.
-          </div>
+          <div className="card-subtitle">Günlük yedek alınır; son 30 yedek saklanır.</div>
         </div>
         <button className="small" disabled={busy} onClick={runNow}>
           <RefreshCw size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
@@ -175,7 +171,6 @@ export default function AuditLogPage() {
     <>
       <PageHeader
         title="İşlem Kayıtları"
-        subtitle="Sistemde yapılan her kritik işlem (oluşturma, düzenleme, silme, tamamlama, kilit açma, içe/dışa aktarma) değiştirilemez şekilde kaydedilir. Yalnızca yönetici görüntüleyebilir."
       />
 
       <BackupsPanel />

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
+import { useLiveEvent } from '../liveEvents'
 import type { NotificationItem, SearchHit, SearchResults } from '../types'
 import {
   Search,
@@ -17,6 +18,8 @@ import {
   AlertTriangle,
   Inbox,
   Lightbulb,
+  HelpCircle,
+  PackageX,
 } from 'lucide-react'
 
 // Global aramada sonucu tıklanınca hangi sayfaya gidileceğini App belirler.
@@ -68,6 +71,22 @@ function GlobalSearch({
   const [results, setResults] = useState<SearchResults | null>(null)
   const [loading, setLoading] = useState(false)
   const boxRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // Ctrl+K (Cmd+K Mac'te) — çoğu kurumsal uygulamada olduğu gibi, nerede
+  // olursanız olun tek tuşla global aramaya odaklanmayı sağlar.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        inputRef.current?.focus()
+        inputRef.current?.select()
+        setOpen(true)
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   useEffect(() => {
     const query = q.trim()
@@ -114,13 +133,14 @@ function GlobalSearch({
       <div className="search-box topbar-search-box">
         <Search size={15} />
         <input
+          ref={inputRef}
           value={q}
           onFocus={() => setOpen(true)}
           onChange={(e) => {
             setQ(e.target.value)
             setOpen(true)
           }}
-          placeholder="Araç, iş emri, parça, personel, PDF ara…"
+          placeholder="Araç, iş emri, parça, personel, PDF ara… (Ctrl+K)"
         />
         {q && (
           <button className="topbar-search-clear" title="Temizle" onClick={() => { setQ(''); setResults(null) }}>
@@ -178,6 +198,7 @@ const NOTIF_ICON: Record<NotificationItem['category'], React.ReactNode> = {
   user: <UserPlus size={15} />,
   overdue: <AlertTriangle size={15} />,
   suggestion: <Lightbulb size={15} />,
+  low_stock: <PackageX size={15} />,
 }
 
 const NOTIF_TONE: Record<NotificationItem['category'], string> = {
@@ -187,6 +208,7 @@ const NOTIF_TONE: Record<NotificationItem['category'], string> = {
   user: 'info',
   overdue: 'crit',
   suggestion: 'info',
+  low_stock: 'warn',
 }
 
 const LAST_SEEN_KEY = 'notif_last_seen'
@@ -210,6 +232,10 @@ function NotificationBell({ onOpenMaintenance }: { onOpenMaintenance: (id: numbe
     const id = setInterval(load, 60000)
     return () => clearInterval(id)
   }, [])
+
+  // Canlı Güncelleme (SSE) — yeni bir iş emri/tamamlama/kilit açma/kullanıcı/
+  // öneri/düşük stok olayı olunca zil anında güncellensin.
+  useLiveEvent(['maintenance', 'user', 'suggestion', 'part', 'permission'], load)
 
   useEffect(() => {
     function onDocClick(e: MouseEvent) {
@@ -286,15 +312,24 @@ export default function TopbarTools({
   allow,
   onPick,
   onOpenMaintenance,
+  onStartTour,
 }: {
   allow: Record<HitType, boolean>
   onPick: (hit: SearchHit) => void
   onOpenMaintenance: (id: number) => void
+  // Site eğitim turunu elle (yeniden) başlatır — ilk girişte otomatik
+  // açılan tur bir kez kapatıldıktan sonra buradan tekrar izlenebilir.
+  onStartTour?: () => void
 }) {
   return (
     <div className="topbar-tools">
       <GlobalSearch allow={allow} onPick={onPick} />
       <NotificationBell onOpenMaintenance={onOpenMaintenance} />
+      {onStartTour && (
+        <button className="tour-help-btn" title="Site turunu başlat" onClick={onStartTour}>
+          <HelpCircle size={17} />
+        </button>
+      )}
     </div>
   )
 }

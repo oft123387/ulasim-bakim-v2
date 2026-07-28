@@ -1,7 +1,8 @@
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -93,6 +94,11 @@ class Vehicle(Base):
     # dosya adı; /uploads/vehicles/<filename> altında servis edilir).
     production_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
     photo_filename: Mapped[str] = mapped_column(String(300), default="")
+    # Süre bazlı (aylık/yıllık) bakım planları için başlangıç referans tarihi
+    # ("hizmete başlama tarihi"). Bu tarih olmadan süre bazlı bakımların
+    # "kaç ay geçti" hesabı yapılamaz — bkz. services.check_and_open_time_maintenances.
+    # Girilmezse araç oluşturulduğu gün otomatik atanır (create_vehicle).
+    commissioning_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     maintenances = relationship("Maintenance", back_populates="vehicle")
     attachments = relationship(
@@ -128,10 +134,28 @@ class VehicleAttachment(Base):
 class MaintenancePlan(Base):
     """Periyodik bakım planı: her interval_km'de bir bakım.
 
-    Alt limit = hedef_km - interval_km * lower_pct/100
-    Üst limit = hedef_km + interval_km * upper_pct/100
-    Örn. interval=25.000, lower=50, upper=10 → 1.025.000 km bakımı
-    için aralık [1.012.500 , 1.027.500].
+    Açılma (tolerans) penceresi iki farklı şekilde tanımlanabilir
+    (threshold_type):
+      - "percent" (varsayılan, geriye dönük uyumlu):
+        Alt limit = hedef_km - interval_km * lower_pct/100
+        Üst limit = hedef_km + interval_km * upper_pct/100
+        Örn. interval=25.000, lower=50, upper=10 → 1.025.000 km bakımı
+        için aralık [1.012.500 , 1.027.500].
+      - "km" (sabit kalan km):
+        Alt limit = hedef_km - lower_km
+        Üst limit = hedef_km + upper_km
+        Örn. hedef=25.000, lower_km=2000, upper_km=500 → aralık
+        [23.000 , 25.500]. Periyot büyüklüğünden bağımsız, sabit bir
+        kilometre payı isteyen kullanıcılar için (ör. "hedeften 2000 km
+        önce açılsın" gibi periyottan bağımsız net bir kural).
+
+    plan_type ("km" | "time"): "time" ise interval_km yerine interval_months
+    kullanılır — periyot kilometre değil takvim ayıdır (ör. 1/3/6 ay,
+    1/2/6/10 yıl → 12/24/72/120 ay). Açılma mantığı KM motoruyla birebir
+    aynıdır (bkz. services.check_and_open_time_maintenances) — sadece "km"
+    yerine "aracın hizmete başlama tarihinden geçen ay sayısı" kullanılır.
+    Bu durumda lower_pct/upper_pct de aynı şekilde ama AY biriminde
+    yorumlanır (threshold_type/lower_km/upper_km süre planlarında kullanılmaz).
     """
 
     __tablename__ = "maintenance_plans"
@@ -139,8 +163,13 @@ class MaintenancePlan(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
     interval_km: Mapped[int] = mapped_column(Integer)
-    lower_pct: Mapped[float] = mapped_column(Float, default=50.0)
+    # "percent" veya "km" — hangi alan çiftinin (lower_pct/upper_pct ya da
+    # lower_km/upper_km) kullanılacağını belirler.
+    threshold_type: Mapped[str] = mapped_column(String(10), default="percent")
+    lower_pct: Mapped[float] = mapped_column(Float, default=5.0)
     upper_pct: Mapped[float] = mapped_column(Float, default=10.0)
+    lower_km: Mapped[float] = mapped_column(Float, default=0.0)
+    upper_km: Mapped[float] = mapped_column(Float, default=0.0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     # Boş ("") = "genel" plan, filodaki TÜM araçlara (modelinden bağımsız)
     # uygulanır — mevcut/eski planların hepsi bu şekildedir, geriye dönük
@@ -148,6 +177,24 @@ class MaintenancePlan(Base):
     # birebir eşleşen araçlara uygulanır (farklı araç modelleri için ayrı
     # bakım ağaçları/periyotları tanımlamayı sağlar).
     vehicle_model: Mapped[str] = mapped_column(String(100), default="")
+    # "km" (varsayılan, geriye dönük uyumlu) veya "time" (süre bazlı).
+    plan_type: Mapped[str] = mapped_column(String(10), default="km")
+    # Yalnızca plan_type="time" için: periyot, ay cinsinden (1 ay, 3 ay,
+    # 12 ay = 1 yıl, 72 ay = 6 yıl, vb.).
+    interval_months: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Toplu katalog içe aktarımında, bir periyot (ör. 800.000 km) TEMEL bir
+    # periyodun (ör. 200.000 km) tam katıysa: kendi başına AYRI bir bakım
+    # sayılmaz (200.000 km planı zaten 800.000'de de otomatik tetiklenir —
+    # km motoru periyodun her katında tekrar eder), bu yüzden bu plan
+    # is_catalog_only=True olarak işaretlenir:
+    #   - Bakım Planları sayfasında (GET /api/plans varsayılanı) GÖSTERİLMEZ,
+    #     kendi başına bakım/iş emri AÇMAZ (services.check_and_open_* bu
+    #     planları eler).
+    #   - Bakım Ağacı sayfasında ("Bakım Planı" seçicisinde) yine de
+    #     GÖRÜNÜR ve düzenlenebilir — kaynak katalogdaki içeriği kaybolmasın,
+    #     kullanıcı o periyoda özel maddeleri görebilsin diye
+    #     (GET /api/plans?include_catalog_only=true).
+    is_catalog_only: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class TreeNode(Base):
@@ -171,6 +218,11 @@ class TreeNode(Base):
     order_index: Mapped[int] = mapped_column(Integer, default=0)
     # Faz 10: admin'in maddeye eklediği açıklama/talimat metni (usta görür).
     note: Mapped[str] = mapped_column(Text, default="")
+    # Toplu bakım kataloğu içe aktarmasından gelen "KART KODU" (üretici bakım
+    # kartı/talimat referans numarası, ör. "SKA-MRM-13-A03", "B0734"). Madde
+    # adının yanında küçük bir rozet olarak gösterilir — bkz. MaintenancesPage
+    # .card-code-pill (pdf-pill ile aynı desen).
+    card_code: Mapped[str] = mapped_column(String(50), default="")
 
     children = relationship(
         "TreeNode", cascade="all, delete-orphan", order_by="TreeNode.order_index"
@@ -181,6 +233,37 @@ class TreeNode(Base):
         cascade="all, delete-orphan",
         order_by="NodeAttachment.id",
     )
+
+
+class TreeNodePartUsage(Base):
+    """Bir bakım ağacı maddesinin (genellikle en alt seviye/yaprak madde)
+    tamamlanması sırasında kullanılan parça(lar) ve adetleri.
+
+    Usta bu maddeyi işaretleyip tamamladığında (bkz. services.complete_item
+    / force_complete_maintenance), buradaki her satır için
+    PartCatalogItem.stock_qty otomatik olarak `qty` kadar düşülür (bkz.
+    services._adjust_stock_for_node); madde kilidi açılıp sıfırlanırsa
+    (services.unlock_item) aynı miktar geri eklenir. Aynı (tree_node_id,
+    part_id) çifti için tek satır olur — tekrar eklenirse qty güncellenir
+    (upsert, bkz. main.py add_node_part_usage)."""
+
+    __tablename__ = "tree_node_part_usages"
+    __table_args__ = (
+        UniqueConstraint("tree_node_id", "part_id", name="uq_node_part"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tree_node_id: Mapped[int] = mapped_column(
+        ForeignKey("tree_nodes.id", ondelete="CASCADE"), index=True
+    )
+    part_id: Mapped[int] = mapped_column(
+        ForeignKey("part_catalog_items.id", ondelete="CASCADE"), index=True
+    )
+    # Float (Integer değil): "1 kg'lık üründen bu maddede 0.2 kg kullanılır"
+    # gibi kesirli miktarları desteklemek için — bkz. PartCatalogItem.unit.
+    qty: Mapped[float] = mapped_column(Float, default=1.0)
+
+    part = relationship("PartCatalogItem")
 
 
 class Maintenance(Base):
@@ -200,7 +283,20 @@ class Maintenance(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_id: Mapped[int] = mapped_column(ForeignKey("vehicles.id"))
     plan_id: Mapped[int] = mapped_column(ForeignKey("maintenance_plans.id"))
+    # KM planlarında gerçek hedef km. SÜRE planlarında (plan.plan_type=="time")
+    # bu sütun hâlâ NOT NULL olduğu için ve mevcut uq_once benzersizlik kısıtını
+    # (vehicle_id, plan_id, target_km) şema değişikliği yapmadan yeniden
+    # kullanabilmek için, süre bakımlarında target_km = -(hedef ay sayısı)
+    # (negatif "sentinel" değer) tutulur — asla gerçek bir km hedefiyle
+    # çakışmaz (km hedefleri her zaman pozitiftir) ve aynı planın art arda
+    # gelen her ay/yıl tekrarı için ayrı, benzersiz bir değer üretir. Gerçek
+    # takvim tarihi için her zaman target_date alanına bakılmalı; target_km
+    # süre bakımlarında YALNIZCA dahili benzersizlik amaçlıdır, kullanıcıya
+    # asla gösterilmez (bkz. services.check_and_open_time_maintenances).
     target_km: Mapped[int] = mapped_column(Integer)
+    # Yalnızca süre bazlı bakımlarda dolu — bu iş emrinin hedeflediği takvim
+    # tarihi (aracın hizmete başlama tarihinden + N ay). KM bakımlarında None.
+    target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     km_at_open: Mapped[int] = mapped_column(Integer)
     # pending (Bekliyor) | in_progress (Devam Ediyor) | completed (Tamamlandı)
     status: Mapped[str] = mapped_column(String(20), default="pending")
@@ -208,12 +304,32 @@ class Maintenance(Base):
         ForeignKey("users.id"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    # DİKKAT: started_at, teknisyenin checklist'te İLK maddeyi tamamladığı an
+    # (status pending -> in_progress geçişi, bkz. services.complete_item) set
+    # edilir — aşağıdaki is_activated/activated_at ile KARIŞTIRILMAMALI.
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Faz 26 — Bakım başlatma onayı: otomatik-açma (check_and_open_maintenances)
+    # bir iş emrini artık DOĞRUDAN görünür/çalışılabilir yapmaz; yalnızca bir
+    # "aday" olarak oluşturur (is_activated=False). Admin/Mühendis (yetkisi
+    # olan roller) Bakımlar sayfasındaki "Başlatılmayı Bekleyenler" bölümünden
+    # bu adayı gözden geçirip "Başlat" demeden iş emri; Bakımlar listesinde,
+    # Takvim'de, Dashboard'da ve Alarm Merkezi'nde HİÇBİR role görünmez ve
+    # teknisyen ekranında çalışılamaz. Eski (bu özellikten önce açılmış)
+    # kayıtlar geriye dönük uyumluluk için migrate.py'de is_activated=1 ile
+    # doldurulur — bu özellik yalnızca BUNDAN SONRA açılan yeni adaylara
+    # uygulanır.
+    is_activated: Mapped[bool] = mapped_column(Boolean, default=False)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    activated_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+
     vehicle = relationship("Vehicle", back_populates="maintenances")
     plan = relationship("MaintenancePlan")
-    assigned_to = relationship("User")
+    assigned_to = relationship("User", foreign_keys=[assigned_to_id])
+    activated_by = relationship("User", foreign_keys=[activated_by_id])
     items = relationship(
         "MaintenanceItem",
         back_populates="maintenance",
@@ -404,6 +520,48 @@ class PartCatalogItem(Base):
         order_by="PartCatalogItem.order_index",
     )
 
+    # Parça stok takibi: depo/stok adedi ve düşük stok eşiği. stock_qty, bu
+    # parça bir bakım ağacı maddesine (TreeNodePartUsage) bağlıysa ilgili
+    # madde tamamlanınca otomatik düşer (services._adjust_stock_for_node),
+    # madde kilidi açılıp sıfırlanırsa geri eklenir. min_stock=0 (varsayılan)
+    # "bu parça için stok takibi/eşiği tanımlanmadı" anlamına gelir —
+    # Bildirim Merkezi'nde yalnızca min_stock > 0 olan parçalar için düşük
+    # stok uyarısı üretilir (aksi halde henüz stok girilmemiş yüzlerce parça
+    # gürültü oluştururdu). Float (Integer değil): "1 kg'lık bir üründen bir
+    # bakımda 0.2 kg kullanılır" gibi kesirli miktarları (gram/litre/metre
+    # cinsinden ölçülen sarf malzemeleri) desteklemek için.
+    stock_qty: Mapped[float] = mapped_column(Float, default=0.0)
+    min_stock: Mapped[float] = mapped_column(Float, default=0.0)
+    unit: Mapped[str] = mapped_column(String(20), default="adet")
+
+
+class PartRepairMaterial(Base):
+    """Bir parçanın (ör. "Körük") tamirinde/bakımında kullanılan malzeme
+    satırı. İki türlü olabilir:
+      * material_part_id doluysa: Parça Bilgi Bankası'ndan seçilmiş, stok
+        takipli bir malzeme (ör. "Vida M6") — "Tamir Edildi" (bkz.
+        main.py repair_part) denince bu malzemenin stoğu `qty` kadar
+        otomatik düşer.
+      * free_text doluysa (material_part_id boş): kataloğa ayrı bir parça
+        olarak eklenmemiş, serbest metinle tanımlanmış malzeme (ör. "4 adet
+        M6 vida") — yalnızca bilgi amaçlıdır, stok bağlantısı olmadığı için
+        "Tamir Edildi" denince düşülmez."""
+
+    __tablename__ = "part_repair_materials"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    part_id: Mapped[int] = mapped_column(
+        ForeignKey("part_catalog_items.id", ondelete="CASCADE"), index=True
+    )
+    material_part_id: Mapped[int | None] = mapped_column(
+        ForeignKey("part_catalog_items.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    free_text: Mapped[str] = mapped_column(String(200), default="")
+    qty: Mapped[float] = mapped_column(Float, default=1.0)
+
+    part = relationship("PartCatalogItem", foreign_keys=[part_id])
+    material = relationship("PartCatalogItem", foreign_keys=[material_part_id])
+
 
 class PartCatalogAttachment(Base):
     """Bir parça kataloğu maddesine bağlı doküman / kablo şeması / devre
@@ -578,6 +736,12 @@ class AlarmState(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     closed: Mapped[bool] = mapped_column(Boolean, default=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Bu alarm için admin/mühendis/amir'e (doğrulanmış e-postası olanlara)
+    # kritik-alarm e-postası ne zaman gönderildi — None ise hiç gönderilmedi.
+    # Aynı alarma (aynı vehicle_id+target_km) tekrar tekrar e-posta
+    # atılmasını önlemek için kullanılır (bkz. main.py _send_critical_alarm_
+    # emails). Alarm onaylanır/çözülür/kapatılırsa da tekrar e-posta atılmaz.
+    emailed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now

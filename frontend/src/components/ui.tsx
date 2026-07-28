@@ -13,14 +13,23 @@ export function PageHeader({
   subtitle,
   actions,
   breadcrumb,
+  decoration,
 }: {
   title: string
   subtitle?: string
   actions?: ReactNode
   breadcrumb?: { label: string; onClick?: () => void }[]
+  /** İsteğe bağlı dekoratif katman (ör. ParticleNetwork) — ".fade-in"
+   * sarmalayıcısının İÇİNE, başlık/altyazıdan ÖNCE (yani görsel olarak
+   * arkasına) render edilir. Yalnızca ilgili sayfa özel bir arka plan
+   * stiliyle (ör. Dashboard'daki ".dashboard-page > .fade-in" hero
+   * kartı — position:relative + overflow:hidden) kullanılmalıdır; aksi
+   * halde sınırları belirsiz kalır. */
+  decoration?: ReactNode
 }) {
   return (
     <div className="fade-in">
+      {decoration}
       {breadcrumb && breadcrumb.length > 0 && <Breadcrumb items={breadcrumb} />}
       <div className="page-header" style={{ marginTop: breadcrumb ? 6 : 0 }}>
         <div>

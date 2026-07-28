@@ -197,7 +197,7 @@ export default function ProfilePage({
 
   return (
     <>
-      <PageHeader title="Profil" subtitle="Kişisel bilgilerinizi görüntüleyin, tema tercihinizi ve şifrenizi yönetin." />
+      <PageHeader title="Profil" />
 
       <div className="grid grid-2" style={{ alignItems: 'start' }}>
         <div className="card slide-up">

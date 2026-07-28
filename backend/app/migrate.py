@@ -17,6 +17,7 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("last_km_update_at", "DATETIME"),
         ("production_year", "INTEGER"),
         ("photo_filename", "VARCHAR(300) DEFAULT ''"),
+        ("commissioning_date", "DATE"),
     ],
     "users": [
         ("email", "VARCHAR(200) DEFAULT ''"),
@@ -26,6 +27,7 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "tree_nodes": [
         ("plan_id", "INTEGER"),
         ("note", "TEXT DEFAULT ''"),
+        ("card_code", "VARCHAR(50) DEFAULT ''"),
     ],
     "maintenance_items": [
         ("source_node_id", "INTEGER"),
@@ -36,9 +38,39 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
     ],
     "maintenance_plans": [
         ("vehicle_model", "VARCHAR(100) DEFAULT ''"),
+        ("threshold_type", "VARCHAR(10) DEFAULT 'percent'"),
+        ("lower_km", "FLOAT DEFAULT 0.0"),
+        ("upper_km", "FLOAT DEFAULT 0.0"),
+        ("plan_type", "VARCHAR(10) DEFAULT 'km'"),
+        ("interval_months", "INTEGER"),
+        ("is_catalog_only", "BOOLEAN DEFAULT 0"),
     ],
     "part_catalog_items": [
         ("parent_id", "INTEGER"),
+        # FLOAT (INTEGER değil): kesirli stok miktarlarını (ör. 1 kg'lık bir
+        # üründen 0.2 kg kullanımı) desteklemek için. SQLite'ta tür affinity'si
+        # esnek olduğu için önceden INTEGER olarak eklenmiş bir sütun da
+        # kesirli değerleri kayıpsız saklar — bu satır yalnızca SIFIRDAN
+        # kurulan veritabanlarında doğru türle oluşturulmasını sağlar.
+        ("stock_qty", "FLOAT DEFAULT 0"),
+        ("min_stock", "FLOAT DEFAULT 0"),
+        ("unit", "VARCHAR(20) DEFAULT 'adet'"),
+    ],
+    "maintenances": [
+        # ÖNEMLİ: default '1' (TRUE) — bu sütun eklenmeden ÖNCE açılmış tüm
+        # mevcut iş emirleri geriye dönük uyumluluk için otomatik olarak
+        # "başlatılmış" sayılır (aksi halde bu migration'dan sonra sunucu
+        # yeniden başlatılınca kullanıcının önünde olan tüm bakımlar aniden
+        # Bakımlar/Takvim'den kaybolurdu). Yalnızca BUNDAN SONRA
+        # check_and_open_maintenances ile açılan YENİ adaylar kod tarafında
+        # açıkça is_activated=False verilerek "onay bekliyor" durumunda başlar.
+        ("is_activated", "BOOLEAN DEFAULT 1"),
+        ("activated_at", "DATETIME"),
+        ("activated_by_id", "INTEGER"),
+        ("target_date", "DATE"),
+    ],
+    "alarm_states": [
+        ("emailed_at", "DATETIME"),
     ],
     "audit_logs": [
         ("old_value", "TEXT DEFAULT ''"),

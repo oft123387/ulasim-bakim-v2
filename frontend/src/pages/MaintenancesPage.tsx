@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, apiDownload } from '../api'
+import { showToast } from '../components/toast'
 import Tram3D from '../components/Tram3D'
-import type { ExportFormat, Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Shift, ShiftModeConfig, User } from '../types'
+import type { ExportFormat, Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Plan, Shift, ShiftModeConfig, User, Vehicle } from '../types'
 import { STATUS_TR } from '../types'
 import {
   PageHeader,
@@ -27,6 +28,14 @@ import {
   Send,
   AlertTriangle,
   Users,
+  PlayCircle,
+  ShieldAlert,
+  Trash2,
+  Plus,
+  Search,
+  X,
+  CheckCircle2,
+  RotateCcw,
 } from 'lucide-react'
 
 // Paylaşılan tablet üzerinde vardiya seçimi, aynı tarayıcıda sayfa
@@ -90,7 +99,27 @@ function ItemExtras({ item }: { item: Item }) {
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
+// Tahmini Bakım Aralığı rozetinde km'nin yanında tahmini tarih de gösterilir
+// (ör. "en geç 12.08.2026") — DAILY_KM varsayımıyla hesaplanan earliest/latest
+// tarihlerin gün.ay.yıl biçiminde yazımı.
 const fmtDate = (d: Date) => d.toLocaleDateString('tr-TR')
+
+// Süre bazlı (aylık/yıllık) iş emirlerinde gerçek hedef bir km değil takvim
+// tarihidir (target_date) — backend km alanını bu durumda gizler (null).
+// Tablo/başlık gösterimlerinde ikisini de doğru biçimde tek bir metne çevirir.
+const hedefLabel = (m: Maintenance) =>
+  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+
+// Plan periyodunu türüne göre okunur biçimde göster (km bazlı ↔ süre bazlı) —
+// seçim listelerinde kullanılır.
+const planPeriodLabel = (p: Plan) => {
+  if (p.plan_type === 'unknown') return 'Belirsiz (?)'
+  if (p.plan_type === 'time') {
+    const mo = p.interval_months ?? 0
+    return mo % 12 === 0 ? `${mo / 12} yıl` : `${mo} ay`
+  }
+  return `${fmtKm(p.interval_km)} km`
+}
 
 // Takvim/Dashboard'daki projeksiyonlarla aynı varsayım: günde ortalama 300 km.
 const DAILY_KM = 300
@@ -104,10 +133,22 @@ const DAILY_KM = 300
  * tamamlanmamış iş emirleri için anlamlıdır. */
 function estimateWindow(
   m: Maintenance,
-): { earliest: Date; latest: Date; earliestReached: boolean; overdue: boolean } | null {
+): { earliest: Date; latest: Date; earliestReached: boolean; overdue: boolean; remainingKm: number } | null {
   if (m.status === 'completed') return null
-  const lowerKm = m.target_km - (m.plan.interval_km * m.plan.lower_pct) / 100
-  const upperKm = m.target_km + (m.plan.interval_km * m.plan.upper_pct) / 100
+  // Süre bazlı (aylık/yıllık) iş emirlerinde hedef bir km değil takvim
+  // tarihidir (target_date) — km projeksiyonu burada anlamsız, bu yüzden bu
+  // fonksiyon yalnızca km bazlı planlar için hesap yapar.
+  if (m.plan.plan_type === 'time' || m.target_km == null) return null
+  // Faz 26: plan yüzde (lower_pct/upper_pct) ya da sabit km (lower_km/
+  // upper_km) bazlı tolerans kullanabiliyor — hangisi geçerliyse ona göre
+  // hesapla (aksi halde km bazlı bir plan için burada hep varsayılan %50/%10
+  // kullanılıp yanlış tarih üretilirdi).
+  const lowerKm = m.plan.threshold_type === 'km'
+    ? m.target_km - m.plan.lower_km
+    : m.target_km - (m.plan.interval_km * m.plan.lower_pct) / 100
+  const upperKm = m.plan.threshold_type === 'km'
+    ? m.target_km + m.plan.upper_km
+    : m.target_km + (m.plan.interval_km * m.plan.upper_pct) / 100
   const remainingLower = lowerKm - m.vehicle.current_km
   const remainingUpper = upperKm - m.vehicle.current_km
   const earliestDays = Math.max(0, Math.ceil(remainingLower / DAILY_KM))
@@ -116,7 +157,15 @@ function estimateWindow(
   earliest.setDate(earliest.getDate() + earliestDays)
   const latest = new Date()
   latest.setDate(latest.getDate() + latestDays)
-  return { earliest, latest, earliestReached: remainingLower <= 0, overdue: remainingUpper <= 0 }
+  return {
+    earliest,
+    latest,
+    earliestReached: remainingLower <= 0,
+    overdue: remainingUpper <= 0,
+    // Sıralama ve gösterim için km bazlı kalan mesafe (negatifse süresi
+    // geçmiş demektir) — hedef km'den aracın güncel km'si çıkarılır.
+    remainingKm: m.target_km - m.vehicle.current_km,
+  }
 }
 
 function countLeaves(items: Item[]): [number, number] {
@@ -145,6 +194,7 @@ function TreeItem({
   highlightId,
   showTierBadges,
   expandIds,
+  searchMatchIds,
 }: {
   item: Item
   canEdit: boolean
@@ -158,6 +208,9 @@ function TreeItem({
   // üst başlıkların id'lerini taşır — bu düğümler tek tek elle açılmadan
   // otomatik genişler ki madde tek tek alt kısımlara girmeden görülebilsin.
   expandIds?: Set<number>
+  // Bakım ağacı aramasıyla eşleşen madde id'leri — eşleşen satırlar sarı
+  // vurguyla işaretlenir (arama kutusu boşken undefined/boş küme).
+  searchMatchIds?: Set<number>
 }) {
   const [open, setOpen] = useState(false)
   const isLeaf = item.children.length === 0
@@ -178,7 +231,7 @@ function TreeItem({
     <li className="tree-node" id={`item-${item.id}`}>
       <div
         ref={rowRef}
-        className={`tree-row ${isLeaf ? 'leaf' : ''} ${item.is_completed ? 'done' : ''} ${isHighlighted ? 'flash' : ''}`}
+        className={`tree-row ${isLeaf ? 'leaf' : ''} ${item.is_completed ? 'done' : ''} ${isHighlighted ? 'flash' : ''} ${searchMatchIds?.has(item.id) ? 'search-match' : ''}`}
       >
         {isLeaf ? (
           <input
@@ -201,6 +254,7 @@ function TreeItem({
           </button>
         )}
         <span className="node-name">{item.name}</span>
+        {item.card_code && <span className="card-code-pill">{item.card_code}</span>}
         {isLeaf && showTierBadges && item.tier_kms && item.tier_kms.length > 0 && (
           <span className="tier-badges">
             {item.tier_kms.map((km) => (
@@ -215,6 +269,24 @@ function TreeItem({
             <Lock size={11} /> Kilitli
           </span>
         )}
+        {(() => {
+          // PDF eki varsa, not rozetiyle aynı mantıkta ama tıklanabilir küçük
+          // bir rozet — maddenin hemen yanında, nerede olduğu belli olacak
+          // şekilde gösterilir; tıklanınca PDF yeni sekmede açılır.
+          const pdfAtt = item.attachments.find((a) => a.kind === 'pdf')
+          if (!pdfAtt) return null
+          return (
+            <a
+              className="pdf-pill"
+              href={`/uploads/attachments/${pdfAtt.filename}`}
+              target="_blank"
+              rel="noreferrer"
+              title={pdfAtt.label || pdfAtt.original_name || 'PDF ekini aç'}
+            >
+              <FileText size={11} /> PDF
+            </a>
+          )
+        })()}
         {!isLeaf && branchTotal > 0 && (
           <span className="branch-progress">
             <span className="progressbar tone-green"><div style={{ width: `${(branchDone / branchTotal) * 100}%` }} /></span>
@@ -280,6 +352,7 @@ function TreeItem({
                   highlightId={highlightId}
                   showTierBadges={showTierBadges}
                   expandIds={expandIds}
+                  searchMatchIds={searchMatchIds}
                 />
               ))}
             </ul>
@@ -346,6 +419,31 @@ function collectNotedItems(items: Item[], trail: string[] = []): NotedItemEntry[
       })
     }
     out.push(...collectNotedItems(it.children, [...trail, it.name]))
+  }
+  return out
+}
+
+interface SearchMatchEntry {
+  id: number
+  path: string
+}
+
+/** Ağacı gezip adı arama sorgusuyla eşleşen tüm alt maddeleri, "Notlu
+ * Maddeler" panelindekiyle aynı yol (breadcrumb) formatında düz bir listeye
+ * toplar — bakım ağacında hızlı arama (Ctrl+F) için kullanılır. */
+function collectSearchMatches(items: Item[], query: string, trail: string[] = []): SearchMatchEntry[] {
+  const q = query.trim().toLocaleLowerCase('tr-TR')
+  if (!q) return []
+  const out: SearchMatchEntry[] = []
+  for (const it of items) {
+    const isLeaf = it.children.length === 0
+    if (isLeaf) {
+      if (it.name.toLocaleLowerCase('tr-TR').includes(q)) {
+        out.push({ id: it.id, path: [...trail, it.name].join(' > ') })
+      }
+    } else {
+      out.push(...collectSearchMatches(it.children, query, [...trail, it.name]))
+    }
   }
   return out
 }
@@ -441,6 +539,9 @@ function MaintenanceDetail({
   const [expandIds, setExpandIds] = useState<Set<number>>(new Set())
   const [tierFilter, setTierFilter] = useState<number | 'all'>('all')
   const [deleting, setDeleting] = useState(false)
+  // Admin kısayolları: tek tek madde işaretlemeden iş emrini doğrudan
+  // tamamlandı yapma / tamamlandı durumundan çıkarma.
+  const [statusActionBusy, setStatusActionBusy] = useState(false)
   const [assignableUsers, setAssignableUsers] = useState<User[]>([])
   const [assignBusy, setAssignBusy] = useState(false)
   // Vardiyalı çalışma AÇIKKEN "kim tikledi / kim not ekledi" seçicilerinde
@@ -463,6 +564,12 @@ function MaintenanceDetail({
   const [itemNoteAuthorId, setItemNoteAuthorId] = useState<number | ''>('')
   const [itemNoteBusy, setItemNoteBusy] = useState(false)
   const [itemNoteHadExisting, setItemNoteHadExisting] = useState(false)
+  // Bakım ağacında hızlı arama (Ctrl+F) — girilen metne göre eşleşen
+  // maddeleri bulur, "sonraki" ile aralarında gezinilebilir; jumpToItem ile
+  // aynı vurgulama/otomatik açma mekanizmasını kullanır.
+  const [treeSearch, setTreeSearch] = useState('')
+  const [searchIdx, setSearchIdx] = useState(0)
+  const treeSearchRef = useRef<HTMLInputElement>(null)
 
   const isStaff = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
   const isTechnician = user.role === 'technician'
@@ -498,6 +605,7 @@ function MaintenanceDetail({
     try {
       await api(`/maintenances/${id}/assign`, { method: 'PATCH', body: { assigned_to_id: userId } })
       load()
+      showToast('✓ Atama güncellendi')
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -517,6 +625,7 @@ function MaintenanceDetail({
       try {
         await api(`/items/${itemId}/complete`, { method: 'POST' })
         load()
+        showToast('✓ Kaydedildi')
       } catch (e) {
         setError((e as Error).message)
       }
@@ -540,6 +649,7 @@ function MaintenanceDetail({
       })
       setPickerItemId(null)
       load()
+      showToast('✓ Kaydedildi')
     } catch (e) {
       setError((e as Error).message)
     }
@@ -571,6 +681,7 @@ function MaintenanceDetail({
       })
       setItemNoteId(null)
       load()
+      showToast('✓ Not kaydedildi')
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -624,6 +735,7 @@ function MaintenanceDetail({
     try {
       await api(`/items/${itemId}/unlock`, { method: 'POST' })
       load()
+      showToast('✓ Kilit açıldı', 'info')
     } catch (e) {
       setError((e as Error).message)
     }
@@ -643,12 +755,59 @@ function MaintenanceDetail({
     }
   }
 
+  async function forceComplete() {
+    if (!m) return
+    if (!confirm(`İş Emri #${m.id} (${m.vehicle.code} — ${m.plan.name}) tek tek madde işaretlenmeden doğrudan TAMAMLANDI yapılsın mı?`)) return
+    setError('')
+    setStatusActionBusy(true)
+    try {
+      await api(`/maintenances/${m.id}/force-complete`, { method: 'POST' })
+      load()
+      showToast('✓ İş emri tamamlandı yapıldı')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setStatusActionBusy(false)
+    }
+  }
+
+  async function reopenMaintenance() {
+    if (!m) return
+    if (!confirm(`İş Emri #${m.id} (${m.vehicle.code} — ${m.plan.name}) "Tamamlandı" durumundan çıkarılsın mı? Madde işaretleri değişmez.`)) return
+    setError('')
+    setStatusActionBusy(true)
+    try {
+      await api(`/maintenances/${m.id}/reopen`, { method: 'POST' })
+      load()
+      showToast('✓ Tamamlandıdan çıkarıldı', 'info')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setStatusActionBusy(false)
+    }
+  }
+
   function jumpToItem(itemId: number) {
     const ancestors = m ? findAncestorIds(m.items ?? [], itemId) : null
     if (ancestors) setExpandIds((prev) => new Set([...prev, ...ancestors]))
     setHighlightId(itemId)
     setTimeout(() => setHighlightId(null), 2200)
   }
+
+  // Ctrl+F (Cmd+F Mac'te) tarayıcının kendi "sayfada bul" kutusu yerine
+  // buradaki bakım ağacı arama kutusuna odaklansın — ustanın en sık
+  // ihtiyaç duyacağı kısayol.
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+        e.preventDefault()
+        treeSearchRef.current?.focus()
+        treeSearchRef.current?.select()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   if (!m) return <div className="card"><div className="muted">Yükleniyor…</div></div>
   const covered = m.covered_tiers ?? []
@@ -664,6 +823,15 @@ function MaintenanceDetail({
   // Hangi ana başlığın hangi alt maddesinde not olduğunu tek tek açmadan
   // görebilmek için tüm notlu maddeleri yol (breadcrumb) bilgisiyle topla.
   const notedItems = collectNotedItems(allItems)
+  const searchResults = collectSearchMatches(displayedItems, treeSearch)
+  const searchMatchSet = treeSearch.trim() ? new Set(searchResults.map((r) => r.id)) : undefined
+
+  function goToSearchMatch(idx: number) {
+    if (searchResults.length === 0) return
+    const wrapped = ((idx % searchResults.length) + searchResults.length) % searchResults.length
+    setSearchIdx(wrapped)
+    jumpToItem(searchResults[wrapped].id)
+  }
 
   return (
     <div className="fade-in">
@@ -676,19 +844,42 @@ function MaintenanceDetail({
             {m.vehicle.code} — {m.plan.name}
           </h1>
           <Badge tone={m.status}>{STATUS_TR[m.status]}</Badge>
-          {perms.delete_maintenance && m.status !== 'completed' && (
-            <button
-              className="small danger"
-              style={{ marginLeft: 'auto' }}
-              disabled={deleting}
-              onClick={remove}
-            >
-              İş Emrini Sil
-            </button>
-          )}
+          <div className="row" style={{ marginLeft: 'auto', gap: 8 }}>
+            {user.role === 'admin' && m.status !== 'completed' && (
+              <button
+                className="small"
+                title="Tek tek madde işaretlemeden iş emrini doğrudan tamamlandı yap"
+                disabled={statusActionBusy}
+                onClick={forceComplete}
+              >
+                <CheckCircle2 size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+                Tamamlandı Yap
+              </button>
+            )}
+            {user.role === 'admin' && m.status === 'completed' && (
+              <button
+                className="small"
+                title="Bu iş emrini 'Tamamlandı' durumundan çıkar (madde işaretleri değişmez)"
+                disabled={statusActionBusy}
+                onClick={reopenMaintenance}
+              >
+                <RotateCcw size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+                Tamamlandıdan Çıkar
+              </button>
+            )}
+            {perms.delete_maintenance && m.status !== 'completed' && (
+              <button
+                className="small danger"
+                disabled={deleting}
+                onClick={remove}
+              >
+                İş Emrini Sil
+              </button>
+            )}
+          </div>
         </div>
         <div className="muted" style={{ margin: '10px 0' }}>
-          İş Emri #{m.id} · {fmtKm(m.target_km)} km'de açıldı · Oluşturma: {fmt(m.created_at)} ·
+          İş Emri #{m.id} · {hedefLabel(m)}'de açıldı · Oluşturma: {fmt(m.created_at)} ·
           Başlangıç: {fmt(m.started_at)} · Bitiş: {fmt(m.completed_at)} · Açılış KM: {fmtKm(m.km_at_open)}
         </div>
         <div className="row" style={{ marginBottom: 10, gap: 8 }}>
@@ -790,6 +981,53 @@ function MaintenanceDetail({
         </div>
       )}
       <div className="card">
+        <div className="row" style={{ gap: 10, flexWrap: 'wrap', alignItems: 'center', marginBottom: 14 }}>
+          <div className="search-box" style={{ flex: 1, minWidth: 220 }}>
+            <Search size={15} />
+            <input
+              ref={treeSearchRef}
+              value={treeSearch}
+              onChange={(e) => {
+                const v = e.target.value
+                setTreeSearch(v)
+                setSearchIdx(0)
+                if (v.trim()) {
+                  const matches = collectSearchMatches(displayedItems, v)
+                  if (matches.length > 0) jumpToItem(matches[0].id)
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  goToSearchMatch(e.shiftKey ? searchIdx - 1 : searchIdx + 1)
+                }
+              }}
+              placeholder="Bakım ağacında ara… (Ctrl+F)"
+            />
+            {treeSearch && (
+              <button
+                className="topbar-search-clear"
+                title="Temizle"
+                onClick={() => { setTreeSearch(''); setSearchIdx(0) }}
+              >
+                <X size={14} />
+              </button>
+            )}
+          </div>
+          {treeSearch.trim() && (
+            <span className="muted" style={{ fontSize: 12.5, display: 'flex', alignItems: 'center', gap: 8 }}>
+              {searchResults.length > 0 ? (
+                <>
+                  {(searchIdx % searchResults.length) + 1} / {searchResults.length} eşleşme
+                  <button className="small ghost" onClick={() => goToSearchMatch(searchIdx - 1)}>‹ Önceki</button>
+                  <button className="small ghost" onClick={() => goToSearchMatch(searchIdx + 1)}>Sonraki ›</button>
+                </>
+              ) : (
+                <>Eşleşme bulunamadı</>
+              )}
+            </span>
+          )}
+        </div>
         <ul className="tree">
           {displayedItems.map((i) => (
             <TreeItem
@@ -803,6 +1041,7 @@ function MaintenanceDetail({
               highlightId={highlightId}
               showTierBadges={showTierBadges}
               expandIds={expandIds}
+              searchMatchIds={searchMatchSet}
             />
           ))}
         </ul>
@@ -1166,8 +1405,7 @@ export default function MaintenancesPage({
     </div>
   )
 
-  useEffect(() => {
-    if (selected !== null) return
+  const loadList = useCallback(() => {
     setList(null)
     setListError('')
     const q = status ? `?status=${status}` : ''
@@ -1177,7 +1415,137 @@ export default function MaintenancesPage({
         setListError((e as Error).message)
         setList([])
       })
-  }, [status, selected])
+  }, [status])
+
+  useEffect(() => {
+    if (selected !== null) return
+    loadList()
+  }, [loadList, selected])
+
+  // Faz 26 — Bakım başlatma onayı: otomatik açılan ama admin/mühendis henüz
+  // "Başlat" demediği için Bakımlar listesinde/Takvim'de görünmeyen aday iş
+  // emirleri. Yalnızca start_maintenance yetkisi olanlara (admin/mühendis/
+  // amir) yüklenir — teknisyen bu uç noktaya zaten erişemez (403).
+  // Faz 26 UI — iki tablo alt alta karışık durmasın diye tek seferde
+  // yalnızca biri gösterilir: "Başlatılanlar" (varsayılan) ya da
+  // "Bekleyenler" (başlatma yetkisi olanlara, büyük sekme düğmeleriyle seçilir).
+  const [mainView, setMainView] = useState<'started' | 'pending'>('started')
+  const [pendingStart, setPendingStart] = useState<Maintenance[] | null>(null)
+  const [pendingStartBusy, setPendingStartBusy] = useState<number | null>(null)
+  const [pendingStartError, setPendingStartError] = useState('')
+
+  const loadPendingStart = useCallback(() => {
+    if (!perms.start_maintenance) return
+    api<Maintenance[]>('/maintenances/pending-start')
+      .then(setPendingStart)
+      .catch(() => setPendingStart([]))
+  }, [perms.start_maintenance])
+
+  useEffect(() => {
+    if (selected !== null) return
+    loadPendingStart()
+  }, [loadPendingStart, selected])
+
+  async function startPendingMaintenance(id: number) {
+    setPendingStartBusy(id)
+    setPendingStartError('')
+    try {
+      await api(`/maintenances/${id}/start`, { method: 'POST' })
+      loadPendingStart()
+      loadList()
+    } catch (e) {
+      setPendingStartError((e as Error).message)
+    } finally {
+      setPendingStartBusy(null)
+    }
+  }
+
+  // Faz 28 — Manuel Bakım Ekle: otomatik tespiti beklemeden admin/mühendis
+  // araç + periyot + hedef km seçerek elle bir iş emri açabilir (ör. otomatik
+  // algılama kaçırılmışsa ya da plan dışı ek bir bakım gerekiyorsa). Bu iş
+  // emri "Başlat" onayı beklemeden doğrudan aktif olarak açılır.
+  const [manualOpen, setManualOpen] = useState(false)
+  const [manualVehicles, setManualVehicles] = useState<Vehicle[]>([])
+  const [manualPlans, setManualPlans] = useState<Plan[]>([])
+  const [manualVehicleId, setManualVehicleId] = useState<number | ''>('')
+  const [manualPlanId, setManualPlanId] = useState<number | ''>('')
+  const [manualTargetKm, setManualTargetKm] = useState('')
+  const [manualTargetDate, setManualTargetDate] = useState('')
+  const [manualBusy, setManualBusy] = useState(false)
+  const [manualError, setManualError] = useState('')
+
+  useEffect(() => {
+    if (!perms.create_maintenance) return
+    api<Vehicle[]>('/vehicles').then(setManualVehicles).catch(() => setManualVehicles([]))
+    api<Plan[]>('/plans').then(setManualPlans).catch(() => setManualPlans([]))
+  }, [perms.create_maintenance])
+
+  const manualVehicle = manualVehicles.find((v) => v.id === manualVehicleId) ?? null
+  const manualPlan = manualPlans.find((p) => p.id === manualPlanId) ?? null
+  // Araç ve periyot seçilince, aracın güncel km'sinden sonraki ilk periyot
+  // katını öneri olarak doldurur — kullanıcı isterse elle değiştirebilir.
+  const manualSuggestedKm =
+    manualVehicle && manualPlan && manualPlan.interval_km > 0
+      ? Math.ceil((manualVehicle.current_km + 1) / manualPlan.interval_km) * manualPlan.interval_km
+      : null
+
+  function openManualAdd() {
+    setManualVehicleId('')
+    setManualPlanId('')
+    setManualTargetKm('')
+    setManualTargetDate('')
+    setManualError('')
+    setManualOpen(true)
+  }
+
+  async function submitManualMaintenance() {
+    const isTimePlan = manualPlan?.plan_type === 'time'
+    if (manualVehicleId === '' || manualPlanId === '') return
+    if (isTimePlan ? !manualTargetDate.trim() : !manualTargetKm.trim()) return
+    setManualBusy(true)
+    setManualError('')
+    try {
+      await api('/maintenances/manual', {
+        method: 'POST',
+        body: isTimePlan
+          ? { vehicle_id: manualVehicleId, plan_id: manualPlanId, target_date: manualTargetDate }
+          : { vehicle_id: manualVehicleId, plan_id: manualPlanId, target_km: Number(manualTargetKm) },
+      })
+      setManualOpen(false)
+      setMainView('started')
+      loadList()
+    } catch (e) {
+      setManualError((e as Error).message)
+    } finally {
+      setManualBusy(false)
+    }
+  }
+
+  // Faz 27 — Tehlikeli Bölge: tamamlananlar dahil TÜM bakım iş emirlerini
+  // kalıcı olarak siler. Yanlışlıkla tıklamayı önlemek için "SİL" yazarak
+  // onaylama zorunludur (tek tıkla confirm() yeterli görülmedi — bu işlem
+  // tüm araçların bakım geçmişini geri dönüşsüz şekilde siler).
+  const [dangerOpen, setDangerOpen] = useState(false)
+  const [dangerConfirmText, setDangerConfirmText] = useState('')
+  const [dangerBusy, setDangerBusy] = useState(false)
+  const [dangerError, setDangerError] = useState('')
+
+  async function deleteAllMaintenances() {
+    if (dangerConfirmText.trim().toUpperCase() !== 'SİL') return
+    setDangerBusy(true)
+    setDangerError('')
+    try {
+      await api('/maintenances/all', { method: 'DELETE' })
+      setDangerOpen(false)
+      setDangerConfirmText('')
+      loadList()
+      loadPendingStart()
+    } catch (e) {
+      setDangerError((e as Error).message)
+    } finally {
+      setDangerBusy(false)
+    }
+  }
 
   if (selected !== null)
     return (
@@ -1203,7 +1571,7 @@ export default function MaintenancesPage({
   if (perms.view_maintenance === false)
     return (
       <>
-        <PageHeader title="Bakımlar" subtitle="Açılan tüm bakım iş emirlerini periyot, araç ve durum bazında filtreleyip inceleyin." />
+        <PageHeader title="Bakımlar" />
         <EmptyState
           icon={<Wrench size={22} />}
           title="Görüntüleme yetkiniz yok"
@@ -1219,14 +1587,22 @@ export default function MaintenancesPage({
   // (ör. 25.000/50.000 km) zaten o büyük bakımın içine (kombine checklist)
   // dahil edilmiştir, ayrı satır olarak tekrar gösterilmez. Tamamlanan
   // bakımlar (geçmiş kayıt oldukları için) bu kısıtlamadan etkilenmez.
-  const maxOpenTargetByVehicle = new Map<number, number>()
+  // Faz: km ve süre bazlı iş emirleri artık aynı araçta eş zamanlı açık
+  // olabilir — bu yüzden dedup anahtarı sadece araç değil, (araç, plan
+  // türü) olmalı; aksi halde bir km iş emri diğer türdeki iş emrini
+  // gizleyebilir. target_km süre bazlı maddelerde null olabileceğinden
+  // mutlak değer + null-güvenli karşılaştırma kullanılır.
+  const maxOpenTargetByVehicle = new Map<string, number>()
+  const dedupKey = (m: Maintenance) => `${m.vehicle.id}:${m.plan.plan_type}`
   for (const m of rawList) {
     if (m.status === 'completed') continue
-    const cur = maxOpenTargetByVehicle.get(m.vehicle.id) ?? -Infinity
-    if (m.target_km > cur) maxOpenTargetByVehicle.set(m.vehicle.id, m.target_km)
+    const key = dedupKey(m)
+    const val = Math.abs(m.target_km ?? 0)
+    const cur = maxOpenTargetByVehicle.get(key) ?? -Infinity
+    if (val > cur) maxOpenTargetByVehicle.set(key, val)
   }
   const all = rawList.filter(
-    (m) => m.status === 'completed' || m.target_km === maxOpenTargetByVehicle.get(m.vehicle.id),
+    (m) => m.status === 'completed' || Math.abs(m.target_km ?? 0) === maxOpenTargetByVehicle.get(dedupKey(m)),
   )
 
   const vehicleCodes = Array.from(new Set(all.map((m) => m.vehicle.code))).sort()
@@ -1235,11 +1611,10 @@ export default function MaintenancesPage({
       (all.find((m) => m.plan.name === b)?.plan.interval_km ?? 0),
   )
 
-  // Tahmini bakım aralığının bitiş tarihine (en geç yapılması gereken
-  // tarihe) göre en erkenden en gece doğru sıralanır — süresi geçmiş
-  // (gecikmiş) bakımlar bu tarih geçmişte olduğu için otomatik en üstte
-  // çıkar. Tamamlanmış bakımların tahmini aralığı olmadığı için en sona
-  // (en son tamamlanan en üstte olacak şekilde) eklenir.
+  // Kalan kilometreye göre sıralanır (tarihe göre değil): kalan km'si en az
+  // (veya negatifse en çok süresi geçmiş) olan en üstte çıkar. Tamamlanmış
+  // bakımların kalan km'si olmadığı için en sona (en son tamamlanan en
+  // üstte olacak şekilde) eklenir.
   const filtered = all
     .filter(
       (m) =>
@@ -1249,7 +1624,7 @@ export default function MaintenancesPage({
     .sort((a, b) => {
       const wa = estimateWindow(a)
       const wb = estimateWindow(b)
-      if (wa && wb) return wa.latest.getTime() - wb.latest.getTime()
+      if (wa && wb) return wa.remainingKm - wb.remainingKm
       if (wa && !wb) return -1
       if (!wa && wb) return 1
       const ta = a.completed_at ? new Date(a.completed_at).getTime() : 0
@@ -1261,13 +1636,113 @@ export default function MaintenancesPage({
     <>
       <PageHeader
         title="Bakımlar"
-        subtitle="Açılan tüm bakım iş emirlerini periyot, araç ve durum bazında filtreleyip inceleyin."
+        subtitle="Açık iş emirlerini filtreleyin, bekleyenleri başlatın ve detaylara geçin."
+        actions={
+          !!perms.create_maintenance && (
+            <button className="primary" onClick={openManualAdd}>
+              <Plus size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
+              Manuel Bakım Ekle
+            </button>
+          )
+        }
       />
       {shiftBar}
+
+      {!!perms.start_maintenance && (
+        <div className="row maintenance-view-tabs" style={{ gap: 10, marginBottom: 16 }}>
+          <button
+            className={mainView === 'started' ? 'primary' : ''}
+            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
+            onClick={() => setMainView('started')}
+          >
+            <Wrench size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
+            Başlatılanlar
+          </button>
+          <button
+            className={mainView === 'pending' ? 'primary' : ''}
+            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
+            onClick={() => setMainView('pending')}
+          >
+            <PlayCircle size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
+            Bekleyenler
+            {!!pendingStart && pendingStart.length > 0 && (
+              <span
+                style={{
+                  marginLeft: 8, background: mainView === 'pending' ? 'rgba(255,255,255,0.28)' : 'var(--amber-light)',
+                  color: mainView === 'pending' ? '#fff' : 'var(--amber)',
+                  borderRadius: 999, padding: '1px 9px', fontSize: 12.5, fontWeight: 700,
+                }}
+              >
+                {pendingStart.length}
+              </span>
+            )}
+          </button>
+        </div>
+      )}
+
+      {mainView === 'pending' && !!perms.start_maintenance && (
+        <div className="card fade-in" style={{ marginBottom: 16 }}>
+          <div className="card-head">
+            <div>
+              <div className="card-title">
+                <PlayCircle size={15} style={{ marginRight: 6, verticalAlign: -3, color: 'var(--primary-600)' }} />
+                Başlatılmayı Bekleyenler
+              </div>
+            </div>
+            <Badge tone="pending">{pendingStart?.length ?? 0}</Badge>
+          </div>
+          {pendingStartError && <div className="error">{pendingStartError}</div>}
+          {pendingStart && pendingStart.length === 0 && (
+            <EmptyState
+              icon={<PlayCircle size={22} />}
+              title="Başlatılmayı bekleyen bakım yok"
+              description="Otomatik açılan tüm adaylar zaten başlatılmış."
+            />
+          )}
+          {pendingStart && pendingStart.length > 0 && (
+            <div className="table-scroll">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Araç</th>
+                    <th>Periyot</th>
+                    <th>Hedef KM</th>
+                    <th>Açılış KM</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingStart.map((m) => (
+                    <tr key={m.id}>
+                      <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
+                      <td>{m.plan.name}</td>
+                      <td>{hedefLabel(m)}</td>
+                      <td>{fmtKm(m.km_at_open)} km</td>
+                      <td>
+                        <button
+                          className="small primary"
+                          disabled={pendingStartBusy === m.id}
+                          onClick={() => startPendingMaintenance(m.id)}
+                        >
+                          <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                          {pendingStartBusy === m.id ? 'Başlatılıyor…' : 'Başlat'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mainView === 'started' && (
+      <>
       {listError && <div className="error" style={{ marginBottom: 12 }}>{listError}</div>}
 
-      <div className="table-card fade-in">
-        <div className="table-toolbar">
+      <div className="table-card fade-in maintenance-list-card">
+        <div className="table-toolbar maintenance-toolbar">
           <ListFilter size={15} color="var(--text-tertiary)" />
           <select value={status} onChange={(e) => setStatus(e.target.value)}>
             <option value="">Tüm Durumlar</option>
@@ -1292,7 +1767,7 @@ export default function MaintenancesPage({
               Filtreleri Temizle
             </button>
           )}
-          <span className="muted" style={{ marginLeft: 'auto' }}>
+          <span className="maintenance-record-count">
             {filtered.length} kayıt
           </span>
           {perms.export_excel && (
@@ -1342,16 +1817,16 @@ export default function MaintenancesPage({
                   <td style={{ fontWeight: 600 }}>#{m.id}</td>
                   <td><span className="vehicle-code">{m.vehicle.code}</span></td>
                   <td>{m.plan.name}</td>
-                  <td>{fmtKm(m.target_km)} km</td>
+                  <td>{hedefLabel(m)}</td>
                   <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                   <td>
                     {window ? (
                       <Badge tone={window.overdue ? 'danger' : window.earliestReached ? 'in_progress' : 'neutral'}>
                         {window.overdue
-                          ? `Süresi geçti · ${fmtDate(window.latest)}`
+                          ? `Süresi geçti · ${fmtKm(Math.abs(window.remainingKm))} km geçildi (en geç ${fmtDate(window.latest)} tarihindeydi)`
                           : window.earliestReached
-                            ? `En geç ${fmtDate(window.latest)}`
-                            : `${fmtDate(window.earliest)} – ${fmtDate(window.latest)} arası`}
+                            ? `En geç ${fmtDate(window.latest)} · ${fmtKm(window.remainingKm)} km kaldı`
+                            : `Kalan ${fmtKm(window.remainingKm)} km · en geç ${fmtDate(window.latest)}`}
                       </Badge>
                     ) : '—'}
                   </td>
@@ -1375,6 +1850,176 @@ export default function MaintenancesPage({
           )}
         </div>
       </div>
+      </>
+      )}
+
+      {!!perms.delete_all_maintenance && (
+        <div className="card fade-in" style={{ marginTop: 20, borderColor: 'var(--red)', background: 'var(--red-light)' }}>
+          <div className="card-head">
+            <div>
+              <div className="card-title" style={{ color: 'var(--red)' }}>
+                <ShieldAlert size={15} style={{ marginRight: 6, verticalAlign: -3 }} />
+                Tehlikeli Bölge
+              </div>
+              <div className="card-subtitle">Tüm bakım iş emirleri kalıcı olarak silinir. Bu işlem geri alınamaz.</div>
+            </div>
+          </div>
+          {dangerError && <div className="error">{dangerError}</div>}
+          {!dangerOpen ? (
+            <button className="small danger" onClick={() => setDangerOpen(true)}>
+              <Trash2 size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+              Tüm Bakım İş Emirlerini Sil
+            </button>
+          ) : (
+            <div className="row" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13 }}>
+                Onaylamak için kutuya <strong>SİL</strong> yazın:
+              </span>
+              <input
+                style={{ width: 100 }}
+                value={dangerConfirmText}
+                onChange={(e) => setDangerConfirmText(e.target.value)}
+                placeholder="SİL"
+                autoFocus
+              />
+              <button
+                className="small danger"
+                disabled={dangerBusy || dangerConfirmText.trim().toUpperCase() !== 'SİL'}
+                onClick={deleteAllMaintenances}
+              >
+                {dangerBusy ? 'Siliniyor…' : 'Kalıcı Olarak Sil'}
+              </button>
+              <button
+                className="small"
+                type="button"
+                onClick={() => { setDangerOpen(false); setDangerConfirmText(''); setDangerError('') }}
+              >
+                Vazgeç
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {manualOpen && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
+          }}
+          onClick={() => !manualBusy && setManualOpen(false)}
+        >
+          <div
+            className="card"
+            style={{ width: 420, maxWidth: '90vw' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Plus size={15} /> Manuel Bakım Ekle
+            </h3>
+            <div className="muted" style={{ fontSize: 12.5, marginBottom: 14 }}>
+              Otomatik tespiti beklemeden, seçtiğiniz araç ve periyot için hedef km'yi kendiniz
+              belirleyerek doğrudan aktif bir iş emri açar.
+            </div>
+            {manualError && <div className="error" style={{ marginBottom: 10 }}>{manualError}</div>}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <label style={{ fontSize: 12.5 }}>
+                <div className="muted" style={{ marginBottom: 4 }}>Araç</div>
+                <select
+                  style={{ width: '100%' }}
+                  value={manualVehicleId}
+                  onChange={(e) => {
+                    setManualVehicleId(e.target.value ? Number(e.target.value) : '')
+                    setManualTargetKm('')
+                  }}
+                >
+                  <option value="">Araç seçin…</option>
+                  {manualVehicles.map((v) => (
+                    <option key={v.id} value={v.id}>
+                      {v.code} — {v.name} ({fmtKm(v.current_km)} km)
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label style={{ fontSize: 12.5 }}>
+                <div className="muted" style={{ marginBottom: 4 }}>Periyot / Plan</div>
+                <select
+                  style={{ width: '100%' }}
+                  value={manualPlanId}
+                  onChange={(e) => {
+                    const id = e.target.value ? Number(e.target.value) : ''
+                    setManualPlanId(id)
+                    setManualTargetKm('')
+                    setManualTargetDate('')
+                    const plan = manualPlans.find((p) => p.id === id)
+                    if (manualVehicle && plan && plan.plan_type === 'km' && plan.interval_km > 0) {
+                      setManualTargetKm(
+                        String(Math.ceil((manualVehicle.current_km + 1) / plan.interval_km) * plan.interval_km),
+                      )
+                    }
+                  }}
+                >
+                  <option value="">Periyot seçin…</option>
+                  {manualPlans.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name} ({planPeriodLabel(p)}{p.vehicle_model ? ` · ${p.vehicle_model}` : ''})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {manualPlan?.plan_type === 'time' ? (
+                <label style={{ fontSize: 12.5 }}>
+                  <div className="muted" style={{ marginBottom: 4 }}>Hedef Tarih</div>
+                  <input
+                    type="date"
+                    style={{ width: '100%' }}
+                    value={manualTargetDate}
+                    onChange={(e) => setManualTargetDate(e.target.value)}
+                  />
+                </label>
+              ) : (
+                <label style={{ fontSize: 12.5 }}>
+                  <div className="muted" style={{ marginBottom: 4 }}>
+                    Hedef KM
+                    {manualSuggestedKm !== null && (
+                      <span style={{ marginLeft: 6 }}>
+                        (önerilen: {fmtKm(manualSuggestedKm)} km)
+                      </span>
+                    )}
+                  </div>
+                  <input
+                    type="number"
+                    style={{ width: '100%' }}
+                    value={manualTargetKm}
+                    onChange={(e) => setManualTargetKm(e.target.value)}
+                    placeholder="Örn. 125000"
+                    min={1}
+                  />
+                </label>
+              )}
+            </div>
+            <div className="row" style={{ marginTop: 16, gap: 8, justifyContent: 'flex-end' }}>
+              <button className="ghost" disabled={manualBusy} onClick={() => setManualOpen(false)}>
+                Vazgeç
+              </button>
+              <button
+                className="primary"
+                disabled={
+                  manualBusy ||
+                  manualVehicleId === '' ||
+                  manualPlanId === '' ||
+                  (manualPlan?.plan_type === 'time'
+                    ? !manualTargetDate.trim()
+                    : !manualTargetKm.trim() || Number(manualTargetKm) <= 0)
+                }
+                onClick={submitManualMaintenance}
+              >
+                {manualBusy ? 'Ekleniyor…' : 'İş Emrini Oluştur'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   )
 }

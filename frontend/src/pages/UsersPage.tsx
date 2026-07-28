@@ -3,7 +3,8 @@ import { api } from '../api'
 import type { Shift, User } from '../types'
 import { ROLE_TR } from '../types'
 import { PageHeader, Badge, Avatar, SearchInput, EmptyState, SkeletonTableRows } from '../components/ui'
-import { PlusCircle, Users as UsersIcon, ListFilter } from 'lucide-react'
+import { showToast } from '../components/toast'
+import { PlusCircle, Users as UsersIcon, ListFilter, Trash2 } from 'lucide-react'
 
 const PAGE_SIZE = 12
 
@@ -57,6 +58,29 @@ export default function UsersPage({ currentUser }: { currentUser: User }) {
     load()
   }
 
+  // Pasife almaktan farklı olarak hesabı kalıcı olarak siler — geri
+  // alınamaz. Geçmiş bakım/not/işlem kayıtları kaybolmaz (yalnızca "kim
+  // yaptı" bağlantısı kalkar), bu yüzden onay metni bunu açıkça belirtir.
+  async function remove(u: User) {
+    if (
+      !confirm(
+        `"${u.full_name}" (@${u.username}) hesabı KALICI OLARAK silinecek. Bu işlem geri alınamaz.\n\n` +
+          `Geçmiş bakım/not kayıtları kaybolmaz, yalnızca bu kullanıcıya olan bağlantıları kalkar. ` +
+          `Hesabı yalnızca geçici olarak devre dışı bırakmak istiyorsanız bunun yerine "Pasife Al" kullanın.\n\n` +
+          `Devam edilsin mi?`,
+      )
+    )
+      return
+    setError('')
+    try {
+      await api(`/users/${u.id}`, { method: 'DELETE' })
+      load()
+      showToast(`"${u.full_name}" silindi`, 'info')
+    } catch (err) {
+      setError((err as Error).message)
+    }
+  }
+
   async function changeRole(u: User, newRole: string) {
     if (newRole === u.role) return
     if (!confirm(`${u.full_name} kullanıcısının rolü "${ROLE_TR[newRole]}" olarak değiştirilsin mi?`)) return
@@ -105,7 +129,7 @@ export default function UsersPage({ currentUser }: { currentUser: User }) {
 
   return (
     <>
-      <PageHeader title="Kullanıcılar" subtitle="Sisteme erişebilecek kullanıcıları ve yetki seviyelerini yönetin." />
+      <PageHeader title="Kullanıcılar" />
 
       <div className="row" style={{ gap: 10, marginBottom: 16, flexWrap: 'wrap' }}>
         <StatChip label="Toplam" value={counts.total} />
@@ -216,9 +240,15 @@ export default function UsersPage({ currentUser }: { currentUser: User }) {
                   </td>
                   <td>
                     {u.id !== currentUser.id && (
-                      <button className="small" onClick={() => toggle(u)}>
-                        {u.is_active ? 'Pasife Al' : 'Aktifleştir'}
-                      </button>
+                      <div className="row" style={{ gap: 6, flexWrap: 'nowrap' }}>
+                        <button className="small" onClick={() => toggle(u)}>
+                          {u.is_active ? 'Pasife Al' : 'Aktifleştir'}
+                        </button>
+                        <button className="small danger" title="Hesabı kalıcı olarak sil" onClick={() => remove(u)}>
+                          <Trash2 size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+                          Sil
+                        </button>
+                      </div>
                     )}
                   </td>
                 </tr>

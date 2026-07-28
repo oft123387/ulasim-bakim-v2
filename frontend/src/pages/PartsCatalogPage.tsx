@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, apiUploadWithFields } from '../api'
 import { PageHeader, EmptyState } from '../components/ui'
-import type { PartCatalogAttachment, PartCatalogItem } from '../types'
+import type { PartCatalogAttachment, PartCatalogItem, PartRepairMaterial, PartRepairResult } from '../types'
 import {
   ArrowLeft,
   FileText,
@@ -19,7 +19,16 @@ import {
   Boxes,
   Box,
   QrCode,
+  PackageX,
+  Plus,
+  Minus,
+  Wrench,
 } from 'lucide-react'
+
+/** min_stock > 0 (takip tanımlı) ve stock_qty <= min_stock ise düşük stok. */
+function isLowStock(p: PartCatalogItem): boolean {
+  return p.min_stock > 0 && p.stock_qty <= p.min_stock
+}
 
 /** Parça ağacında (children iç içe) id'ye göre bir parçayı bulur — seçili
  * parça en üst seviyede olmayabilir (bir alt parça açılmış olabilir). */
@@ -225,6 +234,349 @@ function SubPartsSection({
   )
 }
 
+// ---------------------------------------------------------- Stok
+function StockCard({
+  part,
+  canEdit,
+  onChanged,
+}: {
+  part: PartCatalogItem
+  canEdit: boolean
+  onChanged: () => void
+}) {
+  const [editingThreshold, setEditingThreshold] = useState(false)
+  const [minStock, setMinStock] = useState(String(part.min_stock))
+  const [unit, setUnit] = useState(part.unit)
+  const [delta, setDelta] = useState('')
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    setMinStock(String(part.min_stock))
+    setUnit(part.unit)
+  }, [part.min_stock, part.unit])
+
+  async function saveThreshold() {
+    setBusy(true)
+    setError('')
+    try {
+      await api(`/parts/${part.id}`, {
+        method: 'PATCH',
+        body: { min_stock: Math.max(0, Number(minStock) || 0), unit: unit.trim() || 'adet' },
+      })
+      setEditingThreshold(false)
+      onChanged()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function adjustStock(sign: 1 | -1) {
+    const n = Number(delta)
+    if (!n || n <= 0) return
+    setBusy(true)
+    setError('')
+    try {
+      await api(`/parts/${part.id}/stock-adjust`, {
+        method: 'POST',
+        body: { delta: sign * n, note: note.trim() },
+      })
+      setDelta('')
+      setNote('')
+      onChanged()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const low = isLowStock(part)
+
+  return (
+    <div className="card">
+      <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <PackageX size={15} /> Stok
+      </h3>
+      <div className="row" style={{ alignItems: 'baseline', gap: 10, marginBottom: 10 }}>
+        <span style={{ fontSize: 26, fontWeight: 700, color: low ? 'var(--amber, #92400e)' : undefined }}>
+          {part.stock_qty}
+        </span>
+        <span className="muted">{part.unit}</span>
+        {part.min_stock > 0 && (
+          <span className="muted" style={{ fontSize: 12 }}>
+            (minimum eşik: {part.min_stock} {part.unit})
+          </span>
+        )}
+        {low && (
+          <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--amber, #92400e)' }}>
+            Düşük stok — Bildirim Merkezi'nde görünür
+          </span>
+        )}
+      </div>
+
+      {canEdit && (
+        <>
+          {editingThreshold ? (
+            <div className="row" style={{ gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+              <label className="muted" style={{ fontSize: 12 }}>
+                Min. eşik
+                <input
+                  type="number"
+                  min={0}
+                  step="any"
+                  value={minStock}
+                  onChange={(e) => setMinStock(e.target.value)}
+                  style={{ width: 90, marginLeft: 6 }}
+                />
+              </label>
+              <label className="muted" style={{ fontSize: 12 }}>
+                Birim
+                <input value={unit} onChange={(e) => setUnit(e.target.value)} style={{ width: 80, marginLeft: 6 }} />
+              </label>
+              <button className="small primary" disabled={busy} onClick={saveThreshold}>Kaydet</button>
+              <button className="small ghost" onClick={() => setEditingThreshold(false)}>Vazgeç</button>
+            </div>
+          ) : (
+            <button className="small ghost" style={{ marginBottom: 10 }} onClick={() => setEditingThreshold(true)}>
+              <Pencil size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+              Eşik/Birim Düzenle
+            </button>
+          )}
+
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+            <input
+              type="number"
+              min={0.001}
+              step="any"
+              placeholder="Adet/miktar"
+              value={delta}
+              onChange={(e) => setDelta(e.target.value)}
+              style={{ width: 100 }}
+            />
+            <input
+              placeholder="Not (opsiyonel, ör. tedarikçi/fatura no)"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              style={{ minWidth: 200 }}
+            />
+            <button className="small primary" disabled={busy || !delta} onClick={() => adjustStock(1)}>
+              <Plus size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+              Stok Girişi
+            </button>
+            <button className="small danger" disabled={busy || !delta} onClick={() => adjustStock(-1)}>
+              <Minus size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+              Düşüm/Fire
+            </button>
+          </div>
+          <p className="muted" style={{ fontSize: 11.5, marginTop: 6 }}>
+            Bir bakım maddesi tamamlanınca eşleştirilmiş parçalar (Bakım Ağacı'nda tanımlanır)
+            otomatik düşer — buradaki giriş/düşüm yalnızca elle yapılan stok hareketleri içindir.
+          </p>
+        </>
+      )}
+      {error && <div className="error" style={{ marginTop: 8 }}>{error}</div>}
+    </div>
+  )
+}
+
+/** Parça ağacını (alt parçalar iç içe) düz, derinlik önekli bir listeye
+ * çevirir — "malzeme seç" listesinde kullanılır. */
+function flattenPartsList(items: PartCatalogItem[], depth = 0): { id: number; label: string }[] {
+  const out: { id: number; label: string }[] = []
+  for (const it of items) {
+    out.push({ id: it.id, label: `${'— '.repeat(depth)}${it.name}` })
+    out.push(...flattenPartsList(it.children, depth + 1))
+  }
+  return out
+}
+
+// ---------------------------------------------------------- Tamir malzemeleri
+function RepairMaterialsSection({
+  part,
+  canEdit,
+  allParts,
+}: {
+  part: PartCatalogItem
+  canEdit: boolean
+  allParts: PartCatalogItem[]
+}) {
+  const [rows, setRows] = useState<PartRepairMaterial[]>([])
+  const [materialId, setMaterialId] = useState('')
+  const [freeText, setFreeText] = useState('')
+  const [qty, setQty] = useState('1')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [repairResult, setRepairResult] = useState<PartRepairResult | null>(null)
+  const [note, setNote] = useState('')
+
+  const materialOptions = flattenPartsList(allParts).filter((p) => p.id !== part.id)
+
+  function load() {
+    api<PartRepairMaterial[]>(`/parts/${part.id}/repair-materials`).then(setRows).catch(() => setRows([]))
+  }
+  useEffect(load, [part.id])
+
+  async function addRow(e: React.FormEvent) {
+    e.preventDefault()
+    if (!materialId && !freeText.trim()) return
+    setBusy(true)
+    setError('')
+    try {
+      await api(`/parts/${part.id}/repair-materials`, {
+        method: 'POST',
+        body: {
+          material_part_id: materialId ? Number(materialId) : null,
+          free_text: materialId ? '' : freeText.trim(),
+          qty: Math.max(0.001, Number(qty) || 1),
+        },
+      })
+      setMaterialId('')
+      setFreeText('')
+      setQty('1')
+      load()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeRow(id: number) {
+    await api(`/parts/repair-materials/${id}`, { method: 'DELETE' })
+    load()
+  }
+
+  async function doRepair() {
+    if (rows.length === 0) return
+    if (!confirm(`"${part.name}" tamir edildi işaretlensin mi? Listedeki katalog malzemelerinin stoğu düşecek.`)) return
+    setBusy(true)
+    setError('')
+    setRepairResult(null)
+    try {
+      const res = await api<PartRepairResult>(`/parts/${part.id}/repair`, {
+        method: 'POST',
+        body: { note: note.trim() },
+      })
+      setRepairResult(res)
+      setNote('')
+      load()
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="card">
+      <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+        <Wrench size={15} /> Tamir Malzemeleri
+      </h3>
+      <div className="muted" style={{ fontSize: 12.5, marginBottom: 10 }}>
+        Bu parçanın tamirinde/bakımında kullanılan malzemeler. Katalogdan seçilenler "Tamir
+        Edildi" denince stoktan otomatik düşer; serbest metin girilenler yalnızca bilgi
+        amaçlıdır (stok bağlantısı yoktur). Miktar kesirli olabilir — ör. 1 kg'lık bir üründen
+        200 gram kullanılıyorsa 0.2 girin (parçanın birimi "kg" olmalı).
+      </div>
+
+      {rows.length === 0 ? (
+        <div className="muted" style={{ marginBottom: 10 }}>Henüz malzeme eklenmemiş.</div>
+      ) : (
+        <div className="attach-list" style={{ marginBottom: 10 }}>
+          {rows.map((r) => (
+            <div key={r.id} className="attach-list-row">
+              <span className="attach-chip">
+                <span>
+                  {r.material_part_id ? r.material_name : r.free_text} × {r.qty}
+                  {r.material_part_id && (
+                    <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>
+                      (stok: {r.material_stock_qty} {r.material_unit})
+                    </span>
+                  )}
+                  {!r.material_part_id && (
+                    <span className="muted" style={{ marginLeft: 6, fontSize: 11 }}>(bilgi amaçlı)</span>
+                  )}
+                </span>
+              </span>
+              {canEdit && (
+                <button className="small danger" onClick={() => removeRow(r.id)} title="Kaldır">
+                  <Trash2 size={12} />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {canEdit && (
+        <>
+          <form className="row" onSubmit={addRow} style={{ flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+            <select
+              value={materialId}
+              onChange={(e) => { setMaterialId(e.target.value); if (e.target.value) setFreeText('') }}
+              style={{ minWidth: 200 }}
+            >
+              <option value="">Katalogdan malzeme seç…</option>
+              {materialOptions.map((p) => (
+                <option key={p.id} value={p.id}>{p.label}</option>
+              ))}
+            </select>
+            <span className="muted" style={{ fontSize: 12 }}>veya</span>
+            <input
+              placeholder="Serbest metin (ör. 4 adet M6 vida)"
+              value={freeText}
+              onChange={(e) => { setFreeText(e.target.value); if (e.target.value) setMaterialId('') }}
+              style={{ minWidth: 200 }}
+            />
+            <input
+              type="number"
+              min={0.001}
+              step="any"
+              placeholder="Miktar"
+              value={qty}
+              onChange={(e) => setQty(e.target.value)}
+              style={{ width: 80 }}
+            />
+            <button className="small primary" disabled={(!materialId && !freeText.trim()) || busy}>Ekle</button>
+          </form>
+
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap', paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+            <input
+              placeholder="Tamir notu (opsiyonel)"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              style={{ minWidth: 200 }}
+            />
+            <button className="small primary" disabled={rows.length === 0 || busy} onClick={doRepair}>
+              <Wrench size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+              Tamir Edildi
+            </button>
+          </div>
+        </>
+      )}
+
+      {repairResult && (
+        <div className="muted" style={{ marginTop: 10, fontSize: 12.5 }}>
+          {repairResult.materials_deducted.length > 0 && (
+            <div style={{ color: 'var(--green, #1e7a46)' }}>
+              Stoktan düşüldü: {repairResult.materials_deducted.join(', ')}
+            </div>
+          )}
+          {repairResult.materials_skipped.length > 0 && (
+            <div>Bilgi amaçlı (stok bağlantısız): {repairResult.materials_skipped.join(', ')}</div>
+          )}
+        </div>
+      )}
+
+      {error && <div className="error" style={{ marginTop: 8 }}>{error}</div>}
+    </div>
+  )
+}
+
 // ---------------------------------------------------------- Parça detayı
 function PartDetail({
   part,
@@ -235,6 +587,7 @@ function PartDetail({
   onChanged,
   onDeleted,
   onAddSubPart,
+  allParts,
 }: {
   part: PartCatalogItem
   canEdit: boolean
@@ -245,6 +598,7 @@ function PartDetail({
   onChanged: () => void
   onDeleted: () => void
   onAddSubPart: () => void
+  allParts: PartCatalogItem[]
 }) {
   const [file, setFile] = useState<File | null>(null)
   const [fileLabel, setFileLabel] = useState('')
@@ -381,6 +735,7 @@ function PartDetail({
                 <input
                   type="file"
                   accept="image/*,.heic,.heif"
+                  capture="environment"
                   style={{ display: 'none' }}
                   onChange={(e) => e.target.files?.[0] && uploadImage(e.target.files[0])}
                 />
@@ -457,6 +812,10 @@ function PartDetail({
       </div>
 
       {error && <div className="error">{error}</div>}
+
+      <StockCard part={part} canEdit={canEdit} onChanged={onChanged} />
+
+      <RepairMaterialsSection part={part} canEdit={canEdit} allParts={allParts} />
 
       <div className="card">
         <h3 style={{ marginTop: 0, fontSize: 15 }}>Dokümanlar, Şemalar ve Videolar</h3>
@@ -552,8 +911,25 @@ function PartCard({ part, onOpen }: { part: PartCatalogItem; onOpen: () => void 
           <PackageSearch size={28} />
         </div>
       )}
-      <div style={{ fontWeight: 600, fontSize: 13.5 }}>{part.name}</div>
+      <div className="row" style={{ gap: 6 }}>
+        <div style={{ fontWeight: 600, fontSize: 13.5 }}>{part.name}</div>
+        {isLowStock(part) && (
+          <span
+            title={`Stok düşük: ${part.stock_qty} ${part.unit} (eşik ${part.min_stock})`}
+            style={{
+              display: 'inline-flex', alignItems: 'center', gap: 3, marginLeft: 'auto',
+              fontSize: 10.5, fontWeight: 700, color: 'var(--amber, #92400e)',
+              background: 'var(--amber-bg, #fef3c7)', borderRadius: 5, padding: '2px 5px',
+            }}
+          >
+            <PackageX size={11} /> Düşük Stok
+          </span>
+        )}
+      </div>
       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
+        {part.min_stock > 0 && (
+          <div className="muted" style={{ fontSize: 11.5 }}>Stok: {part.stock_qty} {part.unit}</div>
+        )}
         {part.attachments.length > 0 && (
           <div className="muted" style={{ fontSize: 11.5 }}>{part.attachments.length} ek</div>
         )}
@@ -696,6 +1072,7 @@ export default function PartsCatalogPage({
             load()
           }}
           onAddSubPart={() => setShowNew(true)}
+          allParts={parts ?? []}
         />
         {showNew && (
           <NewPartModal
@@ -718,7 +1095,6 @@ export default function PartsCatalogPage({
     <>
       <PageHeader
         title="Parça Bilgi Bankası"
-        subtitle="Arıza/bakım anında hızlı referans: parçaların dokümanı, kablo/devre şeması ve eğitim videosu."
         actions={
           canEdit ? (
             <button className="primary" onClick={() => setShowNew(true)}>
