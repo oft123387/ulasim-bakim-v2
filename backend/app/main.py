@@ -4713,7 +4713,14 @@ def get_kpi(
     """Filo genelinde KPI raporu (Faz 18): tamamlanma oranı/süresi, geciken/
     kritik bakım sayıları, araç/model bazlı ve personel/vardiya bazlı
     performans. date_from/date_to 'YYYY-MM-DD' — esnek tarih aralığı
-    (Bakımlar sayfasındaki filtrelerle aynı ayrıştırma, bkz. _parse_date)."""
+    (Bakımlar sayfasındaki filtrelerle aynı ayrıştırma, bkz. _parse_date).
+
+    Usta rolü, view_dashboard_analytics izni açık olsa bile (bu izin aynı
+    zamanda Dashboard'daki analiz grafiğini de kontrol ettiği için varsayılan
+    olarak açıktır) KPI raporunu GÖREMEZ — bu, yönetici rollerine (admin/
+    mühendis/amir) özel, kasıtlı ve sabit bir kısıtlamadır."""
+    if user.role == "technician":
+        raise HTTPException(403, "KPI raporunu görüntüleme yetkiniz yok")
     df = _parse_date(date_from)
     dt_ = _parse_date(date_to, end=True)
     report = services.compute_kpi_report(db, df, dt_)
@@ -4728,7 +4735,10 @@ def export_kpi(
     db: Session = Depends(get_db),
     user: models.User = Depends(require_permission("export_excel")),
 ):
-    """KPI raporunu çok sayfalı bir Excel dosyası olarak indirir (Faz 18)."""
+    """KPI raporunu çok sayfalı bir Excel dosyası olarak indirir (Faz 18).
+    get_kpi ile aynı sebeple usta rolüne kapalıdır (bkz. yukarısı)."""
+    if user.role == "technician":
+        raise HTTPException(403, "KPI raporunu dışa aktarma yetkiniz yok")
     df = _parse_date(date_from)
     dt_ = _parse_date(date_to, end=True)
     report = services.compute_kpi_report(db, df, dt_)

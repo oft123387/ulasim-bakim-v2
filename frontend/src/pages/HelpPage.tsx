@@ -10,12 +10,16 @@ import {
   ClipboardList,
   Workflow,
   PackageSearch,
+  Lightbulb,
+  BarChart3,
+  Clock,
   Bell,
   ShieldCheck,
   Users as UsersIcon,
   ScrollText,
   Activity,
   Radio,
+  UserCircle2,
   HelpCircle,
 } from 'lucide-react'
 
@@ -44,7 +48,8 @@ const SECTIONS: HelpSection[] = [
         </p>
         <p>
           "Analiz" bölümü (periyoda göre bakım grafiği + genel tamamlanma oranı) Yetki Yönetimi
-          sayfasından rol bazında açılıp kapatılabilir — admin her zaman görür.
+          sayfasından rol bazında açılıp kapatılabilir — admin her zaman görür. Daha derin, tarih
+          aralıklı performans analizi istiyorsanız aşağıdaki <strong>KPI Raporu</strong> bölümüne bakın.
         </p>
       </>
     ),
@@ -62,10 +67,22 @@ const SECTIONS: HelpSection[] = [
           bitince iş emri "Tamamlandı" olur.
         </p>
         <p>
+          <strong>Görsel ekleme</strong>: bir maddeyi işaretlerken/incelerken "Çekerek Yükle"
+          (tablet/telefon kamerasını doğrudan açar) veya "Görsel Ekle" (galeriden seçer)
+          düğmeleriyle o maddeye kanıt/durum fotoğrafı eklenebilir — ayrı iki düğün olmasının
+          sebebi, kamera doğrudan açılırsa bazı cihazlarda galeri seçeneğinin gizlenmesidir.
+        </p>
+        <p>
           Bir madde yanlışlıkla işaretlenirse yetkili bir rol (onaylama izni olan) kilidi
-          açabilir — madde ve altındaki her şey sıfırlanır. Otomatik açılan iş emirleri önce
-          "Başlatılmayı Bekleyenler" listesinde aday olarak durur; yetkili biri "Başlat" demeden
-          usta ekranında görünmez.
+          açabilir — madde ve altındaki her şey sıfırlanır.
+        </p>
+        <p>
+          <strong>Başlatılmayı Bekleyenler</strong> (yetkili roller): otomatik tespit edilen aday
+          iş emirleri burada listelenir; yetkili biri "Başlat" demeden usta ekranında görünmez.
+          Liste en kritik adayları (1M periyodu, toleransı aşmak üzere olanlar) en üstte gösterecek
+          şekilde otomatik sıralanır. "Başlat" derken bugün yerine ileri bir tarih de seçilebilir —
+          o tarih geldiğinde iş emri arka planda kendiliğinden devreye girer, siz tekrar bir şey
+          yapmanıza gerek kalmaz.
         </p>
       </>
     ),
@@ -74,8 +91,19 @@ const SECTIONS: HelpSection[] = [
     id: 'calendar',
     title: 'Takvim',
     icon: <CalendarDays size={16} />,
-    role: 'all',
-    body: <p>Yaklaşan bakımları tarih eksenine yerleştirerek gösterir — hangi hafta hangi araçların bakıma gireceğini planlamak için kullanılır.</p>,
+    role: 'staff',
+    body: (
+      <>
+        <p>
+          Açık bakımları tarih eksenine yerleştirerek gösterir — hangi hafta hangi araçların
+          bakıma gireceğini planlamak için kullanılır. Varsayılan olarak <strong>Haftalık</strong>{' '}
+          görünüm açılır (satırlar geniş, her bakımın altında "en geç bu tarihte" tahmini de
+          yazar); üstteki sekmeden <strong>Aylık</strong> görünüme geçilebilir (daha sıkışık,
+          genel bir aya bakış için).
+        </p>
+        <p>Bu sayfa yalnızca amir ve üstü rollere (admin/mühendis/amir) açıktır, ustada görünmez.</p>
+      </>
+    ),
   },
   {
     id: 'vehicles',
@@ -172,6 +200,64 @@ const SECTIONS: HelpSection[] = [
     ),
   },
   {
+    id: 'suggestions',
+    title: 'Öneriler',
+    icon: <Lightbulb size={16} />,
+    role: 'all',
+    body: (
+      <>
+        <p>
+          Herhangi bir rol, bir araç modeli (ör. Bozankaya/Sirio) + isteğe bağlı periyot/plan
+          seçerek bakım ağacına eklenmesini önerdiği bir maddeyi metin olarak girer. Öneriler
+          yalnızca kendini oluşturana değil, <strong>herkese</strong> görünür.
+        </p>
+        <p>
+          Onay <strong>iki aşamalıdır</strong>: önce <strong>amir</strong> değerlendirir. Amir
+          onaylarsa öneri <strong>mühendis</strong>e düşer ve mühendisin kararı (onay/red/"Ağaca
+          Eklendi") nihaidir. Amir reddederse öneri mühendise hiç düşmez, orada sonuçlanmış
+          sayılır. Her aşamanın kararı, kim verdiği ve notu ekranda ayrı ayrı görünür.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'kpi',
+    title: 'KPI Raporu',
+    icon: <BarChart3 size={16} />,
+    role: 'staff',
+    body: (
+      <>
+        <p>
+          Filo genelinde performans raporu: tarih aralığı seçin (son 7/30/90 gün, bu ay, bu yıl
+          veya özel bir aralık), sistem şunları hesaplar: tamamlanma oranı ve ortalama tamamlanma
+          süresi, güncel kritik/çok kritik/gecikmiş bakım sayıları (bunlar her zaman ANLIK duruma
+          göredir, seçilen tarih aralığından etkilenmez), araç/model bazlı performans ve personel/
+          vardiya bazlı tamamlama istatistikleri.
+        </p>
+        <p>
+          Sağ üstteki <strong>"Excel Olarak İndir"</strong> düğmesiyle aynı rapor, her kategori
+          ayrı bir sayfada olacak şekilde tek bir Excel dosyasına aktarılır. Bu sayfa yalnızca
+          yönetici rollerine (admin/mühendis/amir) açıktır, ustada görünmez.
+        </p>
+      </>
+    ),
+  },
+  {
+    id: 'shifts',
+    title: 'Vardiya Modu',
+    icon: <Clock size={16} />,
+    role: 'staff',
+    body: (
+      <p>
+        Bakımlar sayfasının üstündeki düğmeyle (yalnızca yönetici roller değiştirebilir) açılıp
+        kapatılır. Açıkken, paylaşılan bir tablette birden fazla kişi oturum açıp kapatmadan sırayla
+        çalışabilir — bir madde tamamlanırken/not eklenirken "kim yaptı" ayrıca, o an seçili
+        vardiyadaki kişiler arasından seçilir. Kapalıyken işlemler otomatik olarak oturum açan
+        kişiye atfedilir. Kullanıcıların hangi vardiyada olduğu Kullanıcılar sayfasından atanır.
+      </p>
+    ),
+  },
+  {
     id: 'notifications',
     title: 'Bildirim Merkezi (üstteki zil)',
     icon: <Bell size={16} />,
@@ -213,7 +299,8 @@ const SECTIONS: HelpSection[] = [
         <p>
           Bir rolde çok fazla ayar değiştirip kafanız karıştıysa "Sıfırla" ile o rolü fabrika
           varsayılanına döndürebilirsiniz. Admin her zaman tüm yetkilere sahiptir, buradan
-          kısıtlanamaz.
+          kısıtlanamaz. Not: KPI Raporu, "Dashboard Görünürlüğü" izni açık olsa bile ustaya sabit
+          olarak kapalıdır — bu, buradan değiştirilemeyen tek istisnadır.
         </p>
       </>
     ),
@@ -226,7 +313,8 @@ const SECTIONS: HelpSection[] = [
     body: (
       <p>
         Yeni kayıt olan kullanıcılar onay bekler durumda başlar; onaylamadan giriş yapamazlar.
-        Buradan rol atayabilir, hesabı aktif/pasif yapabilirsiniz.
+        Buradan rol atayabilir, hesabı aktif/pasif yapabilir ve (vardiya modu kullanıyorsanız)
+        kişinin hangi vardiyada olduğunu belirleyebilirsiniz.
       </p>
     ),
   },
@@ -252,6 +340,20 @@ const SECTIONS: HelpSection[] = [
         Veritabanı konumu/türü, çalışma süresi, araç/kullanıcı/plan sayaçları, yedekleme durumu
         gibi teknik bilgileri gösterir — özellikle "yaptığım değişiklik görünmüyor" gibi
         durumlarda (ör. yanlış veritabanına bakıyor olma ihtimali) ilk bakılacak yerdir.
+      </p>
+    ),
+  },
+  {
+    id: 'profile',
+    title: 'Profil',
+    icon: <UserCircle2 size={16} />,
+    role: 'all',
+    body: (
+      <p>
+        Kendi hesap ayarlarınız: şifre değiştirme, açık/koyu görünüm teması ve e-posta ekleyip
+        doğrulama (şifremi unuttum akışının çalışması için gerekir). Rolünüzü/hesabınızın
+        aktif olup olmadığını da burada görürsünüz — bu ikisi yalnızca yetkili biri tarafından
+        Kullanıcılar sayfasından değiştirilebilir.
       </p>
     ),
   },
@@ -312,7 +414,7 @@ export default function HelpPage({ isAdmin, isStaff }: { isAdmin: boolean; isSta
         title="Yardım"
         subtitle="Ulaşım-Bakım'daki her sayfanın ne işe yaradığını ve nasıl kullanılacağını burada bulabilirsiniz."
       />
-      <SearchInput value={search} onChange={setSearch} placeholder="Yardım konusu ara… (ör. stok, önizleme, alarm)" style={{ marginBottom: 14 }} />
+      <SearchInput value={search} onChange={setSearch} placeholder="Yardım konusu ara… (ör. stok, önizleme, alarm, vardiya, KPI)" style={{ marginBottom: 14 }} />
       {visible.length === 0 ? (
         <EmptyState icon={<HelpCircle size={28} />} title="Eşleşen konu bulunamadı" description="Farklı bir arama terimi deneyin." />
       ) : (

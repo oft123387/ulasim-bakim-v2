@@ -16,8 +16,20 @@ import io
 from datetime import date, timedelta
 
 import openpyxl
+import pytest
 
 from .conftest import auth
+
+
+@pytest.fixture(scope="module")
+def engineer_token(client, admin_token):
+    client.post(
+        "/api/users", headers=auth(admin_token),
+        json={"username": "kpi_muh", "full_name": "KPI Test Mühendis", "role": "engineer", "password": "kpimuhpass1"},
+    )
+    r = client.post("/api/auth/login", data={"username": "kpi_muh", "password": "kpimuhpass1"})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
 
 
 def _make_maintenance_with_item(client, admin, model, current_km, target_km, interval_km=10_000):
@@ -151,37 +163,53 @@ def test_kpi_critical_and_overdue_counts_reflect_current_state(client, admin_tok
         _cleanup(client, admin, v, plan)
 
 
-def test_kpi_requires_view_dashboard_analytics_permission(client, admin_token, usta_token):
+def test_kpi_blocked_for_technician_even_with_permission_on(client, admin_token, usta_token):
+    """Usta rolü, view_dashboard_analytics izni AÇIK olsa bile (bu izin
+    varsayılan olarak açıktır çünkü aynı zamanda Dashboard'daki analiz
+    grafiğini de kontrol eder) KPI raporunu göremez/dışa aktaramaz — bu,
+    yönetici rollerine (admin/mühendis/amir) özel, sabit bir kısıtlamadır."""
+    admin = admin_token
+    perms = client.get("/api/permissions", headers=auth(admin)).json()
+    assert perms["technician"]["view_dashboard_analytics"] is True
+    assert perms["technician"]["export_excel"] is True
+
+    r = client.get("/api/kpi", headers=auth(usta_token))
+    assert r.status_code == 403
+    r = client.get("/api/kpi/export", headers=auth(usta_token))
+    assert r.status_code == 403
+
+
+def test_kpi_requires_view_dashboard_analytics_permission_for_non_technician(client, admin_token, engineer_token):
     admin = admin_token
     r = client.patch(
         "/api/permissions", headers=auth(admin),
-        json={"role": "technician", "permission": "view_dashboard_analytics", "allowed": False},
+        json={"role": "engineer", "permission": "view_dashboard_analytics", "allowed": False},
     )
     assert r.status_code == 200, r.text
     try:
-        r = client.get("/api/kpi", headers=auth(usta_token))
+        r = client.get("/api/kpi", headers=auth(engineer_token))
         assert r.status_code == 403
     finally:
         client.patch(
             "/api/permissions", headers=auth(admin),
-            json={"role": "technician", "permission": "view_dashboard_analytics", "allowed": True},
+            json={"role": "engineer", "permission": "view_dashboard_analytics", "allowed": True},
         )
 
 
-def test_kpi_export_requires_export_excel_permission(client, admin_token, usta_token):
+def test_kpi_export_requires_export_excel_permission_for_non_technician(client, admin_token, engineer_token):
     admin = admin_token
     r = client.patch(
         "/api/permissions", headers=auth(admin),
-        json={"role": "technician", "permission": "export_excel", "allowed": False},
+        json={"role": "engineer", "permission": "export_excel", "allowed": False},
     )
     assert r.status_code == 200, r.text
     try:
-        r = client.get("/api/kpi/export", headers=auth(usta_token))
+        r = client.get("/api/kpi/export", headers=auth(engineer_token))
         assert r.status_code == 403
     finally:
         client.patch(
             "/api/permissions", headers=auth(admin),
-            json={"role": "technician", "permission": "export_excel", "allowed": True},
+            json={"role": "engineer", "permission": "export_excel", "allowed": True},
         )
 
 

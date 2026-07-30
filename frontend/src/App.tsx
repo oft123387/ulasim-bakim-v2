@@ -329,7 +329,8 @@ export default function App() {
     { key: 'tree', label: 'Bakım Ağacı', show: isAdmin },
     { key: 'parts', label: 'Parça Bilgi Bankası', show: true },
     { key: 'suggestions', label: 'Öneriler', show: true },
-    { key: 'kpi', label: 'KPI Raporu', show: p.view_dashboard_analytics !== false },
+    // KPI Raporu ustaya kasıtlı olarak kapalı — yönetici rollerine (admin/mühendis/amir) özeldir.
+    { key: 'kpi', label: 'KPI Raporu', show: isStaff && p.view_dashboard_analytics !== false },
     { key: 'users', label: 'Kullanıcılar', show: canManageUsers },
     { key: 'permissions', label: 'Yetki Yönetimi', show: isAdmin },
     { key: 'audit', label: 'İşlem Kayıtları', show: isAdmin },
@@ -513,7 +514,7 @@ export default function App() {
           {page === 'tree' && isAdmin && <TreeEditorPage />}
           {page === 'parts' && <PartsCatalogPage canEdit={isStaff} initialSelectedId={openPartId} />}
           {page === 'suggestions' && <SuggestionsPage user={user} />}
-          {page === 'kpi' && p.view_dashboard_analytics !== false && <KPIPage />}
+          {page === 'kpi' && isStaff && p.view_dashboard_analytics !== false && <KPIPage />}
           {page === 'users' && canManageUsers && <UsersPage currentUser={user} />}
           {page === 'permissions' && isAdmin && <PermissionsPage />}
           {page === 'audit' && isAdmin && <AuditLogPage />}
