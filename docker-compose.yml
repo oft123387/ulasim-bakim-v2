@@ -14,7 +14,12 @@ services:
     #    kendisi fark edip indirip yeniden başlatır — yani ilk kurulumdan
     #    sonra tek bir komut bile yazmanıza gerek kalmaz.
     build: .
-    image: ghcr.io/beyziki/ulasim-bakim:latest
+    # NOT: Depo beyziki/ulasim-bakim'den beyziki/ulasim-bakim-v2'ye taşındı
+    # (eski depoda GitHub Actions kısıtlanmıştı, GitHub Destek'e bildirildi).
+    # GitHub Actions imajı her zaman "ghcr.io/<repo adı>" olarak etiketler
+    # (bkz. .github/workflows/ci.yml → images: ghcr.io/${{ github.repository }}),
+    # bu yüzden bu satır da yeni depo adıyla güncellendi.
+    image: ghcr.io/beyziki/ulasim-bakim-v2:latest
     pull_policy: always
     labels:
       # Watchtower yalnızca bu etikete sahip container'ları izler (aşağıda
