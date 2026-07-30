@@ -48,7 +48,10 @@ export class ErrorBoundary extends Component<Props, State> {
     return (
       <div
         style={{
-          minHeight: '100vh',
+          // index.css'teki html{zoom} küçültmesini telafi eder — bkz.
+          // --vh-fill tanımı (aksi halde bu tam ekran hata sayfası da
+          // ekranın altında boş bir şerit bırakırdı).
+          minHeight: 'var(--vh-fill, 100vh)',
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',

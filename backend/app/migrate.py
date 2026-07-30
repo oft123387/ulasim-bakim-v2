@@ -68,6 +68,7 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("activated_at", "DATETIME"),
         ("activated_by_id", "INTEGER"),
         ("target_date", "DATE"),
+        ("scheduled_start_at", "DATE"),
     ],
     "alarm_states": [
         ("emailed_at", "DATETIME"),
@@ -83,12 +84,108 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
 _NEW_TABLES_HANDLED_BY_CREATE_ALL = True  # diagram_images / hotspots create_all ile oluşur
 
 
+def _migrate_suggestions_hierarchical_approval(engine: Engine, existing_tables: set[str]) -> None:
+    """Faz 30 — Öneriler artık (a) belirli bir araca değil bir ARAÇ
+    MODELİNE (vehicle_model — Bozankaya/Sirio) bağlanabiliyor VE (b) tek
+    aşamalı (tek onaylayan) yerine İKİ aşamalı hiyerarşik onaydan geçiyor:
+    öneri önce AMİR'e düşer, amir onaylarsa MÜHENDİS'e düşer, amir
+    reddederse mühendise hiç düşmez.
+
+    Bunun için suggestions.vehicle_id artık NULL olabilmeli (bir modele
+    bağlı öneride belirli bir araç yok) — SQLite'ta ALTER TABLE ile mevcut
+    bir sütunun NOT NULL kısıtı DOĞRUDAN kaldırılamaz (yalnızca sütun
+    EKLENEBİLİR), bu yüzden SQLite'ın resmi olarak belgelediği "tabloyu
+    yeniden oluştur" tekniği kullanılır: doğru kısıtlı yeni bir tablo
+    oluşturulur, TÜM mevcut veriler eski (tek aşamalı) status'e göre
+    akıllıca yeni alanlara eşlenerek kopyalanır, eski tablo silinir, yenisi
+    eski adına yeniden adlandırılır. `vehicle_model` sütunu zaten varsa
+    (daha önce migrate edilmişse) hiçbir şey yapılmaz — idempotenttir."""
+    if "suggestions" not in existing_tables:
+        return  # tablo henüz yok, create_all zaten doğru şemayla oluşturacak
+    inspector = inspect(engine)
+    existing_cols = {c["name"] for c in inspector.get_columns("suggestions")}
+    if "vehicle_model" in existing_cols:
+        return  # zaten migrate edilmiş
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            """
+            CREATE TABLE suggestions_new (
+                id INTEGER PRIMARY KEY,
+                vehicle_id INTEGER REFERENCES vehicles(id) ON DELETE CASCADE,
+                vehicle_model VARCHAR(100) DEFAULT '',
+                plan_id INTEGER REFERENCES maintenance_plans(id) ON DELETE SET NULL,
+                text TEXT NOT NULL,
+                status VARCHAR(20) DEFAULT 'pending',
+                admin_note TEXT DEFAULT '',
+                created_by_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                created_at DATETIME,
+                reviewed_by_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                reviewed_at DATETIME,
+                amir_status VARCHAR(20) DEFAULT 'pending',
+                amir_reviewed_by_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                amir_reviewed_at DATETIME,
+                amir_note TEXT DEFAULT '',
+                engineer_status VARCHAR(20) DEFAULT 'pending',
+                engineer_reviewed_by_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                engineer_reviewed_at DATETIME,
+                engineer_note TEXT DEFAULT ''
+            )
+            """
+        ))
+        # Eski tek-aşamalı status -> yeni iki aşamalı alanlara eşleme:
+        # rejected -> amir_status='rejected' (en erken kapı, geriye dönük en
+        #             mantıklı varsayım), engineer hiç başlamamış sayılır;
+        # approved -> her iki aşama da onaylanmış (zaten kabul edilmiş bir
+        #             öneriyi yeniden değerlendirmeye zorlamamak için);
+        # added    -> aynı şekilde ama mühendis aşaması 'added';
+        # pending  -> ikisi de sıfırdan 'pending'.
+        conn.execute(text(
+            """
+            INSERT INTO suggestions_new (
+                id, vehicle_id, vehicle_model, plan_id, text, status, admin_note,
+                created_by_id, created_at, reviewed_by_id, reviewed_at,
+                amir_status, amir_reviewed_by_id, amir_reviewed_at, amir_note,
+                engineer_status, engineer_reviewed_by_id, engineer_reviewed_at, engineer_note
+            )
+            SELECT
+                id, vehicle_id, '', plan_id, text, status, admin_note,
+                created_by_id, created_at, reviewed_by_id, reviewed_at,
+                CASE status
+                    WHEN 'rejected' THEN 'rejected'
+                    WHEN 'approved' THEN 'approved'
+                    WHEN 'added' THEN 'approved'
+                    ELSE 'pending'
+                END,
+                CASE WHEN status IN ('approved', 'added', 'rejected') THEN reviewed_by_id END,
+                CASE WHEN status IN ('approved', 'added', 'rejected') THEN reviewed_at END,
+                '',
+                CASE status
+                    WHEN 'approved' THEN 'approved'
+                    WHEN 'added' THEN 'added'
+                    ELSE 'pending'
+                END,
+                CASE WHEN status IN ('approved', 'added') THEN reviewed_by_id END,
+                CASE WHEN status IN ('approved', 'added') THEN reviewed_at END,
+                ''
+            FROM suggestions
+            """
+        ))
+        conn.execute(text("DROP TABLE suggestions"))
+        conn.execute(text("ALTER TABLE suggestions_new RENAME TO suggestions"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_suggestions_vehicle_id ON suggestions (vehicle_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_suggestions_status ON suggestions (status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_suggestions_created_at ON suggestions (created_at)"))
+
+
 def run_light_migrations(engine: Engine) -> None:
     if not engine.url.get_backend_name().startswith("sqlite"):
         return  # yalnızca SQLite için otomatik migration uygulanır
 
     inspector = inspect(engine)
     existing_tables = set(inspector.get_table_names())
+
+    _migrate_suggestions_hierarchical_approval(engine, existing_tables)
 
     # Güvenlik notu (Faz 23 denetimi): buradaki f-string yalnızca yukarıdaki
     # _NEW_COLUMNS sabitinden (kaynak kodda gömülü, kullanıcı girdisi

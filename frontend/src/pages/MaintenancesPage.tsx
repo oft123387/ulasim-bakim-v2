@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, apiDownload } from '../api'
+import { api, apiDownload, apiUploadWithFields } from '../api'
 import { showToast } from '../components/toast'
 import Tram3D from '../components/Tram3D'
 import type { ExportFormat, Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Plan, Shift, ShiftModeConfig, User, Vehicle } from '../types'
@@ -21,6 +21,7 @@ import {
   Download,
   FileText,
   ImageIcon,
+  Camera,
   LinkIcon,
   StickyNote,
   UserPlus,
@@ -58,11 +59,23 @@ function AttachmentChip({ att }: { att: NodeAttachment }) {
   )
 }
 
-function ItemExtras({ item }: { item: Item }) {
+function ItemExtras({
+  item,
+  canEdit,
+  onDeletePhoto,
+}: {
+  item: Item
+  // Faz 21 — bakım sırasında eklenen görsellerin silinebilmesi için
+  // (yalnızca işaretleme yetkisi olanlara gösterilir). Şablon ağacı
+  // editörü gibi canEdit geçmeyen çağıranlarda opsiyoneldir.
+  canEdit?: boolean
+  onDeletePhoto?: (attachmentId: number) => void
+}) {
   const hasNote = !!item.note
   const images = item.attachments.filter((a) => a.kind === 'image')
   const others = item.attachments.filter((a) => a.kind !== 'image')
-  if (!hasNote && item.attachments.length === 0) return null
+  const execPhotos = item.exec_attachments ?? []
+  if (!hasNote && item.attachments.length === 0 && execPhotos.length === 0) return null
   return (
     <div className="item-extras">
       {hasNote && (
@@ -90,6 +103,32 @@ function ItemExtras({ item }: { item: Item }) {
         <div className="attach-chips">
           {others.map((a) => (
             <AttachmentChip key={a.id} att={a} />
+          ))}
+        </div>
+      )}
+      {execPhotos.length > 0 && (
+        <div className="exec-attach-thumbs">
+          {execPhotos.map((a) => (
+            <div key={a.id} className="exec-attach-thumb-wrap">
+              <a
+                href={`/uploads/attachments/${a.filename}`}
+                target="_blank"
+                rel="noreferrer"
+                title={`${a.original_name}${a.uploaded_by ? ' — ' + a.uploaded_by.full_name : ''}`}
+              >
+                <img src={`/uploads/attachments/${a.filename}`} alt={a.original_name} />
+              </a>
+              {canEdit && onDeletePhoto && (
+                <button
+                  type="button"
+                  className="exec-attach-delete"
+                  title="Görseli sil"
+                  onClick={() => onDeletePhoto(a.id)}
+                >
+                  <X size={11} />
+                </button>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -124,6 +163,15 @@ const planPeriodLabel = (p: Plan) => {
 // Takvim/Dashboard'daki projeksiyonlarla aynı varsayım: günde ortalama 300 km.
 const DAILY_KM = 300
 
+// Kullanıcının onayladığı km-tolerans tablosuyla birebir aynı kural (bkz.
+// backend services.MAX_TOLERANCE_KM): yüzdelik (pct) tolerans, periyot
+// büyüdükçe sınırsız büyümez — her iki yönde de en fazla 3.000 km'de
+// tavanlanır. Burada da uygulanmazsa büyük periyotlu (ör. Sirio 12Y =
+// 1.440.000 km) planlarda tolerans penceresi backend'in gerçekte
+// uyguladığından çok daha geniş hesaplanır ve "toleranstan çıkmaya yakın"
+// sıralaması/tarihleri yanlış çıkardı.
+const MAX_TOLERANCE_KM = 3000
+
 /** Bir iş emri için tahmini bakım PENCERESİ — planın alt (-%lower) ve üst
  * (+%upper) tolerans sınırlarının, aracın güncel km'sinden günde ortalama
  * DAILY_KM ilerlediği varsayımıyla kaç gün sonra geleceğini hesaplar.
@@ -133,7 +181,14 @@ const DAILY_KM = 300
  * tamamlanmamış iş emirleri için anlamlıdır. */
 function estimateWindow(
   m: Maintenance,
-): { earliest: Date; latest: Date; earliestReached: boolean; overdue: boolean; remainingKm: number } | null {
+): {
+  earliest: Date
+  latest: Date
+  earliestReached: boolean
+  overdue: boolean
+  remainingKm: number
+  upperKm: number
+} | null {
   if (m.status === 'completed') return null
   // Süre bazlı (aylık/yıllık) iş emirlerinde hedef bir km değil takvim
   // tarihidir (target_date) — km projeksiyonu burada anlamsız, bu yüzden bu
@@ -142,13 +197,17 @@ function estimateWindow(
   // Faz 26: plan yüzde (lower_pct/upper_pct) ya da sabit km (lower_km/
   // upper_km) bazlı tolerans kullanabiliyor — hangisi geçerliyse ona göre
   // hesapla (aksi halde km bazlı bir plan için burada hep varsayılan %50/%10
-  // kullanılıp yanlış tarih üretilirdi).
-  const lowerKm = m.plan.threshold_type === 'km'
-    ? m.target_km - m.plan.lower_km
-    : m.target_km - (m.plan.interval_km * m.plan.lower_pct) / 100
-  const upperKm = m.plan.threshold_type === 'km'
-    ? m.target_km + m.plan.upper_km
-    : m.target_km + (m.plan.interval_km * m.plan.upper_pct) / 100
+  // kullanılıp yanlış tarih üretilirdi). Yüzdelik tip ayrıca MAX_TOLERANCE_KM
+  // ile tavanlanır (bkz. yukarıdaki sabitin açıklaması) — sabit km tipi
+  // (threshold_type==='km') admin'in bilinçli girdiği değerdir, tavanlanmaz.
+  const lowerDist = m.plan.threshold_type === 'km'
+    ? m.plan.lower_km
+    : Math.min((m.plan.interval_km * m.plan.lower_pct) / 100, MAX_TOLERANCE_KM)
+  const upperDist = m.plan.threshold_type === 'km'
+    ? m.plan.upper_km
+    : Math.min((m.plan.interval_km * m.plan.upper_pct) / 100, MAX_TOLERANCE_KM)
+  const lowerKm = m.target_km - lowerDist
+  const upperKm = m.target_km + upperDist
   const remainingLower = lowerKm - m.vehicle.current_km
   const remainingUpper = upperKm - m.vehicle.current_km
   const earliestDays = Math.max(0, Math.ceil(remainingLower / DAILY_KM))
@@ -165,7 +224,45 @@ function estimateWindow(
     // Sıralama ve gösterim için km bazlı kalan mesafe (negatifse süresi
     // geçmiş demektir) — hedef km'den aracın güncel km'si çıkarılır.
     remainingKm: m.target_km - m.vehicle.current_km,
+    // Üst tolerans sınırının mutlak km değeri — "toleranstan çıkmaya ne
+    // kadar kaldı" (upperKm - current_km) hesabı için (bkz. bekleyenler
+    // listesi aciliyet sıralaması).
+    upperKm,
   }
+}
+
+// "Başlatılmayı Bekleyenler" listesi için aciliyet sıralaması (kullanıcı
+// isteği): 3 kademeli (bucket) bir öncelik —
+//   0) 1M periyodu (interval_km === 10.000) olan HERHANGİ bir bakım varsa,
+//      başka hiçbir kritere bakılmadan en üstte gösterilir (1M en sık
+//      tekrar eden, dolayısıyla en öncelikli periyot kabul edilir).
+//   1) Tam bakım km'si GEÇİLMİŞ (remainingKm <= 0) olanlar: üst tolerans
+//      sınırına ne kadar az kaldıysa (upperKm - current_km küçüldükçe,
+//      yani "artık toleranstan çıkabilir" tehlikesi arttıkça) o kadar
+//      öncelikli — bu değer zaten negatife düşebilir (tolerans da
+//      aşılmışsa), bu da otomatik olarak en tepeye çıkmasını sağlar.
+//   2) Henüz hedefe ulaşmamış olanlar: tam bakım km'sine en yakın olan
+//      (remainingKm en küçük, sıfıra en yakın) en üstte.
+//   3) Süre bazlı (aylık/yıllık) planlar gibi km projeksiyonu hesaplanamayan
+//      kayıtlar — en sona atılır, aralarında oluşturulma sırasına göre.
+function pendingUrgencyKey(m: Maintenance): [number, number] {
+  const isOneM = m.plan.plan_type === 'km' && m.plan.interval_km === 10_000
+  const w = estimateWindow(m)
+  if (!w) return [isOneM ? 0 : 3, 0]
+  if (isOneM) return [0, w.remainingKm]
+  if (w.remainingKm <= 0) return [1, w.upperKm - m.vehicle.current_km]
+  return [2, w.remainingKm]
+}
+
+function sortPendingByUrgency(list: Maintenance[]): Maintenance[] {
+  return list
+    .slice()
+    .sort((a, b) => {
+      const [ba, va] = pendingUrgencyKey(a)
+      const [bb, vb] = pendingUrgencyKey(b)
+      if (ba !== bb) return ba - bb
+      return va - vb
+    })
 }
 
 function countLeaves(items: Item[]): [number, number] {
@@ -191,6 +288,8 @@ function TreeItem({
   onComplete,
   onUnlock,
   onEditNote,
+  onAddPhoto,
+  onDeletePhoto,
   highlightId,
   showTierBadges,
   expandIds,
@@ -202,6 +301,9 @@ function TreeItem({
   onComplete: (id: number) => void
   onUnlock: (id: number) => void
   onEditNote: (id: number) => void
+  // Faz 21 — bakım sırasında tablet kamerasıyla/galeriden görsel ekleme.
+  onAddPhoto: (itemId: number, file: File) => void
+  onDeletePhoto: (attachmentId: number) => void
   highlightId?: number | null
   showTierBadges?: boolean
   // Notlu Maddeler panelinden bir maddeye atlanınca, ona giden yoldaki tüm
@@ -215,6 +317,13 @@ function TreeItem({
   const [open, setOpen] = useState(false)
   const isLeaf = item.children.length === 0
   const rowRef = useRef<HTMLDivElement>(null)
+  // Faz 21 — iki ayrı gizli dosya girişi: biri (capture'sız) galeriden
+  // seçim için, diğeri (capture="environment") doğrudan kamerayı açmak
+  // için. Tek bir girişte capture verilince Android'de galeri seçeneği
+  // tamamen kayboluyordu (yalnızca kamera açılıyordu) — kullanıcı isteği
+  // üzerine ikisi de ayrı ayrı sunuluyor.
+  const cameraInputRef = useRef<HTMLInputElement>(null)
+  const galleryInputRef = useRef<HTMLInputElement>(null)
   const isHighlighted = highlightId === item.id
   const forcedOpen = expandIds?.has(item.id) ?? false
   const effectiveOpen = open || forcedOpen
@@ -317,6 +426,49 @@ function TreeItem({
             {item.exec_note ? 'Notu Düzenle' : 'Not Ekle'}
           </button>
         )}
+        {isLeaf && canEdit && (
+          <>
+            <button
+              className="small ghost"
+              title="Kamerayla fotoğraf çek"
+              onClick={() => cameraInputRef.current?.click()}
+            >
+              <Camera size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+              Çekerek Yükle
+            </button>
+            <button
+              className="small ghost"
+              title="Galeriden mevcut bir görsel seç"
+              onClick={() => galleryInputRef.current?.click()}
+            >
+              <ImageIcon size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+              Görsel Ekle
+            </button>
+            <input
+              ref={cameraInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) onAddPhoto(item.id, f)
+                e.target.value = ''
+              }}
+            />
+            <input
+              ref={galleryInputRef}
+              type="file"
+              accept="image/*"
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const f = e.target.files?.[0]
+                if (f) onAddPhoto(item.id, f)
+                e.target.value = ''
+              }}
+            />
+          </>
+        )}
         {canUnlock && item.is_locked && (
           <button className="small" onClick={() => onUnlock(item.id)}>
             <LockOpen size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
@@ -335,7 +487,7 @@ function TreeItem({
           </span>
         </div>
       )}
-      <ItemExtras item={item} />
+      <ItemExtras item={item} canEdit={canEdit} onDeletePhoto={onDeletePhoto} />
       {!isLeaf && (
         <div className={`tree-children ${effectiveOpen ? 'open' : ''}`}>
           <div className="tree-children-inner">
@@ -349,6 +501,8 @@ function TreeItem({
                   onComplete={onComplete}
                   onUnlock={onUnlock}
                   onEditNote={onEditNote}
+                  onAddPhoto={onAddPhoto}
+                  onDeletePhoto={onDeletePhoto}
                   highlightId={highlightId}
                   showTierBadges={showTierBadges}
                   expandIds={expandIds}
@@ -689,6 +843,33 @@ function MaintenanceDetail({
     }
   }
 
+  // Faz 21 — usta/mühendis/amir bir maddeyi tikleyip incelerken tablet
+  // kamerasıyla (veya galeriden) fotoğraf ekleyebilir. Not/tamamlama
+  // işaretlerinden farklı olarak burada kasıtlı olarak vardiya bazlı "kim
+  // ekledi" seçici AÇILMAZ — fotoğraf her zaman oturum sahibine atfedilir;
+  // paylaşılan tablette bu basitlik yeterli (dosyanın kendisi zaten kanıt).
+  async function uploadItemPhoto(itemId: number, file: File) {
+    setError('')
+    try {
+      await apiUploadWithFields(`/items/${itemId}/exec-attachments`, file, {})
+      load()
+      showToast('✓ Görsel eklendi')
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  async function deleteItemPhoto(attId: number) {
+    setError('')
+    try {
+      await api(`/item-exec-attachments/${attId}`, { method: 'DELETE' })
+      load()
+      showToast('✓ Görsel silindi')
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
   async function removeItemNote() {
     if (itemNoteId === null) return
     if (shiftModeEnabled && itemNoteAuthorId === '') return
@@ -876,6 +1057,16 @@ function MaintenanceDetail({
                 İş Emrini Sil
               </button>
             )}
+            {!!perms.export_excel && (
+              <button
+                className="small"
+                title="Kim hangi maddeyi ne zaman tamamladı, varsa hangi notu ekledi — Excel olarak indir"
+                onClick={() => apiDownload(`/maintenances/${m.id}/export-items?format=xlsx`, `is_emri_${m.id}_maddeler.xlsx`)}
+              >
+                <Download size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+                Excel'e Aktar
+              </button>
+            )}
           </div>
         </div>
         <div className="muted" style={{ margin: '10px 0' }}>
@@ -1038,6 +1229,8 @@ function MaintenanceDetail({
               onComplete={requestComplete}
               onUnlock={unlock}
               onEditNote={openItemNote}
+              onAddPhoto={uploadItemPhoto}
+              onDeletePhoto={deleteItemPhoto}
               highlightId={highlightId}
               showTierBadges={showTierBadges}
               expandIds={expandIds}
@@ -1433,6 +1626,12 @@ export default function MaintenancesPage({
   const [pendingStart, setPendingStart] = useState<Maintenance[] | null>(null)
   const [pendingStartBusy, setPendingStartBusy] = useState<number | null>(null)
   const [pendingStartError, setPendingStartError] = useState('')
+  // Her bekleyen satır için seçili başlatma tarihi (varsayılan: bugün — yani
+  // ekstra bir şey seçmeden "Başlat" demek eskisi gibi ANINDA başlatır;
+  // ileri bir tarih seçilirse iş emri o tarihe otomatik zamanlanır).
+  const [pendingScheduleDate, setPendingScheduleDate] = useState<Record<number, string>>({})
+
+  const todayIso = () => new Date().toISOString().slice(0, 10)
 
   const loadPendingStart = useCallback(() => {
     if (!perms.start_maintenance) return
@@ -1447,12 +1646,29 @@ export default function MaintenancesPage({
   }, [loadPendingStart, selected])
 
   async function startPendingMaintenance(id: number) {
+    const scheduledStartAt = pendingScheduleDate[id] || todayIso()
     setPendingStartBusy(id)
     setPendingStartError('')
     try {
-      await api(`/maintenances/${id}/start`, { method: 'POST' })
+      await api(`/maintenances/${id}/start`, {
+        method: 'POST',
+        body: { scheduled_start_at: scheduledStartAt },
+      })
       loadPendingStart()
       loadList()
+    } catch (e) {
+      setPendingStartError((e as Error).message)
+    } finally {
+      setPendingStartBusy(null)
+    }
+  }
+
+  async function cancelPendingSchedule(id: number) {
+    setPendingStartBusy(id)
+    setPendingStartError('')
+    try {
+      await api(`/maintenances/${id}/cancel-schedule`, { method: 'POST' })
+      loadPendingStart()
     } catch (e) {
       setPendingStartError((e as Error).message)
     } finally {
@@ -1582,11 +1798,14 @@ export default function MaintenancesPage({
 
   const rawList = list ?? []
 
+  // Tamamlanan bakımlar artık bu sayfada (Bakımlar) hiç gösterilmez —
+  // yalnızca Bakım Geçmişi sayfasında listelenir. Geçmişe bakmak isteyen
+  // Dashboard/Bakım Geçmişi üzerinden ulaşır.
+  //
   // Aynı araç için birden fazla açık (Bekliyor/Devam Ediyor) bakım varsa,
   // yalnızca hedef km'si en büyük olanı listelenir — küçük periyotlar
   // (ör. 25.000/50.000 km) zaten o büyük bakımın içine (kombine checklist)
-  // dahil edilmiştir, ayrı satır olarak tekrar gösterilmez. Tamamlanan
-  // bakımlar (geçmiş kayıt oldukları için) bu kısıtlamadan etkilenmez.
+  // dahil edilmiştir, ayrı satır olarak tekrar gösterilmez.
   // Faz: km ve süre bazlı iş emirleri artık aynı araçta eş zamanlı açık
   // olabilir — bu yüzden dedup anahtarı sadece araç değil, (araç, plan
   // türü) olmalı; aksi halde bir km iş emri diğer türdeki iş emrini
@@ -1602,7 +1821,7 @@ export default function MaintenancesPage({
     if (val > cur) maxOpenTargetByVehicle.set(key, val)
   }
   const all = rawList.filter(
-    (m) => m.status === 'completed' || Math.abs(m.target_km ?? 0) === maxOpenTargetByVehicle.get(dedupKey(m)),
+    (m) => m.status !== 'completed' && Math.abs(m.target_km ?? 0) === maxOpenTargetByVehicle.get(dedupKey(m)),
   )
 
   const vehicleCodes = Array.from(new Set(all.map((m) => m.vehicle.code))).sort()
@@ -1708,28 +1927,80 @@ export default function MaintenancesPage({
                     <th>Periyot</th>
                     <th>Hedef KM</th>
                     <th>Açılış KM</th>
+                    <th>Tahmini Bakım Aralığı</th>
+                    <th>Başlatma Tarihi</th>
                     <th></th>
                   </tr>
                 </thead>
                 <tbody>
-                  {pendingStart.map((m) => (
-                    <tr key={m.id}>
-                      <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
-                      <td>{m.plan.name}</td>
-                      <td>{hedefLabel(m)}</td>
-                      <td>{fmtKm(m.km_at_open)} km</td>
-                      <td>
-                        <button
-                          className="small primary"
-                          disabled={pendingStartBusy === m.id}
-                          onClick={() => startPendingMaintenance(m.id)}
-                        >
-                          <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
-                          {pendingStartBusy === m.id ? 'Başlatılıyor…' : 'Başlat'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {/* Kullanıcı isteği: en kritikler en üstte — 1M periyodu
+                      olan herhangi bir bakım her zaman en üstte; onun
+                      dışında tam bakım km'sine en yakın olanlar, hedefi
+                      geçmişse de tolerans sınırına en yakın (toleranstan
+                      çıkma tehlikesi en yüksek) olanlar öncelikli (bkz.
+                      sortPendingByUrgency). */}
+                  {sortPendingByUrgency(pendingStart).map((m) => {
+                    const isScheduled = !!m.scheduled_start_at
+                    const selectedDate = pendingScheduleDate[m.id] ?? todayIso()
+                    const window = estimateWindow(m)
+                    return (
+                      <tr key={m.id}>
+                        <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
+                        <td>{m.plan.name}</td>
+                        <td>{hedefLabel(m)}</td>
+                        <td>{fmtKm(m.km_at_open)} km</td>
+                        <td>
+                          {window ? (
+                            <Badge tone={window.overdue ? 'danger' : window.earliestReached ? 'in_progress' : 'neutral'}>
+                              {window.overdue
+                                ? `Süresi geçti (aralık: ${fmtDate(window.earliest)} – ${fmtDate(window.latest)})`
+                                : `${fmtDate(window.earliest)} – ${fmtDate(window.latest)}`}
+                            </Badge>
+                          ) : '—'}
+                        </td>
+                        <td>
+                          {isScheduled ? (
+                            <Badge tone="pending">
+                              {new Date(m.scheduled_start_at as string).toLocaleDateString('tr-TR')}
+                            </Badge>
+                          ) : (
+                            <input
+                              type="date"
+                              min={todayIso()}
+                              value={selectedDate}
+                              onChange={(e) =>
+                                setPendingScheduleDate((prev) => ({ ...prev, [m.id]: e.target.value }))
+                              }
+                              style={{ width: 145 }}
+                            />
+                          )}
+                        </td>
+                        <td>
+                          {isScheduled ? (
+                            <button
+                              className="small"
+                              disabled={pendingStartBusy === m.id}
+                              onClick={() => cancelPendingSchedule(m.id)}
+                            >
+                              <X size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                              {pendingStartBusy === m.id ? 'İptal ediliyor…' : 'Zamanlamayı İptal Et'}
+                            </button>
+                          ) : (
+                            <button
+                              className="small primary"
+                              disabled={pendingStartBusy === m.id}
+                              onClick={() => startPendingMaintenance(m.id)}
+                            >
+                              <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                              {pendingStartBusy === m.id
+                                ? 'Başlatılıyor…'
+                                : selectedDate > todayIso() ? 'Zamanla' : 'Başlat'}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1748,7 +2019,6 @@ export default function MaintenancesPage({
             <option value="">Tüm Durumlar</option>
             <option value="pending">Bekliyor</option>
             <option value="in_progress">Devam Ediyor</option>
-            <option value="completed">Tamamlandı</option>
           </select>
           <select value={vehicleFilter} onChange={(e) => setVehicleFilter(e.target.value)}>
             <option value="">Tüm Araçlar</option>

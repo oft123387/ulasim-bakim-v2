@@ -22,8 +22,18 @@ services:
       # varsa onlara dokunulmaz.
       - "com.centurylinklabs.watchtower.enable=true"
     container_name: ulasim-bakim
+    # Konteyner İÇİNDE uygulama her zaman 8000 portunda çalışır (Dockerfile/
+    # docker-entrypoint.sh) — bu sabittir, değişmez. Ama HOST tarafındaki
+    # port (solundaki sayı) sunucuda çakışabilir: aynı sunucuda başka bir
+    # proje (ör. "datalogger") de 8000'i kullanmaya çalışırsa ikisi birden
+    # ayakta duramaz ("port zaten kullanımda" hatası). Bunu önlemek için
+    # host portu APP_PORT ortam değişkeninden okunur (varsayılan 8001,
+    # klasik 8000'den bilerek farklı). Bu sunucuda BİRDEN FAZLA proje
+    # çalıştıracaksanız: bu depodaki (docker-compose.yml ile aynı klasördeki)
+    # ".env" dosyasına "APP_PORT=8001" gibi HER PROJE İÇİN FARKLI bir değer
+    # yazın (örn. ulasim-bakim=8001, datalogger=8002 vb.) — .env.example'a bakın.
     ports:
-      - "8000:8000"
+      - "${APP_PORT:-8001}:8000"
     # backend/.env, build sırasında imaja KOPYALANMAZ (.dockerignore'da
     # bilerek hariç tutulur — sırlar imaja gömülmesin diye). Bunun yerine
     # docker compose up sırasında HOST'taki bu dosya konteynere ortam

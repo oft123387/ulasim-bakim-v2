@@ -71,6 +71,17 @@ export interface NodeAttachment {
   created_at: string
 }
 
+// Faz 21 — bakım SIRASINDA (bir maddeyi tikleyip incelerken) tablet
+// kamerasıyla/galeriden eklenen fotoğraf. Şablonun NodeAttachment'ından
+// (admin'in bakım ağacına eklediği referans görseli) farklıdır.
+export interface ItemExecAttachment {
+  id: number
+  filename: string
+  original_name: string
+  uploaded_by: User | null
+  created_at: string
+}
+
 export interface TreeNode {
   id: number
   parent_id: number | null
@@ -111,6 +122,8 @@ export interface Item {
   exec_note: string
   exec_note_by: User | null
   exec_note_at: string | null
+  // Faz 21 — bakım sırasında bu maddeye eklenen fotoğraflar.
+  exec_attachments: ItemExecAttachment[]
   children: Item[]
 }
 
@@ -142,6 +155,8 @@ export interface Maintenance {
   is_activated: boolean
   activated_at: string | null
   activated_by: User | null
+  // "Başlat" derken ileri bir tarih seçildiyse dolu — o tarihte otomatik başlatılır.
+  scheduled_start_at: string | null
 }
 
 export interface UpcomingItem {
@@ -625,24 +640,42 @@ export interface NotificationItem {
   maintenance_id: number | null
 }
 
-// ---------- Öneriler ----------
+// ---------- Öneriler (Faz 30 — araç modeli + hiyerarşik onay) ----------
 export interface Suggestion {
   id: number
-  vehicle: Vehicle
+  // Geriye dönük uyumluluk: bu özellikten önce belirli bir araca bağlı
+  // oluşturulmuş eski öneriler için dolu; yeni (model bazlı) önerilerde null.
+  vehicle: Vehicle | null
+  // Yeni önerilerde dolu — hedeflenen araç modeli (Bozankaya/Sirio vb.).
+  vehicle_model: string
   plan: Plan | null
   text: string
-  status: 'pending' | 'approved' | 'rejected' | 'added'
+  // pending: amir'in kararını bekliyor · pending_engineer: amir onayladı,
+  // mühendis bekleniyor · rejected: amir ya da mühendis reddetti ·
+  // approved/added: mühendisin nihai kararı.
+  status: 'pending' | 'pending_engineer' | 'rejected' | 'approved' | 'added'
   admin_note: string
   created_by: User | null
   created_at: string
   reviewed_by: User | null
   reviewed_at: string | null
+  // 1. aşama — amir
+  amir_status: 'pending' | 'approved' | 'rejected'
+  amir_reviewed_by: User | null
+  amir_reviewed_at: string | null
+  amir_note: string
+  // 2. aşama — mühendis
+  engineer_status: 'pending' | 'approved' | 'rejected' | 'added'
+  engineer_reviewed_by: User | null
+  engineer_reviewed_at: string | null
+  engineer_note: string
 }
 
 export const SUGGESTION_STATUS_TR: Record<Suggestion['status'], string> = {
-  pending: 'Beklemede',
-  approved: 'Onaylandı',
+  pending: 'Beklemede (Amir)',
+  pending_engineer: 'Beklemede (Mühendis)',
   rejected: 'Reddedildi',
+  approved: 'Onaylandı',
   added: 'Ağaca Eklendi',
 }
 
@@ -670,4 +703,59 @@ export interface VehicleProfile {
   last_note: MaintenanceNote | null
   recent: Maintenance[]
   attachments: VehicleAttachment[]
+}
+
+// ---------- Faz 18: KPI ----------
+export interface KPICompletion {
+  opened_in_range: number
+  completed_of_opened: number
+  completion_rate_pct: number
+  completed_in_range: number
+  avg_completion_days: number | null
+}
+
+export interface KPICritical {
+  // Her zaman GÜNCEL açık iş emirlerine göredir, tarih aralığından bağımsız.
+  open_total: number
+  urgent_count: number
+  very_critical_count: number
+  overdue_count: number
+}
+
+export interface KPIVehicleModelRow {
+  vehicle_model: string
+  opened: number
+  completed: number
+  open_now: number
+}
+
+export interface KPIVehicleRow {
+  vehicle: Vehicle
+  opened: number
+  completed: number
+  open_now: number
+}
+
+export interface KPIPersonRow {
+  user: User
+  items_completed_in_range: number
+  maintenances_completed_in_range: number
+  avg_completion_days: number | null
+  shift_name: string | null
+}
+
+export interface KPIShiftRow {
+  shift_name: string
+  items_completed_in_range: number
+}
+
+export interface KPIReport {
+  date_from: string | null
+  date_to: string | null
+  completion: KPICompletion
+  critical: KPICritical
+  by_vehicle_model: KPIVehicleModelRow[]
+  top_vehicles: KPIVehicleRow[]
+  by_person: KPIPersonRow[]
+  by_shift: KPIShiftRow[]
 }

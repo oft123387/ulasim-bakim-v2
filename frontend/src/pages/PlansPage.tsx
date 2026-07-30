@@ -60,9 +60,17 @@ function ThresholdFields({
   )
 }
 
-function EditPlanForm({ plan, onDone, onCancel }: { plan: Plan; onDone: () => void; onCancel: () => void }) {
+function EditPlanForm({
+  plan, knownModels, onDone, onCancel,
+}: {
+  plan: Plan
+  knownModels: string[]
+  onDone: () => void
+  onCancel: () => void
+}) {
   const [name, setName] = useState(plan.name)
   const [interval, setIntervalKm] = useState(String(plan.interval_km))
+  const [vehicleModel, setVehicleModel] = useState(plan.vehicle_model ?? '')
   const [mode, setMode] = useState<'percent' | 'km'>(plan.threshold_type ?? 'percent')
   const [lower, setLower] = useState(String(mode === 'km' ? plan.lower_km : plan.lower_pct))
   const [upper, setUpper] = useState(String(mode === 'km' ? plan.upper_km : plan.upper_pct))
@@ -86,6 +94,7 @@ function EditPlanForm({ plan, onDone, onCancel }: { plan: Plan; onDone: () => vo
         name,
         interval_km: Number(interval),
         threshold_type: mode,
+        vehicle_model: vehicleModel.trim(),
       }
       if (mode === 'km') {
         body.lower_km = Number(lower)
@@ -106,9 +115,19 @@ function EditPlanForm({ plan, onDone, onCancel }: { plan: Plan; onDone: () => vo
   return (
     <tr>
       <td colSpan={7}>
-        <form className="row" onSubmit={save}>
+        <form className="row" onSubmit={save} style={{ flexWrap: 'wrap' }}>
           <input placeholder="Plan adı" value={name} onChange={(e) => setName(e.target.value)} required />
           <input placeholder="Periyot (km)" type="number" value={interval} onChange={(e) => setIntervalKm(e.target.value)} required />
+          <select
+            value={vehicleModel}
+            onChange={(e) => setVehicleModel(e.target.value)}
+            style={{ minWidth: 200 }}
+          >
+            <option value="">Genel / Tüm Araçlar</option>
+            {(vehicleModel && !knownModels.includes(vehicleModel) ? [vehicleModel, ...knownModels] : knownModels).map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
           <ThresholdFields mode={mode} setMode={onModeChange} lower={lower} setLower={setLower} upper={upper} setUpper={setUpper} />
           <button className="small primary" disabled={saving}>{saving ? 'Kaydediliyor…' : 'Kaydet'}</button>
           <button className="small" type="button" onClick={onCancel}>Vazgeç</button>
@@ -123,15 +142,20 @@ export default function PlansPage() {
   const [list, setList] = useState<Plan[] | null>(null)
   const [name, setName] = useState('')
   const [interval, setIntervalKm] = useState('')
+  const [vehicleModel, setVehicleModel] = useState('')
   const [mode, setMode] = useState<'percent' | 'km'>('percent')
   const [lower, setLower] = useState('5')
   const [upper, setUpper] = useState('10')
   const [error, setError] = useState('')
   const [editingId, setEditingId] = useState<number | null>(null)
+  const [knownModels, setKnownModels] = useState<string[]>([])
+  const [normalizing, setNormalizing] = useState(false)
+  const [normalizeMsg, setNormalizeMsg] = useState('')
 
   const load = () => api<Plan[]>('/plans').then(setList).catch(() => setList([]))
   useEffect(() => {
     load()
+    api<string[]>('/vehicle-models').then(setKnownModels).catch(() => setKnownModels([]))
   }, [])
 
   function onModeChange(next: 'percent' | 'km') {
@@ -146,7 +170,10 @@ export default function PlansPage() {
     e.preventDefault()
     setError('')
     try {
-      const body: Record<string, unknown> = { name, interval_km: Number(interval), threshold_type: mode }
+      const body: Record<string, unknown> = {
+        name, interval_km: Number(interval), threshold_type: mode,
+        vehicle_model: vehicleModel.trim(),
+      }
       if (mode === 'km') {
         body.lower_km = Number(lower)
         body.upper_km = Number(upper)
@@ -157,6 +184,7 @@ export default function PlansPage() {
       await api('/plans', { method: 'POST', body })
       setName('')
       setIntervalKm('')
+      setVehicleModel('')
       load()
     } catch (err) {
       setError((err as Error).message)
@@ -181,18 +209,57 @@ export default function PlansPage() {
     }
   }
 
+  async function normalizeSirioNames() {
+    setNormalizing(true)
+    setNormalizeMsg('')
+    try {
+      const res = await api<{ count: number }>('/plans/normalize-sirio-names', { method: 'POST' })
+      setNormalizeMsg(
+        res.count > 0
+          ? `${res.count} Sirio planının adı M/Y koduna çevrildi.`
+          : 'Zaten tüm Sirio planları M/Y biçiminde — değişiklik yapılmadı.',
+      )
+      load()
+    } catch (err) {
+      setNormalizeMsg((err as Error).message)
+    } finally {
+      setNormalizing(false)
+    }
+  }
+
   return (
     <>
-      <PageHeader title="Bakım Planları" />
+      <PageHeader
+        title="Bakım Planları"
+        actions={
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4 }}>
+            <button className="small" onClick={normalizeSirioNames} disabled={normalizing}
+              title="Var olan tüm Sirio km planlarının adını kısa periyot koduna (ör. 1.440.000 km -> 12Y) çevirir">
+              {normalizing ? 'Düzeltiliyor...' : 'Sirio Adlarını M/Y Yap'}
+            </button>
+            {normalizeMsg && <span className="muted" style={{ fontSize: 12 }}>{normalizeMsg}</span>}
+          </div>
+        }
+      />
       <div className="card">
         <div className="card-head">
           <div>
             <div className="card-title">Yeni Plan Ekle</div>
           </div>
         </div>
-        <form className="row" onSubmit={add}>
+        <form className="row" onSubmit={add} style={{ flexWrap: 'wrap' }}>
           <input placeholder="Plan adı" value={name} onChange={(e) => setName(e.target.value)} required />
           <input placeholder="Periyot (km)" type="number" value={interval} onChange={(e) => setIntervalKm(e.target.value)} required />
+          <select
+            value={vehicleModel}
+            onChange={(e) => setVehicleModel(e.target.value)}
+            style={{ minWidth: 200 }}
+          >
+            <option value="">Genel / Tüm Araçlar</option>
+            {knownModels.map((m) => (
+              <option key={m} value={m}>{m}</option>
+            ))}
+          </select>
           <ThresholdFields mode={mode} setMode={onModeChange} lower={lower} setLower={setLower} upper={upper} setUpper={setUpper} />
           <button className="primary"><PlusCircle size={14} style={{ marginRight: 6, verticalAlign: -2 }} />Plan Ekle</button>
         </form>
@@ -217,7 +284,15 @@ export default function PlansPage() {
               {list === null && <SkeletonTableRows columns={7} />}
               {list !== null && list.map((p) => {
                 if (editingId === p.id) {
-                  return <EditPlanForm key={p.id} plan={p} onDone={() => { setEditingId(null); load() }} onCancel={() => setEditingId(null)} />
+                  return (
+                    <EditPlanForm
+                      key={p.id}
+                      plan={p}
+                      knownModels={knownModels}
+                      onDone={() => { setEditingId(null); load() }}
+                      onCancel={() => setEditingId(null)}
+                    />
+                  )
                 }
                 const { lower: lowerLabel, upper: upperLabel } = windowLabel(p)
                 return (

@@ -81,25 +81,36 @@ function fmtTime(s: string | null): string {
   return new Date(s).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
 }
 
-// Takvimde "en geç bitirilmesi gereken tarih" planın kendi tolerans
-// aralığından (upper_pct/upper_km) BAĞIMSIZDIR — yapılması gereken hedef
-// km'nin sabit 2500 km geçilmesine kadar olan tarihtir.
-const OVERDUE_ALLOWANCE_KM = 2500
+// Kullanıcının onayladığı km-tolerans tablosuyla birebir aynı kural (bkz.
+// backend services.MAX_TOLERANCE_KM ve MaintenancesPage.tsx'teki
+// estimateWindow): yüzdelik tolerans periyot büyüdükçe sınırsız büyümez,
+// her iki yönde de en fazla 3.000 km'de tavanlanır. Bu değer artık
+// haftalık görünümde iş emri barının üzerinde METİN olarak da
+// gösterildiğinden (bkz. DayCell), planın GERÇEK tolerans kuralıyla
+// hesaplanması şart — eskiden burada sabit bir "2500 km payı" kullanılıyordu,
+// bu da Bakımlar sayfasındaki (estimateWindow) gerçek tolerans hesabıyla
+// TUTARSIZDI.
+const MAX_TOLERANCE_KM = 3000
 
-/** Bir iş emrinin hedef km'sinin sabit OVERDUE_ALLOWANCE_KM kadar
- * geçilmesine kadar olan tahmini son tarih — DAILY_KM varsayımıyla aracın
- * güncel km'sinden kaç gün sonra bu noktaya ulaşacağı hesaplanır. Süre
- * bazlı (aylık/yıllık) iş emirlerinde hedef zaten bir takvim tarihidir
- * (target_date) — km projeksiyonu yerine doğrudan o tarih kullanılır. */
+/** Bir iş emrinin planın ÜST tolerans sınırına göre en geç bitirilmesi
+ * gereken tahmini tarihi — DAILY_KM varsayımıyla aracın güncel km'sinden
+ * kaç gün sonra bu noktaya ulaşacağı hesaplanır. Süre bazlı (aylık/yıllık)
+ * iş emirlerinde hedef zaten bir takvim tarihidir (target_date) — km
+ * projeksiyonu yerine doğrudan o tarih kullanılır. */
 function latestDeadline(m: Maintenance): Date {
   if (m.target_date) return new Date(m.target_date)
-  const upperKm = (m.target_km ?? 0) + OVERDUE_ALLOWANCE_KM
+  const upperDist = m.plan.threshold_type === 'km'
+    ? m.plan.upper_km
+    : Math.min((m.plan.interval_km * m.plan.upper_pct) / 100, MAX_TOLERANCE_KM)
+  const upperKm = (m.target_km ?? 0) + upperDist
   const remainingUpper = upperKm - m.vehicle.current_km
   const days = Math.max(0, Math.ceil(remainingUpper / DAILY_KM))
   const d = new Date()
   d.setDate(d.getDate() + days)
   return d
 }
+
+const fmtDate = (d: Date) => d.toLocaleDateString('tr-TR')
 
 // En dolu hücrelerde en önemli maddelerin görünür kalması için: Bekliyor ve
 // Devam Ediyor, Tamamlandı'dan önce gösterilir (ilgi/aksiyon gerektiren
@@ -143,12 +154,18 @@ function DayCell({
   events,
   onOpenMaintenance,
   onOpenDay,
+  showDeadline,
 }: {
   date: Date
   inMonth: boolean
   events: Maintenance[]
   onOpenMaintenance: (id: number) => void
   onOpenDay: (d: Date) => void
+  // Haftalık görünümde satırlar zaten daha uzun (bkz. .cal-grid-week) —
+  // bu ekstra alanı değerlendirip her barın altında "en geç X tarihinde"
+  // bilgisini de gösterir. Aylık görünümde (satırlar dar) eskisi gibi
+  // yalnızca araç + periyot adı tek satırda kalır.
+  showDeadline: boolean
 }) {
   const isToday = toISODate(date) === toISODate(new Date())
   const sorted = sortByStatusPriority(events)
@@ -164,14 +181,19 @@ function DayCell({
         {visible.map((m) => (
           <button
             key={m.id}
-            className={`cal-chip cal-${m.status}`}
+            className={`cal-chip cal-${m.status} ${showDeadline ? 'cal-chip-detailed' : ''}`}
             onClick={(e) => {
               e.stopPropagation()
               onOpenMaintenance(m.id)
             }}
             title={`${m.vehicle.code} — ${m.plan.name} (${STATUS_TR[m.status]})`}
           >
-            {m.vehicle.code} · {m.plan.name}
+            <span className="cal-chip-title">{m.vehicle.code} · {m.plan.name}</span>
+            {showDeadline && (
+              <span className="cal-chip-deadline">
+                {m.status === 'completed' ? 'Tamamlandı' : `En geç ${fmtDate(latestDeadline(m))}`}
+              </span>
+            )}
           </button>
         ))}
         {extra > 0 && <div className="cal-more">+{extra} daha</div>}
@@ -210,7 +232,10 @@ export default function CalendarPage({
     loadPendingStart()
   }, [loadPendingStart])
 
-  const [view, setView] = useState<ViewMode>('month')
+  // Kullanıcı isteği: sayfa ilk açıldığında (ya da bir yerden otomatik
+  // gelindiğinde) varsayılan görünüm Haftalık olsun — Aylık'a geçiş hâlâ
+  // sekmeden yapılabilir, yalnızca başlangıç değeri değişti.
+  const [view, setView] = useState<ViewMode>('week')
   const [anchor, setAnchor] = useState<Date>(() => startOfDay(new Date()))
   const [list, setList] = useState<Maintenance[] | null>(null)
   const [error, setError] = useState('')
@@ -504,6 +529,7 @@ export default function CalendarPage({
                     setAnchor(day)
                     setView('day')
                   }}
+                  showDeadline={view === 'week'}
                 />
               ))}
             </div>

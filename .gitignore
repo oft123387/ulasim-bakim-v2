@@ -6,6 +6,14 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 
+# Kök dizindeki .env, docker-compose.yml'in okuduğu SUNUCUYA ÖZEL ayarları
+# (ör. APP_PORT — aynı sunucuda birden fazla proje varsa her biri için
+# farklı olmalı) tutar; bu yüzden commit edilmez. .env.example placeholder
+# olarak kalır.
+.env
+.env.*
+!.env.example
+
 # ---------------------------------------------------------------- Python
 **/__pycache__/
 **/*.py[cod]

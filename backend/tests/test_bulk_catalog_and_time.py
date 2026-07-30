@@ -11,8 +11,9 @@ Bu test o akışın küçük, kontrollü bir örneğini otomatik test paketine e
     periyodun tam katı olsa bile) kendi başına GERÇEK, Bakım Planları
     sayfasında da (varsayılan GET /api/plans) görünen bir plan olarak açılır
     — hiçbiri "is_catalog_only" olarak gizlenmez.
-  - BAKIM hücresi yorumlanamayan ("?") bir satır ATLANMAZ, periyodu
-    "belirsiz" (?) olarak işaretlenmiş şekilde ağaca eklenir.
+  - BAKIM hücresi yorumlanamayan ("?") bir satır ATLANIR — hiçbir zaman
+    "?" periyotlu bir plan/madde ağaca eklenmez; yalnızca önizleme/rapor
+    (`unresolved_period`) listesinde görünür.
   - Ağaç içe aktarıldığı anda, o modeldeki araçlar için otomatik bakım
     adayları HEMEN yeniden değerlendirilir.
   - Excel'deki ARAÇ değeri (ör. "SİRİO") filodaki gerçek Vehicle.model
@@ -60,8 +61,8 @@ def test_bulk_catalog_import_km_codes_and_model_matching(client, admin_token):
         # katı olsa da ARTIK ayrı, gerçek/görünür kendi planını alır.
         [model_real.upper(), "ARAÇ ÜSTÜ", "PANTOGRAF", "Karbon Şerit", "6Y",
          "Karbon şeridin aşınma kontrolü", "SKA-TST-04"],
-        # BAKIM hücresi yorumlanamıyor ("?") — atlanmaz, "Periyodu Belirsiz
-        # (?)" planı altında eklenir, madde notunda ham metin korunur.
+        # BAKIM hücresi yorumlanamıyor ("?") — hiçbir zaman ağaca/plana
+        # eklenmez, yalnızca unresolved_period raporunda görünür.
         [model_real.upper(), "ARAÇ İÇİ", "TCMS", "Manuel Kontroler", "?",
          "Mikrosviçin kontrolü", "SKA-TST-05"],
     ]
@@ -85,21 +86,24 @@ def test_bulk_catalog_import_km_codes_and_model_matching(client, admin_token):
     # Artık hiçbir periyot is_catalog_only olarak gizlenmiyor.
     assert result["catalog_only_periods"] == []
 
-    # Bakım Planları sayfası (varsayılan GET /api/plans) TÜM periyotları
-    # gösterir: 200.000, 10.000 (1M), 720.000 (6Y) ve "Periyodu Belirsiz (?)".
+    # Bakım Planları sayfası (varsayılan GET /api/plans) yalnızca
+    # YORUMLANABİLEN periyotları gösterir: 200.000, 10.000 (1M), 720.000
+    # (6Y). "?" satırı için hiçbir plan oluşturulmaz.
     plans = client.get("/api/plans", headers=auth(admin)).json()
     by_model = [p for p in plans if p.get("vehicle_model") == model_real]
-    assert len(by_model) == 4
+    assert len(by_model) == 3
+    assert not any(p["plan_type"] == "unknown" for p in by_model)
     plan_200k = next(p for p in by_model if p["interval_km"] == 200_000)
     plan_10k = next(p for p in by_model if p["interval_km"] == 10_000)
     plan_720k = next(p for p in by_model if p["interval_km"] == 720_000)
-    unknown_plan = next(p for p in by_model if p["plan_type"] == "unknown")
-    assert plan_200k["name"] == "200.000 km Bakımı"
+    # model_real ("Sirio Test") "sirio" içerdiği için otomatik plan adları
+    # artık kısa M/Y koduyla üretilir (bkz. services.default_plan_name /
+    # sirio_period_label) — "X km Bakımı" yerine.
+    assert plan_200k["name"] == "20M"
     assert plan_200k["is_catalog_only"] is False
-    assert plan_10k["name"] == "10.000 km Bakımı"
-    assert plan_720k["name"] == "720.000 km Bakımı"
+    assert plan_10k["name"] == "1M"
+    assert plan_720k["name"] == "6Y"
     assert plan_720k["is_catalog_only"] is False
-    assert unknown_plan["name"] == "Periyodu Belirsiz (?)"
 
     # Her periyodun kendi ağacında yalnızca kendi maddesi olmalı — hiçbiri
     # başka bir periyoda katılmıyor.
@@ -135,7 +139,8 @@ def test_bulk_catalog_import_km_codes_and_model_matching(client, admin_token):
     assert merged_leaves.get("SKA-TST-01") == "200.000 km"
     assert merged_leaves.get("SKA-TST-02") == "10.000 km"
     assert merged_leaves.get("SKA-TST-04") == "720.000 km"
-    assert merged_leaves.get("SKA-TST-05") == "Belirsiz (?)"
+    # "?" satırı hiç ağaca eklenmediği için "Tümü" görünümünde de yok.
+    assert "SKA-TST-05" not in merged_leaves
 
     # ================================================================ Anında yeniden değerlendirme
     # Araç zaten tam 200.000 km'de duruyordu — ne km güncellemesi ne başka
@@ -178,7 +183,7 @@ def test_bulk_catalog_import_dry_run_reports_but_does_not_persist(client, admin_
     result = r.json()
     assert result["dry_run"] is True
     assert result["vehicle_models"] == [model_real]
-    assert result["plans_created"] == 2  # 90.000 km + Periyodu Belirsiz (?)
+    assert result["plans_created"] == 1  # yalnızca 90.000 km — "?" satırı için plan oluşturulmaz
     assert len(result["unresolved_period"]) == 1
 
     # Hiçbir şey kaydedilmemeli.
@@ -195,7 +200,7 @@ def test_bulk_catalog_import_dry_run_reports_but_does_not_persist(client, admin_
     assert r2.status_code == 200, r2.text
     result2 = r2.json()
     assert result2["dry_run"] is False
-    assert result2["plans_created"] == 2
+    assert result2["plans_created"] == 1
 
     plans2 = client.get("/api/plans", headers=auth(admin)).json()
     assert any(p.get("vehicle_model") == model_real for p in plans2)

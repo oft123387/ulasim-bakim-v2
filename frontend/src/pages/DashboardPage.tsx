@@ -12,7 +12,6 @@ import {
   CheckCircle2,
   UserCheck,
   ArrowRight,
-  Workflow,
   AlertTriangle,
 } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
@@ -48,7 +47,7 @@ const hedefDisplay = (u: UpcomingItem) =>
 const hedefLabel = (m: Maintenance) =>
   m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
 
-type NavTarget = 'vehicles' | 'plans' | 'tree' | 'users'
+type NavTarget = 'vehicles' | 'plans' | 'tree' | 'users' | 'history'
 
 const STATUS_BY_BAR_KEY: Record<string, string> = {
   'Bekliyor': 'pending',
@@ -143,6 +142,12 @@ export default function DashboardPage({
   function handleBarClick(barKey: string, barData: { payload?: { fullName?: string } }) {
     const planName = barData?.payload?.fullName
     const status = STATUS_BY_BAR_KEY[barKey]
+    // Tamamlanan bakımlar artık Bakımlar sekmesinde değil, yalnızca Bakım
+    // Geçmişi'nde gösteriliyor — o duruma tıklanınca doğrudan oraya gidilir.
+    if (status === 'completed') {
+      onNavigate?.('history')
+      return
+    }
     onFilterMaintenances?.({ status, planName })
   }
 
@@ -186,7 +191,7 @@ export default function DashboardPage({
           onClick={isStaff ? () => onNavigate?.('vehicles') : undefined}
         />
         <StatCard
-          label="Bekleyen Bakım"
+          label="Planlanan Bakım"
           value={data.pending_count}
           tone="pending"
           icon={<Clock size={18} />}
@@ -204,7 +209,7 @@ export default function DashboardPage({
           value={data.completed_this_month}
           tone="completed"
           icon={<CheckCircle2 size={18} />}
-          onClick={() => onFilterMaintenances?.({ status: 'completed' })}
+          onClick={() => onNavigate?.('history')}
         />
         {criticalCount > 0 && (
           <StatCard
@@ -222,15 +227,6 @@ export default function DashboardPage({
             tone={data.pending_user_approvals > 0 ? 'danger' : undefined}
             icon={<UserCheck size={18} />}
             onClick={() => onNavigate?.('users')}
-          />
-        )}
-        {isStaff && (data.unresolved_period_count ?? 0) > 0 && (
-          <StatCard
-            label="Periyodu Belirsiz (?) Madde"
-            value={data.unresolved_period_count ?? 0}
-            tone="pending"
-            icon={<Workflow size={18} />}
-            onClick={() => onNavigate?.('tree')}
           />
         )}
       </div>

@@ -108,6 +108,82 @@ def maintenance_rows(maintenances: list) -> tuple[list[str], list[list[str]]]:
     return headers, rows
 
 
+def item_completion_rows(
+    maintenance_id: int, vehicle_code: str, plan_name: str, items: list,
+) -> tuple[list[str], list[list[str]]]:
+    """Tek bir iş emrinin kontrol maddelerini (yalnızca en alt seviye/yaprak
+    maddeler — üst başlıklar tek tek işaretlenmez, alt maddeler bitince
+    otomatik kilitlenir) kimin/ne zaman tamamladığını ve varsa eklediği
+    notu düz bir tabloya çevirir. `items`, `main._build_item_tree` çıktısı
+    (iç içe ItemOut listesi) — hiyerarşideki üst başlıklar "Yol" sütununda
+    (ör. "ARAÇ İÇİ > Aydınlatma Sistemi") görünür, kendileri ayrı satır
+    olarak eklenmez."""
+    headers = [
+        "İş Emri", "Araç", "Periyot", "Yol", "Madde", "Kart Kodu",
+        "Durum", "Tamamlayan", "Tamamlanma Tarihi/Saati",
+        "Bulgu/Not", "Notu Ekleyen", "Not Tarihi/Saati",
+    ]
+    rows: list[list[str]] = []
+
+    def walk(nodes, path: list[str]):
+        for it in nodes:
+            children = list(it.children)
+            if children:
+                walk(children, path + [it.name])
+                continue
+            rows.append([
+                str(maintenance_id),
+                vehicle_code,
+                plan_name,
+                " > ".join(path),
+                it.name,
+                it.card_code or "",
+                "Tamamlandı" if it.is_completed else "Bekliyor",
+                it.completed_by.full_name if it.completed_by else "",
+                _dt(it.completed_at),
+                it.exec_note or "",
+                it.exec_note_by.full_name if it.exec_note_by else "",
+                _dt(it.exec_note_at),
+            ])
+
+    walk(items, [])
+    return headers, rows
+
+
+def build_item_completion_export(
+    maintenance_id: int, vehicle_code: str, plan_name: str, items: list, fmt: str, title: str,
+) -> bytes:
+    headers, rows = item_completion_rows(maintenance_id, vehicle_code, plan_name, items)
+    if fmt == "xlsx":
+        import openpyxl
+        from openpyxl.utils import get_column_letter
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Madde Tamamlama"
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = excel_utils._HEADER_FONT
+            cell.fill = excel_utils._HEADER_FILL
+        ws.freeze_panes = "A2"
+        for row in rows:
+            ws.append(row)
+        widths = [10, 12, 16, 34, 30, 14, 14, 20, 20, 34, 20, 20]
+        for i, w in enumerate(widths[: len(headers)], start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    if fmt == "csv":
+        return build_csv(headers, rows)
+    if fmt == "pdf":
+        return build_pdf(headers, rows, title)
+    if fmt == "docx":
+        return build_docx(headers, rows, title)
+    raise ValueError(f"Desteklenmeyen format: {fmt}")
+
+
 def audit_rows(logs: list) -> tuple[list[str], list[list[str]]]:
     headers = [
         "Tarih", "Kullanıcı", "Aksiyon", "Varlık", "Özet",
@@ -277,3 +353,97 @@ def build_audit_export(logs: list, fmt: str, title: str = "İşlem Kayıtları")
 
 def filename_for(base: str, fmt: str) -> str:
     return f"{base}.{fmt}"
+
+
+# ================================================================= Faz 18: KPI raporu (Excel)
+def build_kpi_workbook(report: dict, title: str = "KPI Raporu") -> bytes:
+    """services.compute_kpi_report()'ün döndürdüğü sözlükten çok sayfalı bir
+    Excel raporu üretir: Özet, Araç Modeli, Araçlar, Personel, Vardiya."""
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+
+    def _header_row(ws, headers: list[str]) -> None:
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = excel_utils._HEADER_FONT
+            cell.fill = excel_utils._HEADER_FILL
+        ws.freeze_panes = "A2"
+
+    def _widths(ws, widths: list[int]) -> None:
+        for i, w in enumerate(widths, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+    date_from = report["date_from"].strftime("%d.%m.%Y") if report["date_from"] else "Tüm zamanlar"
+    date_to = report["date_to"].strftime("%d.%m.%Y") if report["date_to"] else "Tüm zamanlar"
+
+    # ---- Özet ----
+    ws = wb.active
+    ws.title = "Özet"
+    ws.append([title])
+    ws.append([f"Tarih Aralığı: {date_from} - {date_to}"])
+    ws.append([])
+    c = report["completion"]
+    ws.append(["Tamamlanma Oranı ve Süresi"])
+    ws.append(["Aralıkta Açılan İş Emri", c["opened_in_range"]])
+    ws.append(["Bunlardan Tamamlanan", c["completed_of_opened"]])
+    ws.append(["Tamamlanma Oranı (%)", c["completion_rate_pct"]])
+    ws.append(["Aralıkta Tamamlanan (toplam)", c["completed_in_range"]])
+    ws.append(["Ortalama Tamamlanma Süresi (gün)", c["avg_completion_days"] if c["avg_completion_days"] is not None else "-"])
+    ws.append([])
+    cr = report["critical"]
+    ws.append(["Geciken/Kritik Bakımlar (güncel durum, tarih aralığından bağımsız)"])
+    ws.append(["Açık İş Emri (toplam)", cr["open_total"]])
+    ws.append(["Kritik", cr["urgent_count"]])
+    ws.append(["Çok Kritik", cr["very_critical_count"]])
+    ws.append(["Gecikmiş (hedefi aşmış)", cr["overdue_count"]])
+    for row in (4, 13):
+        ws.cell(row=row, column=1).font = excel_utils._HEADER_FONT
+    ws.cell(row=1, column=1).font = excel_utils._HEADER_FONT
+    _widths(ws, [38, 16])
+
+    # ---- Araç Modeli ----
+    ws2 = wb.create_sheet("Araç Modeli")
+    _header_row(ws2, ["Araç Modeli", "Açılan", "Tamamlanan", "Şu An Açık"])
+    for row in report["by_vehicle_model"]:
+        ws2.append([row["vehicle_model"], row["opened"], row["completed"], row["open_now"]])
+    _widths(ws2, [26, 12, 12, 12])
+
+    # ---- Araçlar ----
+    ws3 = wb.create_sheet("Araçlar")
+    _header_row(ws3, ["Araç Kodu", "Araç Adı", "Model", "Açılan", "Tamamlanan", "Şu An Açık"])
+    for row in report["vehicles"]:
+        v = row["vehicle"]
+        ws3.append([v.code, v.name, v.model, row["opened"], row["completed"], row["open_now"]])
+    _widths(ws3, [14, 22, 20, 12, 12, 12])
+
+    # ---- Personel ----
+    ws4 = wb.create_sheet("Personel")
+    _header_row(
+        ws4,
+        [
+            "Ad Soyad", "Rol", "Vardiya", "Tamamlanan Madde Sayısı",
+            "Tamamlanan İş Emri Sayısı", "Ortalama Tamamlanma Süresi (gün)",
+        ],
+    )
+    for row in report["by_person"]:
+        u = row["user"]
+        ws4.append([
+            u.full_name, u.role, row["shift_name"] or "-",
+            row["items_completed_in_range"], row["maintenances_completed_in_range"],
+            row["avg_completion_days"] if row["avg_completion_days"] is not None else "-",
+        ])
+    _widths(ws4, [22, 14, 16, 20, 20, 26])
+
+    # ---- Vardiya ----
+    ws5 = wb.create_sheet("Vardiya")
+    _header_row(ws5, ["Vardiya", "Tamamlanan Madde Sayısı"])
+    for row in report["by_shift"]:
+        ws5.append([row["shift_name"], row["items_completed_in_range"]])
+    _widths(ws5, [20, 20])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()

@@ -485,6 +485,17 @@ class MergedTreeNodeOut(BaseModel):
     children: list["MergedTreeNodeOut"] = []
 
 
+class ItemExecAttachmentOut(ORM):
+    """Faz 21 — bakım sırasında (tikleme/inceleme anında) bir maddeye
+    eklenen fotoğraf. Şablonun NodeAttachmentOut'undan (admin ekleri) farklı,
+    ayrı bir alanda (ItemOut.exec_attachments) taşınır."""
+    id: int
+    filename: str
+    original_name: str
+    uploaded_by: UserOut | None = None
+    created_at: datetime
+
+
 # ---------- Maintenance ----------
 class ItemOut(ORM):
     id: int
@@ -498,6 +509,9 @@ class ItemOut(ORM):
     note: str = ""  # Faz 10: bağlı şablon maddesinin açıklaması
     card_code: str = ""  # bağlı şablon maddesinin "KART KODU"su (varsa)
     attachments: list[NodeAttachmentOut] = []  # Faz 10: bağlı ekler
+    # Faz 21 — usta/mühendis/amirin bakım SIRASINDA bu maddeye eklediği
+    # fotoğraflar (şablon ekinden bağımsız, bkz. models.ItemExecAttachment).
+    exec_attachments: list[ItemExecAttachmentOut] = []
     # Kademeli bakımda bu maddenin ait olduğu periyotlar (km). ORM'deki
     # 'tiers' (str) ile çakışmasın diye farklı ada sahip; elle doldurulur.
     tier_kms: list[int] = []
@@ -526,6 +540,9 @@ class MaintenanceOut(ORM):
     is_activated: bool = True
     activated_at: datetime | None = None
     activated_by: UserOut | None = None
+    # "Başlat" derken ileri bir tarih seçildiyse dolu — o tarihte otomatik
+    # başlatılır (bkz. services.run_scheduled_maintenance_starts).
+    scheduled_start_at: date | None = None
 
     @model_validator(mode="after")
     def _hide_time_sentinel(self):
@@ -536,6 +553,14 @@ class MaintenanceOut(ORM):
         if self.target_km is not None and self.target_km < 0:
             self.target_km = None
         return self
+
+
+class MaintenanceStartIn(BaseModel):
+    """POST /api/maintenances/{id}/start gövdesi. scheduled_start_at boş
+    bırakılırsa (veya bugüne eşit/öncesiyse) davranış eskisi gibi HEMEN
+    başlatmadır; bugünden ileri bir tarihse iş emri o tarihe kadar
+    zamanlanır, otomatik olarak o gün başlatılır."""
+    scheduled_start_at: date | None = None
 
 
 class NoteOut(ORM):
@@ -929,28 +954,47 @@ class NotificationOut(BaseModel):
     maintenance_id: int | None = None
 
 
-# ---------- Öneriler ----------
+# ---------- Öneriler (Faz 30 — hiyerarşik onay) ----------
 class SuggestionOut(ORM):
     id: int
-    vehicle: VehicleOut
+    # Geriye dönük uyumluluk: bu özellikten önce belirli bir araca bağlı
+    # oluşturulmuş eski öneriler için dolu; yeni (model bazlı) önerilerde None.
+    vehicle: VehicleOut | None = None
+    # Yeni önerilerde dolu — önerinin hedeflediği araç modeli (Bozankaya/Sirio vb.).
+    vehicle_model: str = ""
     plan: PlanOut | None = None
     text: str
+    # pending | pending_engineer | rejected | approved | added — bkz.
+    # models.Suggestion docstring'i.
     status: str
     admin_note: str = ""
     created_by: UserOut | None = None
     created_at: datetime
     reviewed_by: UserOut | None = None
     reviewed_at: datetime | None = None
+    # 1. aşama — amir
+    amir_status: str = "pending"
+    amir_reviewed_by: UserOut | None = None
+    amir_reviewed_at: datetime | None = None
+    amir_note: str = ""
+    # 2. aşama — mühendis
+    engineer_status: str = "pending"
+    engineer_reviewed_by: UserOut | None = None
+    engineer_reviewed_at: datetime | None = None
+    engineer_note: str = ""
 
 
 class SuggestionCreate(BaseModel):
-    vehicle_id: int
+    # Öneri artık BELİRLİ bir araca değil bir ARAÇ MODELİNE bağlanır (bkz.
+    # /api/vehicle-models) — o modeldeki TÜM araçları ilgilendirir.
+    vehicle_model: str = Field(min_length=1, max_length=100)
     plan_id: int | None = None
     text: str = Field(min_length=1, max_length=2000)
 
 
 class SuggestionReviewBody(BaseModel):
-    status: str = Field(pattern="^(pending|approved|rejected|added)$")
+    # 'added' yalnızca mühendis aşamasında geçerlidir (uç noktada denetlenir).
+    status: str = Field(pattern="^(approved|rejected|added)$")
     admin_note: str = Field(default="", max_length=2000)
 
 
@@ -967,3 +1011,59 @@ class VehicleProfile(BaseModel):
     last_note: NoteOut | None = None
     recent: list[MaintenanceOut] = []
     attachments: list[VehicleAttachmentOut] = []
+
+
+# ---------- Faz 18: KPI ----------
+class KPICompletionOut(BaseModel):
+    opened_in_range: int
+    completed_of_opened: int
+    completion_rate_pct: float
+    completed_in_range: int
+    avg_completion_days: float | None = None
+
+
+class KPICriticalOut(BaseModel):
+    # Not: bu bölüm her zaman GÜNCEL açık iş emirlerine göredir, tarih
+    # aralığından bağımsızdır (bkz. services.compute_kpi_report docstring).
+    open_total: int
+    urgent_count: int
+    very_critical_count: int
+    overdue_count: int
+
+
+class KPIVehicleModelRow(BaseModel):
+    vehicle_model: str
+    opened: int
+    completed: int
+    open_now: int
+
+
+class KPIVehicleRow(BaseModel):
+    vehicle: VehicleOut
+    opened: int
+    completed: int
+    open_now: int
+
+
+class KPIPersonRow(BaseModel):
+    user: UserOut
+    items_completed_in_range: int
+    maintenances_completed_in_range: int
+    avg_completion_days: float | None = None
+    shift_name: str | None = None
+
+
+class KPIShiftRow(BaseModel):
+    shift_name: str
+    items_completed_in_range: int
+
+
+class KPIOut(BaseModel):
+    date_from: date | None = None
+    date_to: date | None = None
+    completion: KPICompletionOut
+    critical: KPICriticalOut
+    by_vehicle_model: list[KPIVehicleModelRow]
+    top_vehicles: list[KPIVehicleRow]
+    by_person: list[KPIPersonRow]
+    by_shift: list[KPIShiftRow]

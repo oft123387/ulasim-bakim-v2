@@ -59,8 +59,7 @@ function writeIdList(key: string, ids: number[]) {
 
 const fmtKmN = (n: number) => n.toLocaleString('tr-TR')
 // Son otomatik günden (cfg.last_date, YYYY-MM-DD) bugüne kadar kaç takvim
-// günü geçtiğini hesaplar — "1 gün/7 gün/30 gün" gibi sabit adımlar yerine
-// otomatik güncelleme tam olarak kaçırılan gün kadar ilerlesin diye.
+// otomatik güncelleme tam olarak kaçırılan gün kadar ilerlesin.
 function daysSinceLast(dateStr: string | null): number {
   if (!dateStr) return 0
   const last = new Date(`${dateStr}T00:00:00`)
@@ -365,7 +364,6 @@ function VehicleDetail({
               <InfoField label="Üretici" value={v.manufacturer || '—'} />
               <InfoField label="Model" value={v.model || '—'} />
               <InfoField label="Üretim Yılı" value={v.production_year ?? '—'} />
-              <InfoField label="Şasi No" value={v.chassis_no || '—'} />
               <InfoField
                 label="Hizmete Başlama Tarihi"
                 value={
@@ -607,7 +605,6 @@ export default function VehiclesPage({
   const [km, setKm] = useState('')
   const [manufacturer, setManufacturer] = useState('')
   const [model, setModel] = useState('')
-  const [chassisNo, setChassisNo] = useState('')
   const [productionYear, setProductionYear] = useState('')
   const [commissioningDate, setCommissioningDate] = useState('')
   const [notes, setNotes] = useState('')
@@ -654,8 +651,8 @@ export default function VehiclesPage({
     load()
   }, [])
 
-  // Global aramadan / alarm merkezinden bir araç profili açılmak istendiğinde
-  // doğrudan o aracın detayına geç. initialVehicleId null'a döndüğünde
+  // Global aramadan bir araç profili açılmak istendiğinde doğrudan o
+  // aracın detayına geç. initialVehicleId null'a döndüğünde
   // (ör. Dashboard'daki "Araçlar"a normal menüden tekrar girildiğinde,
   // App.tsx'teki navigate() bunu temizler) burada da seçili aracı EXPLICIT
   // olarak null'a çekip listeye dönülür — sayfa yeniden mount edilmese
@@ -708,7 +705,6 @@ export default function VehiclesPage({
       return true
     })
     // Favori araçlar her zaman listenin en üstünde — mühendis sürekli aynı
-    // birkaç tramvayı arıyorsa aşağı kaydırmasın.
     return [...base].sort((a, b) => Number(favIds.includes(b.id)) - Number(favIds.includes(a.id)))
   }, [list, search, statusFilter, modelFilter, favIds])
 
@@ -729,7 +725,6 @@ export default function VehiclesPage({
           current_km: Number(km) || 0,
           manufacturer,
           model,
-          chassis_no: chassisNo,
           production_year: productionYear ? Number(productionYear) : null,
           commissioning_date: commissioningDate || null,
           notes,
@@ -740,7 +735,6 @@ export default function VehiclesPage({
       setKm('')
       setManufacturer('')
       setModel('')
-      setChassisNo('')
       setProductionYear('')
       setCommissioningDate('')
       setNotes('')
@@ -830,7 +824,6 @@ export default function VehiclesPage({
     <>
       <PageHeader
         title="Araçlar"
-        subtitle="Filo tipini seçin; araç, üretici veya model adına göre anında filtreleyin."
       />
 
       {user.role === 'admin' && <KmSimCard onChanged={load} />}
@@ -840,7 +833,7 @@ export default function VehiclesPage({
           <div className="card-head">
             <div>
               <div className="card-title">Excel ile İçe/Dışa Aktarma</div>
-              <div className="card-subtitle">Kod, Ad, KM, Üretici, Model, Şasi No, Not sütunları desteklenir.</div>
+              <div className="card-subtitle">Kod, KM, Üretici, Model, Not sütunları desteklenir.</div>
             </div>
           </div>
           <div className="row">
@@ -901,7 +894,6 @@ export default function VehiclesPage({
                 <option key={m} value={m} />
               ))}
             </datalist>
-            <input placeholder="Şasi No" value={chassisNo} onChange={(e) => setChassisNo(e.target.value)} />
             <input
               placeholder="Üretim yılı"
               type="number"
@@ -968,12 +960,12 @@ export default function VehiclesPage({
           )}
           {urgentCount > 0 && (
             <span className="urgent-pill">
-              <AlertTriangle size={12} /> {urgentCount} araçta ~14 günden az kaldı
+              <AlertTriangle size={12} /> {urgentCount} araçta kritik (periyodun %15'inden az kaldı)
             </span>
           )}
           {criticalCount > 0 && (
             <span className="critical-pill">
-              <AlertTriangle size={12} /> {criticalCount} araçta çok kritik (≤1000 km / ≤7 gün)
+              <AlertTriangle size={12} /> {criticalCount} araçta çok kritik (periyodun %5'inden az kaldı)
             </span>
           )}
           <span className="muted" style={{ marginLeft: 'auto' }}>
@@ -986,10 +978,8 @@ export default function VehiclesPage({
               <tr>
                 <th style={{ width: 34 }}></th>
                 <th>Kod</th>
-                <th>Ad</th>
                 <th>Anlık KM</th>
                 <th>Üretici / Model</th>
-                <th>Şasi No</th>
                 <th>Son Güncelleme</th>
                 <th>Durum</th>
                 <th style={{ width: 260 }}>KM Güncelle</th>
@@ -997,7 +987,7 @@ export default function VehiclesPage({
               </tr>
             </thead>
             <tbody>
-              {list === null && <SkeletonTableRows columns={10} />}
+              {list === null && <SkeletonTableRows columns={8} />}
               {list !== null && filtered.map((v) => {
                 const alert = alertByVehicleId.get(v.id)
                 const rowClass = alert ? (alert.critical ? 'critical-row' : alert.urgent ? 'urgent-row' : 'alert-row') : ''
@@ -1016,13 +1006,11 @@ export default function VehiclesPage({
                     <td className="clickable-row" onClick={() => setSelectedId(v.id)}>
                       <span className="vehicle-code">{v.code}</span>
                     </td>
-                    <td className="clickable-row" onClick={() => setSelectedId(v.id)}>{v.name}</td>
                     <td>{fmtKm(v.current_km)}</td>
                     <td className="vehicle-model-cell">
                       {v.model ? <span className="vehicle-model-name">{v.model}</span> : <span>—</span>}
                       {v.manufacturer && <span className="vehicle-manufacturer">{v.manufacturer}</span>}
                     </td>
-                    <td>{v.chassis_no || '—'}</td>
                     <td>{fmt(v.last_km_update_at)}</td>
                     <td>
                       {alert ? (

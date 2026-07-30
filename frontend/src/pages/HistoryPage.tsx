@@ -34,8 +34,9 @@ const EMPTY: Filters = {
 }
 
 /** Bakım Geçmişi (Faz 13-14): tamamlanan (veya seçilen durumdaki) bakımları
- * araç bazında, en yeni üstte gruplar; tarih/araç/plan/personel/km filtreleri
- * ve Excel dışa aktarma sunar. */
+ * TEK bir düz tabloda (araç bazlı gruplama/üst başlık YOK — araç kendi
+ * sütununda), sunucunun döndürdüğü sırayla (en yeni üstte) listeler;
+ * tarih/araç/plan/personel/km filtreleri ve Excel dışa aktarma sunar. */
 export default function HistoryPage({
   user,
   perms,
@@ -81,18 +82,6 @@ export default function HistoryPage({
   }, [query])
 
   const rows = list ?? []
-
-  // Araç bazlı gruplama (en yeni tamamlanan üstte). Sunucu zaten tarihe göre
-  // azalan sıralı döndürür; grubu ilk görülen araç sırasına göre koruyoruz.
-  const groups = useMemo(() => {
-    const map = new Map<string, { vehicle: Vehicle; items: Maintenance[] }>()
-    for (const m of rows) {
-      const key = m.vehicle.code
-      if (!map.has(key)) map.set(key, { vehicle: m.vehicle, items: [] })
-      map.get(key)!.items.push(m)
-    }
-    return Array.from(map.values())
-  }, [rows])
 
   function set<K extends keyof Filters>(k: K, v: string) {
     setF((prev) => ({ ...prev, [k]: v }))
@@ -189,7 +178,7 @@ export default function HistoryPage({
           </div>
         )}
 
-        {list !== null && groups.length === 0 && (
+        {list !== null && rows.length === 0 && (
           <EmptyState
             icon={<HistoryIcon size={22} />}
             title="Kayıt bulunamadı"
@@ -197,46 +186,42 @@ export default function HistoryPage({
           />
         )}
 
-        {list !== null &&
-          groups.map((g) => (
-            <div key={g.vehicle.code} className="history-group">
-              <div className="history-group-head">
-                <span className="vehicle-code"><Truck size={13} style={{ verticalAlign: -2, marginRight: 4 }} />{g.vehicle.code}</span>
-                {g.vehicle.name && <span className="muted">{g.vehicle.name}</span>}
-                <span className="muted" style={{ marginLeft: 'auto' }}>{g.items.length} bakım</span>
-              </div>
-              <div className="table-scroll">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>İş Emri</th>
-                      <th>Periyot</th>
-                      <th>Hedef</th>
-                      <th>Durum</th>
-                      <th>Bitiş</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {g.items.map((m) => (
-                      <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
-                        <td style={{ fontWeight: 600 }}>#{m.id}</td>
-                        <td>{m.plan.name}</td>
-                        <td>{hedefLabel(m)}</td>
-                        <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
-                        <td>{fmt(m.completed_at)}</td>
-                        <td>
-                          <button className="small primary" onClick={(e) => { e.stopPropagation(); onOpenMaintenance(m.id) }}>
-                            Detay <ChevronRight size={12} style={{ verticalAlign: -1, marginLeft: 2 }} />
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          ))}
+        {list !== null && rows.length > 0 && (
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Araç</th>
+                  <th>İş Emri</th>
+                  <th>Periyot</th>
+                  <th>Hedef</th>
+                  <th>Durum</th>
+                  <th>Bitiş</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((m) => (
+                  <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
+                    <td>
+                      <span className="vehicle-code"><Truck size={13} style={{ verticalAlign: -2, marginRight: 4 }} />{m.vehicle.code}</span>
+                    </td>
+                    <td style={{ fontWeight: 600 }}>#{m.id}</td>
+                    <td>{m.plan.name}</td>
+                    <td>{hedefLabel(m)}</td>
+                    <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
+                    <td>{fmt(m.completed_at)}</td>
+                    <td>
+                      <button className="small primary" onClick={(e) => { e.stopPropagation(); onOpenMaintenance(m.id) }}>
+                        Detay <ChevronRight size={12} style={{ verticalAlign: -1, marginLeft: 2 }} />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </>
   )

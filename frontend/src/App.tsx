@@ -17,8 +17,8 @@ import PermissionsPage from './pages/PermissionsPage'
 import CalendarPage from './pages/CalendarPage'
 import ProfilePage from './pages/ProfilePage'
 import PartsCatalogPage from './pages/PartsCatalogPage'
-import AlarmCenterPage from './pages/AlarmCenterPage'
 import SuggestionsPage from './pages/SuggestionsPage'
+import KPIPage from './pages/KPIPage'
 import SystemStatusPage from './pages/SystemStatusPage'
 import HelpPage from './pages/HelpPage'
 import { Avatar } from './components/ui'
@@ -41,17 +41,16 @@ import {
   UserCircle2,
   Menu,
   PackageSearch,
-  Siren,
   Lightbulb,
   ChevronLeft,
   ChevronRight,
   Activity,
   HelpCircle,
+  BarChart3,
 } from 'lucide-react'
 
 export type Page =
   | 'dashboard'
-  | 'alarms'
   | 'maintenances'
   | 'calendar'
   | 'history'
@@ -60,6 +59,7 @@ export type Page =
   | 'tree'
   | 'parts'
   | 'suggestions'
+  | 'kpi'
   | 'users'
   | 'permissions'
   | 'audit'
@@ -71,7 +71,6 @@ type Theme = 'light' | 'dark'
 
 const NAV_ICONS: Record<Page, ReactElement> = {
   dashboard: <LayoutDashboard size={17} />,
-  alarms: <Siren size={17} />,
   tree: <Workflow size={17} />,
   maintenances: <Wrench size={17} />,
   calendar: <CalendarDays size={17} />,
@@ -80,6 +79,7 @@ const NAV_ICONS: Record<Page, ReactElement> = {
   plans: <ClipboardList size={17} />,
   parts: <PackageSearch size={17} />,
   suggestions: <Lightbulb size={17} />,
+  kpi: <BarChart3 size={17} />,
   users: <UsersIcon size={17} />,
   permissions: <ShieldCheck size={17} />,
   audit: <ScrollText size={17} />,
@@ -90,7 +90,6 @@ const NAV_ICONS: Record<Page, ReactElement> = {
 
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
-  alarms: 'Alarm Merkezi',
   tree: 'Bakım Ağacı',
   maintenances: 'Bakımlar',
   calendar: 'Takvim',
@@ -99,6 +98,7 @@ const PAGE_TITLES: Record<Page, string> = {
   plans: 'Bakım Planları',
   parts: 'Parça Bilgi Bankası',
   suggestions: 'Öneriler',
+  kpi: 'KPI Raporu',
   users: 'Kullanıcılar',
   permissions: 'Yetki Yönetimi',
   audit: 'İşlem Kayıtları',
@@ -276,8 +276,7 @@ export default function App() {
     window.history.pushState({ page: next }, '', '')
   }
 
-  // Global aramadan / alarm merkezinden / QR koddan bir aracın profil
-  // sayfasını açar.
+  // Global aramadan / QR koddan bir aracın profil sayfasını açar.
   function openVehicleProfile(id: number) {
     setOpenVehicleId(id)
     setPage('vehicles')
@@ -322,15 +321,15 @@ export default function App() {
 
   const menu: { key: Page; label: string; show: boolean }[] = [
     { key: 'dashboard', label: 'Dashboard', show: true },
-    { key: 'alarms', label: 'Canlı Alarm Merkezi', show: isStaff },
     { key: 'maintenances', label: 'Bakımlar', show: true },
-    { key: 'calendar', label: 'Takvim', show: true },
+    { key: 'calendar', label: 'Takvim', show: isStaff },
     { key: 'vehicles', label: 'Araçlar', show: isStaff },
     { key: 'history', label: 'Bakım Geçmişi', show: true },
     { key: 'plans', label: 'Bakım Planları', show: isAdmin },
     { key: 'tree', label: 'Bakım Ağacı', show: isAdmin },
     { key: 'parts', label: 'Parça Bilgi Bankası', show: true },
     { key: 'suggestions', label: 'Öneriler', show: true },
+    { key: 'kpi', label: 'KPI Raporu', show: p.view_dashboard_analytics !== false },
     { key: 'users', label: 'Kullanıcılar', show: canManageUsers },
     { key: 'permissions', label: 'Yetki Yönetimi', show: isAdmin },
     { key: 'audit', label: 'İşlem Kayıtları', show: isAdmin },
@@ -496,13 +495,7 @@ export default function App() {
               initialPlanName={maintFilter?.planName}
             />
           )}
-          {page === 'alarms' && isStaff && (
-            <AlarmCenterPage
-              onOpenMaintenance={openMaintenance}
-              onOpenVehicle={openVehicleProfile}
-            />
-          )}
-          {page === 'calendar' && (
+          {page === 'calendar' && isStaff && (
             <CalendarPage perms={p} onOpenMaintenance={openMaintenance} />
           )}
           {page === 'history' && (
@@ -519,7 +512,8 @@ export default function App() {
           {page === 'plans' && isAdmin && <PlansPage />}
           {page === 'tree' && isAdmin && <TreeEditorPage />}
           {page === 'parts' && <PartsCatalogPage canEdit={isStaff} initialSelectedId={openPartId} />}
-          {page === 'suggestions' && <SuggestionsPage user={user} canReview={isAdmin || canManageUsers} />}
+          {page === 'suggestions' && <SuggestionsPage user={user} />}
+          {page === 'kpi' && p.view_dashboard_analytics !== false && <KPIPage />}
           {page === 'users' && canManageUsers && <UsersPage currentUser={user} />}
           {page === 'permissions' && isAdmin && <PermissionsPage />}
           {page === 'audit' && isAdmin && <AuditLogPage />}

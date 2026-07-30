@@ -73,6 +73,15 @@
   --dur-base: 200ms;
   --dur-slow: 320ms;
 
+  /* ---------- Küçültülmüş arayüz (html{zoom}) telafisi ----------
+     `zoom`, içindeki HER ŞEYİ (100vh dahil) görsel olarak bu oranda
+     küçültür — ekranı TAMAMEN kaplaması gereken öğeler (kenar çubuğu,
+     giriş sayfası vb.) düz "100vh" kullanırsa ekranın altında/sağında boş
+     bir şerit kalır. Bu yüzden onlar "100vh" yerine bu telafi edilmiş
+     --vh-fill değişkenini kullanır (bkz. #root, .app-shell, .sidebar,
+     .login-wrap) — gerçek ekranı yeniden tam olarak kaplarlar. */
+  --vh-fill: calc(100vh / 0.85);
+
   /* legacy aliases kept for any stray references */
   --panel: var(--surface);
   --border-soft: var(--border);
@@ -126,7 +135,10 @@
     var(--bg);
 }
 [data-theme="dark"] .topbar-strip { background: rgba(0, 0, 0, 0.82); }
-html { scrollbar-gutter: stable; }
+html {
+  scrollbar-gutter: stable;
+  zoom: 0.85;
+}
 
 body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
@@ -138,7 +150,7 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
-#root { min-height: 100vh; }
+#root { min-height: var(--vh-fill); }
 
 ::selection { background: var(--accent-light); color: var(--primary-900); }
 
@@ -232,7 +244,7 @@ select { cursor: pointer; }
 /* =========================================================================
    Layout: sidebar + content
    ========================================================================= */
-.app-shell { display: flex; min-height: 100vh; }
+.app-shell { display: flex; min-height: var(--vh-fill); }
 
 .sidebar {
   width: 224px;
@@ -243,7 +255,7 @@ select { cursor: pointer; }
   border-right: 1px solid var(--border);
   position: sticky;
   top: 0;
-  height: 100vh;
+  height: var(--vh-fill);
   z-index: 20;
   transition: width 0.18s ease;
 }
@@ -776,7 +788,7 @@ table.standalone { background: var(--surface); border-radius: var(--radius-lg); 
    Login
    ========================================================================= */
 .login-wrap {
-  min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  min-height: var(--vh-fill); display: flex; align-items: center; justify-content: center;
   background:
     radial-gradient(circle at 12% 15%, rgba(46, 111, 255, 0.10), transparent 42%),
     radial-gradient(circle at 88% 85%, rgba(27, 77, 160, 0.14), transparent 48%),
@@ -940,7 +952,7 @@ tbody tr.critical-row td:first-child { border-left: 5px solid #a01f2f; }
   .sidebar-toggle-row { display: none; }
 
   .sidebar {
-    position: fixed; top: 0; left: 0; bottom: 0; width: 264px; height: 100vh;
+    position: fixed; top: 0; left: 0; bottom: 0; width: 264px; height: var(--vh-fill);
     flex-direction: column; align-items: stretch; padding: 0;
     transform: translateX(-100%);
     transition: transform var(--dur-base) var(--ease);
@@ -1083,6 +1095,39 @@ tbody tr.critical-row td:first-child { border-left: 5px solid #a01f2f; }
   transition: transform var(--dur-fast, 120ms) var(--ease, ease);
 }
 .attach-thumbs img:hover { transform: scale(1.04); border-color: var(--primary-500); }
+
+/* Faz 21 — bakım SIRASINDA (usta/mühendis/amir tarafından tikleme anında)
+   eklenen görseller — şablonun admin ekleriyle (.attach-thumbs) aynı boyut,
+   ama üzerinde silme (x) butonu olan ayrı bir grup. */
+.exec-attach-thumbs { display: flex; flex-wrap: wrap; gap: 8px; }
+.exec-attach-thumb-wrap { position: relative; }
+.exec-attach-thumb-wrap img {
+  width: 88px;
+  height: 66px;
+  object-fit: cover;
+  border-radius: var(--radius-sm, 6px);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: transform var(--dur-fast, 120ms) var(--ease, ease);
+}
+.exec-attach-thumb-wrap img:hover { transform: scale(1.04); border-color: var(--primary-500); }
+.exec-attach-delete {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: var(--red, #dc2626);
+  color: #fff;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  padding: 0;
+  line-height: 1;
+}
 .attach-chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .attach-chip {
   display: inline-flex;
@@ -1210,7 +1255,11 @@ tbody tr.critical-row td:first-child { border-left: 5px solid #a01f2f; }
 }
 
 .cal-grid-month { grid-auto-rows: minmax(78px, auto); }
-.cal-grid-week { grid-auto-rows: minmax(180px, auto); }
+/* Kullanıcı isteği: haftalık görünüm belirgin şekilde daha uzun olsun —
+   her gün hücresinin altında iş emri barları için (araç/periyot adının
+   yanında "en geç X tarihinde" bilgisini de gösterecek kadar) bolca yer
+   kalsın. Aylık görünüm (.cal-grid-month) kasıtlı olarak DEĞİŞMEDİ. */
+.cal-grid-week { grid-auto-rows: minmax(340px, auto); }
 
 .cal-cell {
   border-right: 1px solid var(--border);
@@ -1263,6 +1312,32 @@ tbody tr.critical-row td:first-child { border-left: 5px solid #a01f2f; }
 .cal-chip.cal-pending { background: var(--amber-light); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 16%, transparent); }
 .cal-chip.cal-in_progress { background: var(--accent-light); color: var(--primary-600); border-color: color-mix(in srgb, var(--primary-600) 16%, transparent); }
 .cal-chip.cal-completed { background: var(--green-light); color: var(--green); border-color: color-mix(in srgb, var(--green) 16%, transparent); }
+
+/* Haftalık görünümdeki barlar (bkz. .cal-grid-week ve DayCell'in
+   showDeadline prop'u) — araç/periyot adının altında ayrıca "en geç X
+   tarihinde" satırı gösterir. Aylık görünümde kullanılmaz (satırlar dar
+   olduğu için oraya sığmaz), bu yüzden yalnızca bu değiştirici sınıfla
+   (temel .cal-chip'i BOZMADAN) etkinleştirilir. */
+.cal-chip.cal-chip-detailed {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  white-space: normal;
+  padding: 7px 9px;
+  min-height: 46px;
+}
+.cal-chip-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  width: 100%;
+}
+.cal-chip-deadline {
+  font-size: 9.5px;
+  font-weight: 500;
+  opacity: 0.8;
+}
 
 .cal-more {
   font-size: 10px;

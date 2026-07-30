@@ -1367,7 +1367,7 @@ def create_plan(
     data = body.model_dump()
     if not data.get("name"):
         data["name"] = services.default_plan_name(
-            data["plan_type"], data["interval_km"], data.get("interval_months")
+            data["plan_type"], data["interval_km"], data.get("interval_months"), data.get("vehicle_model")
         )
     p = models.MaintenancePlan(**data)
     db.add(p)
@@ -1381,6 +1381,22 @@ def create_plan(
         f"Bakım planı oluşturuldu: {p.name} ({period_txt})",
     )
     return p
+
+
+@app.post("/api/plans/normalize-sirio-names")
+def normalize_sirio_plan_names(db: Session = Depends(get_db), actor=Depends(require_admin)):
+    """Var olan TÜM aktif Sirio km planlarının adını kısa M/Y koduna
+    (ör. "1.440.000 km Bakımı" -> "12Y") çevirir — bkz.
+    services.normalize_sirio_plan_names. Yeni oluşturulan Sirio planları
+    zaten otomatik bu biçimde adlandırılır (bkz. default_plan_name); bu uç
+    yalnızca ondan ÖNCE oluşturulmuş planları geriye dönük düzeltmek için."""
+    renamed = services.normalize_sirio_plan_names(db)
+    if renamed:
+        services.log_action(
+            db, actor, "rename", "plan", 0,
+            f"{len(renamed)} Sirio planının adı kısa periyot koduna (M/Y) çevrildi.",
+        )
+    return {"renamed": renamed, "count": len(renamed)}
 
 
 @app.patch("/api/plans/{plan_id}", response_model=schemas.PlanOut)
@@ -2671,27 +2687,70 @@ def list_pending_start_maintenances(
 @app.post("/api/maintenances/{mid}/start", response_model=schemas.MaintenanceOut)
 def start_maintenance(
     mid: int,
+    body: schemas.MaintenanceStartIn = schemas.MaintenanceStartIn(),
     db: Session = Depends(get_db),
     actor=Depends(require_permission("start_maintenance")),
 ):
     """Faz 26: otomatik açılan bir aday iş emrini onaylayıp devreye alır —
     bundan sonra Bakımlar listesinde, Takvim'de, Dashboard'da, Alarm
-    Merkezi'nde ve teknisyen ekranında normal şekilde görünür."""
+    Merkezi'nde ve teknisyen ekranında normal şekilde görünür.
+
+    body.scheduled_start_at bugünden ileri bir tarihse HEMEN başlatmaz —
+    yalnızca o tarihi kaydeder, gerçek başlatma arka plan zamanlayıcısı
+    tarafından o tarih geldiğinde otomatik yapılır (bkz.
+    services.run_scheduled_maintenance_starts). Tarih boşsa veya bugüne
+    eşit/öncesiyse eski davranış (anında başlatma) uygulanır."""
     m = db.get(models.Maintenance, mid)
     if not m:
         raise HTTPException(404, "Bakım bulunamadı")
     if m.is_activated:
         raise HTTPException(400, "Bu bakım zaten başlatılmış")
-    services.activate_maintenance(db, m, actor)
     hedef_txt = (
         f"Hedef tarih {m.target_date.strftime('%d.%m.%Y')}" if m.target_date
         else f"Hedef {fmt_km(m.target_km)} km"
     )
+    if body.scheduled_start_at and body.scheduled_start_at > date.today():
+        services.schedule_maintenance_start(db, m, body.scheduled_start_at)
+        services.log_action(
+            db, actor, "schedule_start", "maintenance", m.id,
+            f"Bakım başlatma zamanlandı: {m.vehicle.code} — {m.plan.name} "
+            f"({body.scheduled_start_at.strftime('%d.%m.%Y')})",
+            detail=hedef_txt,
+        )
+        db.refresh(m)
+        return m
+    services.activate_maintenance(db, m, actor)
     services.log_action(
         db, actor, "start", "maintenance", m.id,
         f"Otomatik bakım başlatıldı: {m.vehicle.code} — {m.plan.name}",
         detail=hedef_txt,
     )
+    db.refresh(m)
+    return m
+
+
+@app.post("/api/maintenances/{mid}/cancel-schedule", response_model=schemas.MaintenanceOut)
+def cancel_maintenance_schedule(
+    mid: int,
+    db: Session = Depends(get_db),
+    actor=Depends(require_permission("start_maintenance")),
+):
+    """Daha önce "Başlat" ile girilmiş bir zamanlanmış başlangıç tarihini
+    iptal eder — iş emri "Başlatılmayı Bekleyenler" listesinde zamansız
+    aday olarak kalmaya devam eder, tekrar tarih seçilebilir veya hemen
+    başlatılabilir."""
+    m = db.get(models.Maintenance, mid)
+    if not m:
+        raise HTTPException(404, "Bakım bulunamadı")
+    if m.is_activated:
+        raise HTTPException(400, "Bu bakım zaten başlatılmış")
+    if not m.scheduled_start_at:
+        raise HTTPException(400, "Bu bakım için bir zamanlama yok")
+    services.log_action(
+        db, actor, "cancel_scheduled_start", "maintenance", m.id,
+        f"Bakım başlatma zamanlaması iptal edildi: {m.vehicle.code} — {m.plan.name}",
+    )
+    services.cancel_scheduled_maintenance_start(db, m)
     db.refresh(m)
     return m
 
@@ -2832,6 +2891,67 @@ def get_maintenance(
     return detail
 
 
+@app.post("/api/maintenances/{mid}/resync-tiers")
+def resync_maintenance_tiers(
+    mid: int,
+    db: Session = Depends(get_db),
+    actor=Depends(require_permission("create_maintenance")),
+):
+    """Bir iş emrinin hedef km'sinin kapsadığı ama (eski bir hatadan dolayı
+    veya sonradan yeni bir plan eklendiği için) checklist'te eksik kalmış
+    periyotların maddelerini sonradan ekler — bkz. services.resync_maintenance_tiers.
+    Tamamlanmış maddelere dokunmaz, yalnızca eksik düğümleri ekler."""
+    m = db.get(models.Maintenance, mid)
+    if not m:
+        raise HTTPException(404, "Bakım bulunamadı")
+    try:
+        result = services.resync_maintenance_tiers(db, m)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    if result["added_items"]:
+        services.log_action(
+            db, actor, "resync_tiers", "maintenance", m.id,
+            f"İş Emri #{m.id}: eksik periyot(lar) eklendi ({', '.join(fmt_km(k) for k in result['merged_periods'])} km), "
+            f"{result['added_items']} yeni madde.",
+        )
+    return result
+
+
+@app.get("/api/maintenances/{mid}/export-items")
+def export_maintenance_items(
+    mid: int,
+    format: str = "xlsx",
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Tek bir iş emrinin tüm kontrol maddelerini (kim/ne zaman tamamladı,
+    varsa hangi notu ekledi) Excel/CSV/PDF/Word olarak indirir — Bakımlar
+    sayfasındaki iş emri detayında "Excel'e Aktar" butonu için."""
+    if not services.has_permission(db, user, "export_excel"):
+        raise HTTPException(403, "Dışa aktarma yetkiniz yok")
+    m = db.get(models.Maintenance, mid)
+    if not m:
+        raise HTTPException(404, "Bakım bulunamadı")
+    fmt = (format or "xlsx").lower()
+    if fmt not in _EXPORT_FORMATS:
+        raise HTTPException(400, "Geçersiz format (xlsx, csv, pdf, docx desteklenir)")
+    items = _build_item_tree(m.items, db)
+    title = f"İş Emri #{m.id} — {m.vehicle.code} — {m.plan.name}"
+    content = export_utils.build_item_completion_export(
+        m.id, m.vehicle.code, m.plan.name, items, fmt, title,
+    )
+    services.log_action(
+        db, user, "export", "maintenance", m.id,
+        f"İş Emri #{m.id} madde tamamlama {_EXPORT_FORMAT_TR[fmt]}'e aktarıldı",
+    )
+    fname = export_utils.filename_for(f"is_emri_{m.id}_maddeler", fmt)
+    return Response(
+        content=content,
+        media_type=export_utils.MEDIA_TYPES[fmt],
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
+
+
 @app.delete("/api/maintenances/all")
 def delete_all_maintenances(
     db: Session = Depends(get_db),
@@ -2894,6 +3014,9 @@ def _build_item_tree(items, db: Session | None = None) -> list[schemas.ItemOut]:
     notes: dict[int, str] = {}
     card_codes: dict[int, str] = {}
     attach: dict[int, list[schemas.NodeAttachmentOut]] = {}
+    # Faz 21: bakım SIRASINDA eklenen fotoğraflar (item_id — şablon değil,
+    # doğrudan bu iş emrinin maddesi) — aynı toplu-sorgu deseni.
+    exec_attach: dict[int, list[schemas.ItemExecAttachmentOut]] = {}
     if db is not None:
         source_ids = [i.source_node_id for i in items if i.source_node_id is not None]
         if source_ids:
@@ -2917,6 +3040,18 @@ def _build_item_tree(items, db: Session | None = None) -> list[schemas.ItemOut]:
                 attach.setdefault(a.node_id, []).append(
                     schemas.NodeAttachmentOut.model_validate(a)
                 )
+        item_ids = [i.id for i in items]
+        if item_ids:
+            exec_atts = (
+                db.query(models.ItemExecAttachment)
+                .filter(models.ItemExecAttachment.item_id.in_(item_ids))
+                .order_by(models.ItemExecAttachment.id)
+                .all()
+            )
+            for a in exec_atts:
+                exec_attach.setdefault(a.item_id, []).append(
+                    schemas.ItemExecAttachmentOut.model_validate(a)
+                )
 
     by_id = {i.id: schemas.ItemOut.model_validate(i) for i in items}
     for out in by_id.values():
@@ -2924,6 +3059,7 @@ def _build_item_tree(items, db: Session | None = None) -> list[schemas.ItemOut]:
     for i in items:
         out = by_id[i.id]
         out.tier_kms = _parse_tier_kms(getattr(i, "tiers", ""))
+        out.exec_attachments = exec_attach.get(i.id, [])
         if i.source_node_id is not None:
             out.note = notes.get(i.source_node_id, "")
             out.card_code = card_codes.get(i.source_node_id, "")
@@ -2993,19 +3129,26 @@ def update_shift_mode(
     return schemas.ShiftModeConfig(enabled=body.enabled)
 
 
-# ================================================================ Öneriler
+# ================================================================ Öneriler (Faz 30 — hiyerarşik onay)
+_SUGGESTION_STATUS_TR = {
+    "pending": "Beklemede (Amir)",
+    "pending_engineer": "Beklemede (Mühendis)",
+    "rejected": "Reddedildi",
+    "approved": "Onaylandı",
+    "added": "Ağaca Eklendi",
+}
+
+
 @app.get("/api/suggestions", response_model=list[schemas.SuggestionOut])
 def list_suggestions(
     status: str | None = None,
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Mühendis/usta/amir yalnızca KENDİ gönderdiği önerileri görür; admin
-    (ve manage_users yetkisi olanlar) TÜM önerileri görür ve değerlendirir."""
-    can_review = user.role == "admin" or services.has_permission(db, user, "manage_users")
+    """Faz 30: şeffaflık için HERKES (rolü ne olursa olsun) TÜM önerileri
+    görür — yalnızca değerlendirme (onayla/reddet) yetkisi role göre
+    kısıtlıdır (bkz. review_suggestion)."""
     q = db.query(models.Suggestion)
-    if not can_review:
-        q = q.filter(models.Suggestion.created_by_id == user.id)
     if status:
         q = q.filter(models.Suggestion.status == status)
     return q.order_by(models.Suggestion.created_at.desc()).all()
@@ -3017,16 +3160,19 @@ def create_suggestion(
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
 ):
-    """Mühendis/usta/amir (ve admin), sahada fark ettiği bir eksikliği/
-    iyileştirmeyi bir araç ve (varsa) bir bakım periyoduyla ilişkilendirip
-    bildirir. Admin'e Bildirim Merkezi'nde otomatik düşer."""
-    vehicle = db.get(models.Vehicle, body.vehicle_id)
-    if not vehicle:
-        raise HTTPException(404, "Araç bulunamadı")
+    """Usta/mühendis/amir (ve admin), sahada fark ettiği bir eksikliği/
+    iyileştirmeyi bir ARAÇ MODELİ (Bozankaya/Sirio vb. — belirli bir araç
+    değil, o modeldeki TÜM araçları ilgilendirir) ve (varsa) bir bakım
+    periyoduyla ilişkilendirip bildirir. Hiyerarşik onay zincirine
+    (bkz. models.Suggestion) 'pending' (amir'in kararını bekliyor) olarak
+    girer."""
+    vehicle_model = body.vehicle_model.strip()
+    if not vehicle_model:
+        raise HTTPException(400, "Araç modeli seçilmelidir")
     if body.plan_id is not None and not db.get(models.MaintenancePlan, body.plan_id):
         raise HTTPException(404, "Bakım periyodu bulunamadı")
     sug = models.Suggestion(
-        vehicle_id=body.vehicle_id,
+        vehicle_model=vehicle_model,
         plan_id=body.plan_id,
         text=body.text.strip(),
         status="pending",
@@ -3037,7 +3183,7 @@ def create_suggestion(
     db.refresh(sug)
     services.log_action(
         db, user, "create", "suggestion", sug.id,
-        f"{vehicle.code} için yeni öneri",
+        f"{vehicle_model} için yeni öneri",
         body.text.strip()[:280],
     )
     return sug
@@ -3050,24 +3196,31 @@ def review_suggestion(
     db: Session = Depends(get_db),
     actor: models.User = Depends(get_current_user),
 ):
-    """Admin (veya manage_users yetkisi olan) öneriyi değerlendirir: onayla,
-    reddet veya (bakım ağacına elle eklendikten sonra) 'Ağaca Eklendi'
-    olarak işaretler; isteğe bağlı bir değerlendirme notu düşebilir."""
-    if not (actor.role == "admin" or services.has_permission(db, actor, "manage_users")):
-        raise HTTPException(403, "Bu işlem için yetkiniz yok")
+    """Faz 30 — hiyerarşik onay: öneri önce AMİR'e düşer; yalnızca amir
+    onaylarsa MÜHENDİS'e düşer ve mühendisin kararı nihaidir. Amir
+    reddederse öneri mühendise HİÇ DÜŞMEZ (aşama None döner, artık
+    değerlendirilemez). Admin her iki aşamada da o aşamanın rolü yerine
+    geçebilir; diğer roller yalnızca KENDİ aşamalarında karar verebilir."""
     sug = db.get(models.Suggestion, suggestion_id)
     if not sug:
         raise HTTPException(404, "Öneri bulunamadı")
-    sug.status = body.status
-    sug.admin_note = body.admin_note.strip()
-    sug.reviewed_by_id = actor.id
-    sug.reviewed_at = datetime.now()
-    db.commit()
+    stage = services.suggestion_pending_stage(sug)
+    if stage is None:
+        raise HTTPException(400, "Bu öneri zaten sonuçlandırılmış, yeniden değerlendirilemez")
+    if actor.role != stage and actor.role != "admin":
+        raise HTTPException(
+            403,
+            "Bu öneriyi yalnızca amir değerlendirebilir" if stage == "amir"
+            else "Bu öneriyi yalnızca mühendis değerlendirebilir",
+        )
+    if body.status == "added" and stage != "engineer":
+        raise HTTPException(400, "'Ağaca Eklendi' yalnızca mühendis aşamasında işaretlenebilir")
+    services.apply_suggestion_review(db, sug, actor, stage, body.status, body.admin_note)
     db.refresh(sug)
-    status_tr = {"pending": "Beklemede", "approved": "Onaylandı", "rejected": "Reddedildi", "added": "Ağaca Eklendi"}
+    stage_tr = "Amir" if stage == "amir" else "Mühendis"
     services.log_action(
         db, actor, "update", "suggestion", sug.id,
-        f"Öneri #{sug.id} — {status_tr.get(body.status, body.status)}",
+        f"Öneri #{sug.id} — {stage_tr}: {_SUGGESTION_STATUS_TR.get(body.status, body.status)}",
         body.admin_note.strip()[:280],
     )
     return sug
@@ -3079,12 +3232,12 @@ def delete_suggestion(
     db: Session = Depends(get_db),
     actor: models.User = Depends(get_current_user),
 ):
-    """Öneriyi kalıcı olarak siler — ya değerlendiren (admin/manage_users)
-    ya da öneriyi gönderen kişinin kendisi silebilir."""
+    """Öneriyi kalıcı olarak siler — ya bir onay aşamasını yürütebilecek rol
+    (admin/amir/mühendis) ya da öneriyi gönderen kişinin kendisi silebilir."""
     sug = db.get(models.Suggestion, suggestion_id)
     if not sug:
         raise HTTPException(404, "Öneri bulunamadı")
-    can_review = actor.role == "admin" or services.has_permission(db, actor, "manage_users")
+    can_review = actor.role in ("admin", "amir", "engineer")
     if not (can_review or sug.created_by_id == actor.id):
         raise HTTPException(403, "Bu işlem için yetkiniz yok")
     db.delete(sug)
@@ -3267,7 +3420,111 @@ def set_item_note(
                 schemas.NodeAttachmentOut.model_validate(a) for a in node.attachments
             ]
     out.tier_kms = _parse_tier_kms(getattr(item, "tiers", ""))
+    out.exec_attachments = [
+        schemas.ItemExecAttachmentOut.model_validate(a)
+        for a in db.query(models.ItemExecAttachment)
+        .filter_by(item_id=item.id)
+        .order_by(models.ItemExecAttachment.id)
+        .all()
+    ]
     return out
+
+
+# ================================================================ Bakım sırasında görsel ekleme (Faz 21)
+@app.post("/api/items/{item_id}/exec-attachments", response_model=schemas.ItemExecAttachmentOut)
+async def upload_item_exec_attachment(
+    item_id: int,
+    file: UploadFile = File(...),
+    uploaded_by_id: int | None = Form(None),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Usta/mühendis/amir bir bakım maddesini tikleyip incelerken tablet
+    kamerasıyla (veya galeriden) fotoğraf ekler — sahadaki o anki durumu
+    (arıza, aşınma, tamamlanmış iş kanıtı vb.) belgelemek içindir. Admin'in
+    bakım ağacı ŞABLONUNA eklediği referans/talimat görselinden (bkz.
+    upload_node_attachment) FARKLIDIR ve yalnızca RESİM kabul eder.
+    Paylaşılan tablet senaryosunda fotoğrafı çeken kişi oturum sahibinden
+    farklı seçilebilir (completed_by_id/author_id ile aynı desen)."""
+    if not services.has_permission(db, user, "edit_maintenance"):
+        raise HTTPException(403, "Bakım maddelerine görsel ekleme yetkiniz yok")
+    item = db.get(models.MaintenanceItem, item_id)
+    if not item:
+        raise HTTPException(404, "Madde bulunamadı")
+    m = item.maintenance
+    if user.role == "technician" and m.assigned_to_id not in (None, user.id):
+        raise HTTPException(403, "Bu bakım size atanmamış")
+
+    uploader = user
+    if uploaded_by_id is not None:
+        chosen = db.get(models.User, uploaded_by_id)
+        if not chosen or not chosen.is_active:
+            raise HTTPException(400, "Geçersiz kullanıcı seçimi")
+        uploader = chosen
+
+    original = file.filename or "gorsel"
+    ext = os.path.splitext(original)[1].lower()
+    content = await file.read()
+    # Tablet kameraları (özellikle iPad) genelde HEIC üretir — tarayıcıda
+    # doğrudan görüntülenemeyeceği için önce görüntülenebilir bir formata
+    # çevrilir (bkz. upload_node_attachment/upload_part_image'daki aynı adım).
+    content, ext = await run_in_threadpool(bg_remove.convert_to_browser_image, content, ext)
+    if ext not in _IMAGE_EXTS:
+        raise HTTPException(400, "Yalnızca resim dosyası yüklenebilir")
+    _reject_dangerous_ext(ext)
+    _validate_upload_content(content, ext, "image")
+    content = _sanitize_if_svg(content, ext)
+    fname = f"{uuid.uuid4().hex}{ext}"
+    (ATTACH_DIR / fname).write_bytes(content)
+    att = models.ItemExecAttachment(
+        item_id=item_id, filename=fname, original_name=original, uploaded_by_id=uploader.id,
+    )
+    db.add(att)
+    db.commit()
+    db.refresh(att)
+    services.log_action(
+        db, user, "create", "item_exec_attachment", att.id,
+        f"Bakım maddesine görsel eklendi: {item.name} — {uploader.full_name}",
+        detail=f"İş Emri #{m.id} ({m.vehicle.code} — {m.plan.name})",
+    )
+    return att
+
+
+@app.delete("/api/item-exec-attachments/{attachment_id}")
+def delete_item_exec_attachment(
+    attachment_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Görseli ekleyen kişi de dahil olmak üzere, işaretleme yetkisi (edit_
+    maintenance) olan herkes silebilir — paylaşılan tablet senaryosunda
+    'yanlış fotoğraf' düzeltmesi anında yapılabilsin diye (not/tamamlama
+    işaretlerinde de aynı yaklaşım)."""
+    if not services.has_permission(db, user, "edit_maintenance"):
+        raise HTTPException(403, "Bu görseli silme yetkiniz yok")
+    att = db.get(models.ItemExecAttachment, attachment_id)
+    if not att:
+        raise HTTPException(404, "Ek bulunamadı")
+    item = att.item
+    m = item.maintenance if item else None
+    if m and user.role == "technician" and m.assigned_to_id not in (None, user.id):
+        raise HTTPException(403, "Bu bakım size atanmamış")
+    fpath = ATTACH_DIR / att.filename if att.filename else None
+    label = att.original_name
+    item_name = item.name if item else ""
+    mid_txt = f"İş Emri #{m.id}" if m else ""
+    db.delete(att)
+    db.commit()
+    if fpath and fpath.is_file():
+        try:
+            fpath.unlink()
+        except OSError:
+            pass
+    services.log_action(
+        db, user, "delete", "item_exec_attachment", attachment_id,
+        f"Bakım maddesindeki görsel silindi: {item_name}", detail=f"{label} · {mid_txt}",
+    )
+    return {"ok": True}
 
 
 @app.post("/api/items/{item_id}/unlock")
@@ -4125,9 +4382,11 @@ def notifications(
                 continue
             cat = "user"
         elif a.entity_type == "suggestion" and a.action == "create":
-            # Yeni öneriler yalnızca değerlendirebilecek kişilere (admin /
-            # manage_users yetkisi) bildirim olarak düşer.
-            if not (user.role == "admin" or services.has_permission(db, user, "manage_users")):
+            # Faz 30 — hiyerarşik onay: yeni öneriler, zincirde bir aşamayı
+            # yürütebilecek rollere (admin/amir/mühendis) bildirim olarak
+            # düşer (hangi aşamanın sırası geldiğinde ilgili rol Öneriler
+            # sayfasında zaten göreceği için burada aşama ayrımı yapılmaz).
+            if user.role not in ("admin", "amir", "engineer"):
                 continue
             cat = "suggestion"
         else:
@@ -4334,15 +4593,19 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
             remaining_km = (dm.target_date - date.today()).days if dm.target_date else 0
             estimated_days = max(0, remaining_km)
             critical = remaining_km <= services.CRITICAL_WITHIN_DAYS
+            urgent = remaining_km <= services.URGENT_WITHIN_DAYS
         else:
             remaining_km = dm.target_km - dm.vehicle.current_km
             estimated_days = (
                 math.ceil(remaining_km / services.DEFAULT_CALENDAR_DAILY_KM) if remaining_km > 0 else 0
             )
-            critical = (
-                remaining_km <= services.CRITICAL_WITHIN_KM
-                or estimated_days <= services.CRITICAL_WITHIN_DAYS
-            )
+            # KM bazlı planlarda kritiklik, planın kendi periyoduna (interval_km)
+            # oranlı: kalan km periyodun %15'inin altındaysa "kritik" (urgent),
+            # %5'inin altındaysa "çok kritik" (critical) — bkz. services.py
+            # KRITIK_PCT_OF_INTERVAL / COK_KRITIK_PCT_OF_INTERVAL.
+            interval_km = dm.plan.interval_km or 0
+            urgent = remaining_km <= interval_km * services.KRITIK_PCT_OF_INTERVAL / 100
+            critical = remaining_km <= interval_km * services.COK_KRITIK_PCT_OF_INTERVAL / 100
         return schemas.UpcomingItem(
             vehicle=schemas.VehicleOut.model_validate(dm.vehicle),
             plan_name=dm.plan.name,
@@ -4353,7 +4616,7 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
                 ",".join(it.tiers for it in dm.items if it.tiers)
             ),
             estimated_days=estimated_days,
-            urgent=estimated_days <= services.URGENT_WITHIN_DAYS,
+            urgent=urgent,
             critical=critical,
             maintenance_id=dm.id,
         )
@@ -4439,6 +4702,46 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     )
 
 
+# ================================================================ Faz 18 — KPI
+@app.get("/api/kpi", response_model=schemas.KPIOut)
+def get_kpi(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(require_permission("view_dashboard_analytics")),
+):
+    """Filo genelinde KPI raporu (Faz 18): tamamlanma oranı/süresi, geciken/
+    kritik bakım sayıları, araç/model bazlı ve personel/vardiya bazlı
+    performans. date_from/date_to 'YYYY-MM-DD' — esnek tarih aralığı
+    (Bakımlar sayfasındaki filtrelerle aynı ayrıştırma, bkz. _parse_date)."""
+    df = _parse_date(date_from)
+    dt_ = _parse_date(date_to, end=True)
+    report = services.compute_kpi_report(db, df, dt_)
+    report["top_vehicles"] = report.pop("vehicles")[:10]
+    return schemas.KPIOut(**report)
+
+
+@app.get("/api/kpi/export")
+def export_kpi(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(require_permission("export_excel")),
+):
+    """KPI raporunu çok sayfalı bir Excel dosyası olarak indirir (Faz 18)."""
+    df = _parse_date(date_from)
+    dt_ = _parse_date(date_to, end=True)
+    report = services.compute_kpi_report(db, df, dt_)
+    content = export_utils.build_kpi_workbook(report, title="KPI Raporu")
+    services.log_action(db, user, "export", "system", None, "KPI raporu Excel'e aktarıldı")
+    fname = export_utils.filename_for("kpi_raporu", "xlsx")
+    return Response(
+        content=content,
+        media_type=export_utils.MEDIA_TYPES["xlsx"],
+        headers={"Content-Disposition": f"attachment; filename={fname}"},
+    )
+
+
 # ================================================================ Süre bazlı bakım — zamanlayıcı
 async def _time_maintenance_background_loop():
     """Sunucu açıkken düzenli aralıklarla takvim gününü kontrol eder; gün
@@ -4491,6 +4794,51 @@ def run_time_maintenance_now(db: Session = Depends(get_db), actor=Depends(requir
             f"Süre bazlı bakım kontrolü elle tetiklendi: {len(opened)} yeni aday iş emri açıldı.",
         )
     return {"opened": len(opened)}
+
+
+# ================================================================ Zamanlanmış bakım başlatma — zamanlayıcı
+async def _scheduled_maintenance_start_background_loop():
+    """Sunucu açıkken düzenli aralıklarla, admin/mühendisin "Başlat" ile
+    ileri bir tarih seçtiği aday iş emirlerinden zamanı gelmiş olanları
+    otomatik başlatır (bkz. services.run_scheduled_maintenance_starts) —
+    diğer zamanlayıcılarla aynı desen."""
+    while True:
+        await asyncio.sleep(900)  # 15 dakikada bir kontrol
+        try:
+            db = SessionLocal()
+            try:
+                started = services.run_scheduled_maintenance_starts(db)
+                if started:
+                    print(f"[ZAMANLANMIŞ-BAKIM] {len(started)} iş emri otomatik başlatıldı.")
+            finally:
+                db.close()
+        except Exception as e:  # arka plan görevi asla çökmemeli
+            print(f"[ZAMANLANMIŞ-BAKIM] arka plan hatası: {e}")
+
+
+@app.on_event("startup")
+async def _scheduled_maintenance_start_startup():
+    """Açılışta, sunucu kapalıyken zamanı gelmiş olabilecek zamanlanmış
+    başlatmaları hemen kontrol eder ve arka plan döngüsünü başlatır."""
+    db = SessionLocal()
+    try:
+        started = services.run_scheduled_maintenance_starts(db)
+        if started:
+            print(f"[ZAMANLANMIŞ-BAKIM] Açılışta {len(started)} iş emri otomatik başlatıldı.")
+    except Exception as e:
+        print(f"[ZAMANLANMIŞ-BAKIM] açılış kontrolü hatası: {e}")
+    finally:
+        db.close()
+    asyncio.create_task(_scheduled_maintenance_start_background_loop())
+
+
+@app.post("/api/maintenances/run-scheduled-starts")
+def run_scheduled_maintenance_starts_now(db: Session = Depends(get_db), actor=Depends(require_admin)):
+    """Zamanlanmış bakım başlatma kontrolünü hemen çalıştırır — 15 dakikalık
+    arka plan döngüsünü beklemeden (km simülasyonu/süre bazlı bakımdaki
+    "Şimdi Çalıştır" ile aynı desen, esas olarak test/destek amaçlı)."""
+    started = services.run_scheduled_maintenance_starts(db)
+    return {"started": len(started)}
 
 
 # ================================================================ Günlük KM simülasyonu — zamanlayıcı

@@ -1021,12 +1021,10 @@ def import_bulk_catalog(
     ARAÇ'ı boş olan satırlar ve BAKIM hücresi tamamen BOŞ olan satırlar
     (sayfa sonundaki boş dolgu satırları) atlanır, `skipped` listesinde
     raporlanır. BAKIM hücresinde bir değer olup da yorumlanamayan satırlar
-    (ör. '?') ise ATLANMAZ: "Periyodu Belirsiz (?)" adlı ayrı bir plan
-    altında ağaca eklenir, ham metin madde notunda korunur (kaynak
-    netleşene kadar periyot bilgisi soru işaretli kalır) ve interval_km=0/
-    interval_months=None olduğu için otomatik açma motorlarından doğal
-    olarak hariç tutulur; bu satırlar `unresolved_period` listesinde
-    raporlanır.
+    (ör. '?') de ATLANIR — hiçbir zaman "?" periyotlu bir plan/madde ağaca
+    eklenmez; bu satırlar yalnızca `unresolved_period` listesinde (import
+    önizlemesinde admin'e gösterilmek üzere) raporlanır, Excel'de periyot
+    netleştirilip yeniden yüklenmeden veritabanına hiç girmez.
 
     Kaynak dosyada görünen HER periyot (ör. 800.000 km gibi başka bir
     periyodun tam katı olsa bile) kendi başına GERÇEK, Bakım Planları
@@ -1157,21 +1155,24 @@ def import_bulk_catalog(
         km'de tekrar isteniyor gibi görünürdü). Yalnızca bu planın
         `is_catalog_only` olarak işaretlenip işaretlenmeyeceği (Bakım
         Planları'nda gizlenip gizlenmeyeceği) burada `collapsed`
-        listesinde raporlanır — bkz. aşağıdaki plan oluşturma döngüsü."""
+        listesinde raporlanır — bkz. aşağıdaki plan oluşturma döngüsü.
+
+        BAKIM hücresi yorumlanamazsa (ör. '?') artık HİÇBİR ZAMAN ağaca/
+        plana eklenmez — "Periyodu Belirsiz (?)" plaseholder'ı kaldırıldı.
+        Satır tamamen atlanır ve yalnızca `unresolved` raporunda (import
+        önizlemesinde admin'e gösterilmek üzere) görünür; Excel'de periyot
+        netleştirilip yeniden yüklenmeden ağaca hiç girmez."""
         parsed = _parse_bakim_value(bakim)
-        note = ""
         if parsed is None:
             raw_bakim = str(bakim).strip()
-            plan_type, interval_km, interval_months = "unknown", 0, None
-            note = f"Bakım periyodu kaynak dosyada {raw_bakim!r} olarak verilmiş — netleşince Excel güncellenip yeniden yüklenmeli."
             unresolved.append({
                 "row": row_no,
-                "reason": f"[{sheet}] Periyot belirsiz ({raw_bakim!r}) — ağaca eklendi, periyot bilgisi soru işaretli bırakıldı.",
+                "reason": f"[{sheet}] Periyot belirsiz ({raw_bakim!r}) — ATLANDI, ağaca eklenmedi. Periyodu netleştirip yeniden yükleyin.",
                 "data": [vehicle_model, str(bakim), bolge, sistem, ekipman, kalem],
             })
-        else:
-            plan_type, interval_km, interval_months = parsed
+            return
 
+        plan_type, interval_km, interval_months = parsed
         key = (plan_type, interval_km, interval_months, vehicle_model)
         rows_by_plan.setdefault(key, []).append({
             "bolge": bolge,
@@ -1179,7 +1180,7 @@ def import_bulk_catalog(
             "ekipman": ekipman,
             "kalem": kalem,
             "kart": kart,
-            "note": note,
+            "note": "",
         })
 
     processed_any = False
@@ -1319,7 +1320,7 @@ def import_bulk_catalog(
         )
         if plan is None:
             plan = models.MaintenancePlan(
-                name=services.default_plan_name(plan_type, interval_km, interval_months),
+                name=services.default_plan_name(plan_type, interval_km, interval_months, vehicle_model),
                 interval_km=interval_km,
                 interval_months=interval_months,
                 plan_type=plan_type,

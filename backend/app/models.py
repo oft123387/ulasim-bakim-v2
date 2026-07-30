@@ -325,6 +325,13 @@ class Maintenance(Base):
     activated_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True
     )
+    # "Başlatılmayı Bekleyenler" listesinde admin/mühendis "Başlat" derken
+    # bugün yerine ileri bir tarih seçebilir — bu durumda hemen değil, o
+    # tarih geldiğinde arka plan zamanlayıcısı tarafından otomatik başlatılır
+    # (bkz. services.schedule_maintenance_start / run_scheduled_maintenance_starts).
+    # is_activated hâlâ False kalır ta ki gerçekten başlayana kadar; bu alan
+    # yalnızca "ne zaman otomatik başlasın" bilgisini tutar.
+    scheduled_start_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     vehicle = relationship("Vehicle", back_populates="maintenances")
     plan = relationship("MaintenancePlan")
@@ -387,6 +394,40 @@ class MaintenanceItem(Base):
     maintenance = relationship("Maintenance", back_populates="items")
     completed_by = relationship("User", foreign_keys=[completed_by_id])
     exec_note_by = relationship("User", foreign_keys=[exec_note_by_id])
+
+
+class ItemExecAttachment(Base):
+    """Faz 21 — Usta/mühendis/amir bakım SIRASINDA (bir checklist maddesini
+    tikleyip incelerken) tablet kamerasıyla veya galeriden fotoğraf
+    ekleyebilir. NodeAttachment'tan (admin'in bakım ağacı ŞABLONUNA eklediği
+    referans/talimat görseli) FARKLIDIR — bu, sahada o anki durumu (arıza,
+    aşınma, tamamlanmış iş kanıtı vb.) belgelemek için doğrudan bu iş
+    emrinin (Maintenance) bu maddesine (MaintenanceItem) bağlıdır, şablona
+    YANSIMAZ. Bilerek MaintenanceItem tarafında aynı adlı bir ORM
+    relationship TANIMLANMAMIŞTIR — aksi halde ItemOut.model_validate()
+    her maddede otomatik (N+1) bir sorgu tetiklerdi; bunun yerine
+    main.py._build_item_tree tek seferde toplu sorgu ile doldurur (bkz.
+    NodeAttachment için 'attach' sözlüğüyle aynı desen). item_id üzerindeki
+    ondelete=CASCADE, iş emri/madde silinince bu ekleri de veritabanı
+    seviyesinde temizler (dosyalar elle silinen tekil ek durumunda
+    silinir; toplu silmede dosya artıkları kalabilir — mevcut ek
+    sistemlerindeki kabul edilmiş davranışla aynı)."""
+
+    __tablename__ = "item_exec_attachments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(
+        ForeignKey("maintenance_items.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    original_name: Mapped[str] = mapped_column(String(300), default="")
+    uploaded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    item = relationship("MaintenanceItem")
+    uploaded_by = relationship("User")
 
 
 class MaintenanceNote(Base):
@@ -660,29 +701,51 @@ class RolePermission(Base):
 
 
 class Suggestion(Base):
-    """Mühendis/usta/amirin bir araç ve (varsa) bakım periyodu için sahada
-    fark ettiği bir eksikliği/iyileştirmeyi bildirdiği öneri. Admin bunları
-    tek bir yerden görür, değerlendirir (Onayla/Reddet), bir açıklama notu
-    düşer ve uygun görürse Bakım Ağacı'na madde olarak ekleyip 'Ağaca
-    Eklendi' olarak işaretler. Bildirim Merkezi'nde yeni öneriler audit_log
-    üzerinden (action='create', entity_type='suggestion') otomatik görünür,
-    ayrıca bu tablodan da 'pending' sayısı doğrudan sorgulanabilir."""
+    """Faz 30 — Usta/mühendis/amir/admin'in sahada fark ettiği bir
+    eksikliği/iyileştirmeyi bildirdiği öneri. Artık BELİRLİ bir araca değil
+    bir ARAÇ MODELİNE (vehicle_model — ör. "Bozankaya Tip-1", "Sirio")
+    bağlanır, çünkü öneri genelde o modelin TÜMÜNÜ ilgilendirir (bkz.
+    /api/vehicle-models). vehicle_id, bu değişiklikten ÖNCE belirli bir
+    araca bağlı oluşturulmuş eski kayıtlar için geriye dönük uyumluluk
+    amacıyla hâlâ var ama artık NULL olabilir ve yeni önerilerde
+    kullanılmaz.
+
+    İKİ AŞAMALI HİYERARŞİK ONAY: bir öneri önce AMİR'e düşer (amir_status);
+    amir onaylarsa (amir_status='approved') MÜHENDİS'e düşer (engineer_
+    status) ve mühendisin kararı (approved/rejected/added) NİHAİDİR; amir
+    reddederse (amir_status='rejected') öneri MÜHENDİSE HİÇ DÜŞMEZ, iş
+    orada biter. `status`, bu iki aşamanın DERLENMİŞ (üst düzey, filtreleme/
+    rozet için kullanılan) görünümüdür:
+      pending          -> yeni, amir'in kararını bekliyor
+      pending_engineer -> amir onayladı, mühendisin kararını bekliyor
+      rejected         -> amir VEYA mühendis reddetti (hangisi olduğu
+                          amir_status/engineer_status'tan ayırt edilir)
+      approved         -> mühendis onayladı (nihai)
+      added            -> mühendis bakım ağacına eklendi olarak işaretledi (nihai)
+    Bu alan, ilgili aşama alanıyla AYNI ANDA (bkz. services.apply_
+    suggestion_review) güncellenir — asla tek başına değiştirilmez."""
 
     __tablename__ = "suggestions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True
+    # Geriye dönük uyumluluk (bu özellikten ÖNCE belirli bir araca bağlı
+    # oluşturulmuş öneriler) — artık NULL olabilir, yeni önerilerde
+    # kullanılmaz (bkz. vehicle_model).
+    vehicle_id: Mapped[int | None] = mapped_column(
+        ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=True, index=True
     )
+    # Yeni önerilerde ZORUNLU — önerinin hangi araç modelini ilgilendirdiği.
+    vehicle_model: Mapped[str] = mapped_column(String(100), default="")
     # Öneri belirli bir bakım periyoduna yönelikse plan; genel bir öneriyse
     # (herhangi bir periyoda özgü değilse) None olabilir.
     plan_id: Mapped[int | None] = mapped_column(
         ForeignKey("maintenance_plans.id", ondelete="SET NULL"), nullable=True
     )
     text: Mapped[str] = mapped_column(Text)
-    # pending | approved | rejected | added
     status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
-    # Admin'in değerlendirme notu (onay/red gerekçesi veya nasıl ele alındığı).
+    # ESKİ tek-aşamalı alan — artık yalnızca "en son hangi aşama tamamlandı,
+    # kim/ne zaman" özetini taşır (geriye dönük uyumluluk + basit "son
+    # işlem" gösterimi için); asıl kaynak amir_*/engineer_* alanlarıdır.
     admin_note: Mapped[str] = mapped_column(Text, default="")
     created_by_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"), nullable=True
@@ -693,10 +756,29 @@ class Suggestion(Base):
     )
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # 1. aşama — AMİR: pending | approved | rejected
+    amir_status: Mapped[str] = mapped_column(String(20), default="pending")
+    amir_reviewed_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    amir_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    amir_note: Mapped[str] = mapped_column(Text, default="")
+
+    # 2. aşama — MÜHENDİS: yalnızca amir_status='approved' olunca sırası
+    # gelir. pending | approved | rejected | added
+    engineer_status: Mapped[str] = mapped_column(String(20), default="pending")
+    engineer_reviewed_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    engineer_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    engineer_note: Mapped[str] = mapped_column(Text, default="")
+
     vehicle = relationship("Vehicle")
     plan = relationship("MaintenancePlan")
     created_by = relationship("User", foreign_keys=[created_by_id])
     reviewed_by = relationship("User", foreign_keys=[reviewed_by_id])
+    amir_reviewed_by = relationship("User", foreign_keys=[amir_reviewed_by_id])
+    engineer_reviewed_by = relationship("User", foreign_keys=[engineer_reviewed_by_id])
 
 
 class AlarmState(Base):

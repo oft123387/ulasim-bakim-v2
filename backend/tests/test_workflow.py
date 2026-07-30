@@ -197,6 +197,17 @@ def test_full_backend_workflow(client, admin_token, usta_token):
     assert client.delete(f"/api/tree/{n1['id']}", headers=auth(admin)).status_code == 200
 
     # ============================================================ Dashboard
+    # "Yaklaşan bakımlar" önizleme penceresi artık km-tolerans tablosuna göre
+    # her iki yönde de en fazla MAX_TOLERANCE_KM=3000'de tavanlanıyor (bkz.
+    # services.plan_window/MAX_TOLERANCE_KM) — büyük periyotlu planlarda
+    # eskisi gibi geniş (%5/%10) bir pencere yok. 3802'yi (seed'de 487.000 km,
+    # bu teste kadar hiç değiştirilmemiş) bir sonraki 25.000 katına (500.000)
+    # yalnızca 800 km kala getirerek, hangi plan "yöneten" olursa olsun
+    # (en küçük tavan bile en az 1.250 km) önizleme penceresine kesin girmesi
+    # sağlanır — böylece "upcoming" listesinin boş olmadığı güvenle test edilir.
+    v3802 = next(x for x in vehicles if x["code"] == "3802")
+    client.put(f"/api/vehicles/{v3802['id']}/km", headers=auth(admin), json={"current_km": 499_200})
+
     r = client.get("/api/dashboard", headers=auth(admin))
     assert r.status_code == 200
     dash = r.json()
@@ -361,13 +372,18 @@ def test_full_backend_workflow(client, admin_token, usta_token):
     client.delete(f"/api/plans/{new_plan_id}", headers=auth(admin))
 
     # ============================================================ Dashboard yaklaşan bakımlar penceresi
+    # Önizleme penceresi (PREVIEW_LOWER/UPPER_PCT) artık her iki yönde de en
+    # fazla MAX_TOLERANCE_KM=3000'de tavanlanıyor (bkz. services.plan_window
+    # yorumu) — bu yüzden "yakın" araç, eskisi gibi %5'lik (500.000'de
+    # 25.000 km) geniş bir payla değil, bu yeni sabit 3.000 km tavanın
+    # İÇİNDE bir kalan km ile kurulur (hedefe 500 km kala).
     plans_now = client.get("/api/plans", headers=auth(admin)).json()
     plan500 = next(p for p in plans_now if p["interval_km"] == 500000)
     client.patch(f"/api/plans/{plan500['id']}", headers=auth(admin), json={"lower_pct": 0, "upper_pct": 0})
 
     dash_near_v = client.post(
         "/api/vehicles", headers=auth(admin),
-        json={"code": "DASHNEAR", "name": "Dashboard Yakın", "current_km": 480_000},
+        json={"code": "DASHNEAR", "name": "Dashboard Yakın", "current_km": 499_500},
     ).json()
     dash_far_v = client.post(
         "/api/vehicles", headers=auth(admin),

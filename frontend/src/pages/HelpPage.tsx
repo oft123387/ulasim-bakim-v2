@@ -10,7 +10,6 @@ import {
   ClipboardList,
   Workflow,
   PackageSearch,
-  Siren,
   Bell,
   ShieldCheck,
   Users as UsersIcon,
@@ -173,26 +172,6 @@ const SECTIONS: HelpSection[] = [
     ),
   },
   {
-    id: 'alarms',
-    title: 'Canlı Alarm Merkezi',
-    icon: <Siren size={16} />,
-    role: 'staff',
-    body: (
-      <>
-        <p>
-          Geciken (Kritik), yakında zamanı gelecek (Uyarı) ve önizleme penceresindeki (Normal)
-          bakımları tek listede toplar. Her alarmı onaylayabilir, birine atayabilir, çözülmüş/
-          kapatılmış olarak işaretleyebilirsiniz.
-        </p>
-        <p>
-          SMTP yapılandırılmışsa, yeni bir kritik alarm için admin/mühendis/amir rolündeki
-          (doğrulanmış e-postası olan) kullanıcılara otomatik bir uyarı e-postası gider — aynı
-          alarm için tekrar gönderilmez.
-        </p>
-      </>
-    ),
-  },
-  {
     id: 'notifications',
     title: 'Bildirim Merkezi (üstteki zil)',
     icon: <Bell size={16} />,
@@ -212,7 +191,7 @@ const SECTIONS: HelpSection[] = [
     role: 'all',
     body: (
       <p>
-        Dashboard, Alarm Merkezi ve Bildirim zili artık sayfayı yenilemenize gerek kalmadan
+        Dashboard ve Bildirim zili artık sayfayı yenilemenize gerek kalmadan
         anında güncellenir — biri bir bakımı tamamladığında, bir alarmı onayladığında ya da km
         güncellediğinde ekranınız kendiliğinden tazelenir. Bağlantı geçici olarak koparsa,
         mevcut periyodik yenileme (30-60 saniye) yedek olarak devreye girer.
