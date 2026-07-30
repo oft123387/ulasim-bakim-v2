@@ -75,13 +75,25 @@ export const ONBOARDING_STEPS: TourStep[] = [
     page: 'calendar',
     selector: '.page-header',
     title: 'Takvim',
-    text: 'Bakımları tarih bazlı takvim görünümünde de inceleyebilirsiniz.',
+    text: 'Bakımlar haftalık (varsayılan) veya aylık görünümde tarih eksenine yerleştirilir; her bakımın altında "en geç bu tarihte" tahmini de görünür.',
   },
   {
     page: 'parts',
     selector: '.page-header',
     title: 'Parça Bilgi Bankası',
-    text: 'Parçaların teknik bilgisi, görselleri ve dokümanları burada tutulur.',
+    text: 'Parçaların teknik bilgisi, görselleri, dokümanları ve stok durumu burada tutulur.',
+  },
+  {
+    page: 'suggestions',
+    selector: '.page-header',
+    title: 'Öneriler',
+    text: 'Bakım ağacına eklenmesini istediğiniz bir maddeyi buradan önerebilirsiniz — önce amir, sonra (onaylarsa) mühendis değerlendirir. Öneriler herkese açık şekilde görünür.',
+  },
+  {
+    page: 'kpi',
+    selector: '.page-header',
+    title: 'KPI Raporu',
+    text: 'Tarih aralığı seçip tamamlanma oranı/süresi, kritik-gecikmiş bakım sayıları ile araç/model ve personel performansını inceleyin; tek tıkla Excel\'e aktarın.',
   },
 ]
 
