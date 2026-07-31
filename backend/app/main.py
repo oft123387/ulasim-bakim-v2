@@ -409,9 +409,9 @@ def _recheck_vehicles_after_tree_import(db: Session, actor, vehicle_models: list
     değerlendirir — admin ayrıca aracı elle güncellemek ya da km simülasyo-
     nunu beklemek zorunda kalmaz; kimin bakımı gelmiş kiminkinin gelmediği
     içe aktarma bitince anında "Otomatik Bakım / Başlatılmayı Bekleyenler"
-    listesinde görünür. `vehicle_models` içinde "" (Genel) varsa TÜM aktif
-    araçlar, aksi halde yalnızca o modeldeki aktif araçlar kontrol edilir."""
-    q = db.query(models.Vehicle).filter(models.Vehicle.is_active == True)  # noqa: E712
+    listesinde görünür. `vehicle_models` içinde "" (Genel) varsa TÜM
+    araçlar, aksi halde yalnızca o modeldeki araçlar kontrol edilir."""
+    q = db.query(models.Vehicle)
     if "" not in vehicle_models:
         q = q.filter(models.Vehicle.model.in_(vehicle_models))
     vehicles = q.all()
@@ -1316,20 +1316,11 @@ async def import_vehicles(
 
 @app.get("/api/vehicles/export")
 def export_vehicles(
-    status: str | None = None,
     db: Session = Depends(get_db),
     actor=Depends(require_permission("export_excel")),
 ):
-    """Araçlar sayfasındaki durum filtresiyle (Tümü/Yalnızca Aktif/Yalnızca
-    Pasif) birebir aynı kapsamda dışa aktarır — önceden bu filtre yalnızca
-    ekrandaki tabloyu etkiliyordu, Excel'e aktarma her zaman TÜM araçları
-    (filtreden bağımsız) indiriyordu."""
-    q = db.query(models.Vehicle)
-    if status == "active":
-        q = q.filter(models.Vehicle.is_active == True)  # noqa: E712
-    elif status == "inactive":
-        q = q.filter(models.Vehicle.is_active == False)  # noqa: E712
-    vehicles = q.order_by(models.Vehicle.code).all()
+    """Tüm araçları Excel'e aktarır."""
+    vehicles = db.query(models.Vehicle).order_by(models.Vehicle.code).all()
     content = excel_utils.build_vehicles_workbook(vehicles)
     services.log_action(
         db, actor, "export", "vehicle", None,
@@ -1635,6 +1626,122 @@ def update_node(
     db.refresh(n)
     services.log_action(db, actor, "update", "tree_node", n.id, f"Ağaç maddesi güncellendi: {n.name}")
     return n
+
+
+@app.patch("/api/tree/{node_id}/mandatory", response_model=schemas.TreeNodeOut)
+def update_node_mandatory(
+    node_id: int,
+    body: schemas.TreeNodeMandatoryUpdate,
+    db: Session = Depends(get_db),
+    actor=Depends(require_staff),
+):
+    """Bir ağaç maddesinin GENEL (tüm araçlar için geçerli) zorunluluk
+    varsayılanını değiştirir — "hepsine uygula". Yeni açılan iş emirlerinin
+    yanı sıra, ZATEN AÇIK (tamamlanmamış) iş emirlerindeki karşılık gelen
+    maddeler de HEMEN yeni duruma göre güncellenir (bkz.
+    services.resync_open_items_mandatory_state) — usta üzerinde çalıştığı
+    bakımda değişikliği anında görür. Bir teknisyen tarafından GERÇEKTEN
+    tamamlanmış maddelere dokunulmaz. Admin, mühendis ve amir kullanabilir
+    (Bakım Ağacı'nın geri kalanının aksine — o yalnızca admin'e açık)."""
+    n = db.get(models.TreeNode, node_id)
+    if not n:
+        raise HTTPException(404, "Düğüm bulunamadı")
+    n.is_mandatory = body.is_mandatory
+    db.commit()
+    db.refresh(n)
+    changed = services.resync_open_items_mandatory_state(db, n.id)
+    services.log_action(
+        db, actor, "update", "tree_node", n.id,
+        f"'{n.name}' maddesi {'zorunlu' if body.is_mandatory else 'zorunlu değil'} olarak işaretlendi"
+        + (f" ({changed} açık iş emrinde madde güncellendi)" if changed else ""),
+    )
+    return n
+
+
+@app.get("/api/tree/{node_id}/vehicle-exceptions", response_model=list[schemas.TreeNodeVehicleExceptionOut])
+def list_node_vehicle_exceptions(
+    node_id: int, db: Session = Depends(get_db), actor=Depends(require_staff),
+):
+    """Bir ağaç maddesi için, genel varsayılanı geçersiz kılan araca-özel
+    istisnaların listesi (ör. genelde zorunlu ama 3805'te zaten yapıldığı
+    için opsiyonel)."""
+    if not db.get(models.TreeNode, node_id):
+        raise HTTPException(404, "Düğüm bulunamadı")
+    return (
+        db.query(models.TreeNodeVehicleException)
+        .filter_by(node_id=node_id)
+        .order_by(models.TreeNodeVehicleException.id)
+        .all()
+    )
+
+
+@app.post("/api/tree/{node_id}/vehicle-exceptions", response_model=schemas.TreeNodeVehicleExceptionOut)
+def add_or_update_node_vehicle_exception(
+    node_id: int,
+    body: schemas.TreeNodeVehicleExceptionIn,
+    db: Session = Depends(get_db),
+    actor=Depends(require_staff),
+):
+    """Belirli TEK bir araç için bu maddenin zorunluluk durumunu genel
+    varsayılandan farklı yapar ("araca göre seç"). Aynı araç için zaten bir
+    istisna varsa değeri günceller (upsert). Yeni açılan iş emirlerinin
+    yanı sıra, bu aracın ZATEN AÇIK (tamamlanmamış) iş emrindeki karşılık
+    gelen madde de HEMEN yeni duruma göre güncellenir (gerçek bir
+    teknisyen tamamlaması varsa dokunulmaz)."""
+    node = db.get(models.TreeNode, node_id)
+    if not node:
+        raise HTTPException(404, "Düğüm bulunamadı")
+    vehicle = db.get(models.Vehicle, body.vehicle_id)
+    if not vehicle:
+        raise HTTPException(404, "Araç bulunamadı")
+    exc = (
+        db.query(models.TreeNodeVehicleException)
+        .filter_by(node_id=node_id, vehicle_id=body.vehicle_id)
+        .first()
+    )
+    if exc:
+        exc.is_mandatory = body.is_mandatory
+    else:
+        exc = models.TreeNodeVehicleException(
+            node_id=node_id, vehicle_id=body.vehicle_id, is_mandatory=body.is_mandatory,
+        )
+        db.add(exc)
+    db.commit()
+    db.refresh(exc)
+    changed = services.resync_open_items_mandatory_state(db, node_id, vehicle_id=body.vehicle_id)
+    services.log_action(
+        db, actor, "update", "tree_node", node_id,
+        f"'{node.name}' maddesi {vehicle.code} için "
+        f"{'zorunlu' if body.is_mandatory else 'zorunlu değil'} olarak işaretlendi (araç istisnası)"
+        + (f" ({changed} açık iş emrinde madde güncellendi)" if changed else ""),
+    )
+    return exc
+
+
+@app.delete("/api/tree/vehicle-exceptions/{exception_id}")
+def delete_node_vehicle_exception(
+    exception_id: int, db: Session = Depends(get_db), actor=Depends(require_staff),
+):
+    """Bir araç istisnasını kaldırır — o araç tekrar maddenin GENEL
+    varsayılanına (TreeNode.is_mandatory) döner. Bu aracın ZATEN AÇIK
+    (tamamlanmamış) iş emrindeki karşılık gelen madde de HEMEN genel
+    varsayılana göre güncellenir (gerçek bir teknisyen tamamlaması varsa
+    dokunulmaz)."""
+    exc = db.get(models.TreeNodeVehicleException, exception_id)
+    if not exc:
+        raise HTTPException(404, "İstisna bulunamadı")
+    node = db.get(models.TreeNode, exc.node_id)
+    vehicle = db.get(models.Vehicle, exc.vehicle_id)
+    node_id, vehicle_id = exc.node_id, exc.vehicle_id
+    db.delete(exc)
+    db.commit()
+    changed = services.resync_open_items_mandatory_state(db, node_id, vehicle_id=vehicle_id)
+    services.log_action(
+        db, actor, "delete", "tree_node", node_id,
+        f"'{node.name if node else '?'}' maddesindeki {vehicle.code if vehicle else '?'} istisnası kaldırıldı"
+        + (f" ({changed} açık iş emrinde madde güncellendi)" if changed else ""),
+    )
+    return {"ok": True}
 
 
 @app.delete("/api/tree/{node_id}")
@@ -2663,7 +2770,10 @@ def list_maintenances(
         db, user, status, vehicle_id, plan_id, worked_by_id,
         date_field, date_from, date_to, km_min, km_max,
     )
-    return q.all()
+    rows = q.all()
+    for m in rows:
+        m.covered_tiers = services.compute_covered_tiers(m)
+    return rows
 
 
 @app.get("/api/maintenances/pending-start", response_model=list[schemas.MaintenanceOut])
@@ -2676,12 +2786,15 @@ def list_pending_start_maintenances(
     Takvim'de ve teknisyen ekranında GÖRÜNMEYEN aday iş emirleri. Yalnızca
     start_maintenance yetkisi olan roller (admin her zaman, varsayılan
     olarak mühendis/amir) görebilir."""
-    return (
+    rows = (
         db.query(models.Maintenance)
         .filter(models.Maintenance.is_activated == False)  # noqa: E712
         .order_by(models.Maintenance.created_at.desc())
         .all()
     )
+    for m in rows:
+        m.covered_tiers = services.compute_covered_tiers(m)
+    return rows
 
 
 @app.post("/api/maintenances/{mid}/start", response_model=schemas.MaintenanceOut)
@@ -2718,6 +2831,7 @@ def start_maintenance(
             detail=hedef_txt,
         )
         db.refresh(m)
+        m.covered_tiers = services.compute_covered_tiers(m)
         return m
     services.activate_maintenance(db, m, actor)
     services.log_action(
@@ -2726,6 +2840,7 @@ def start_maintenance(
         detail=hedef_txt,
     )
     db.refresh(m)
+    m.covered_tiers = services.compute_covered_tiers(m)
     return m
 
 
@@ -2752,6 +2867,7 @@ def cancel_maintenance_schedule(
     )
     services.cancel_scheduled_maintenance_start(db, m)
     db.refresh(m)
+    m.covered_tiers = services.compute_covered_tiers(m)
     return m
 
 
@@ -2790,6 +2906,11 @@ def create_manual_maintenance(
         detail=hedef_txt,
     )
     db.refresh(m)
+    # covered_tiers gerçek bir DB sütunu değil, MaintenanceOut'ta hesaplanan
+    # bir alan — get_maintenance/list_maintenances'ta olduğu gibi burada da
+    # döndürmeden önce elle hesaplanıp iliştirilmeli, yoksa manuel oluşturma
+    # yanıtında (sayfa yeniden yüklenene kadar) boş [] görünür.
+    m.covered_tiers = services.compute_covered_tiers(m)
     return m
 
 
@@ -2849,7 +2970,7 @@ def get_maintenance_projections(
     tarihi aralığına çevirir. Tamamlanmış hedefler bir daha döndürülmez."""
     if not services.has_permission(db, user, "view_maintenance"):
         raise HTTPException(403, "Bakımları görüntüleme yetkiniz yok")
-    vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+    vehicles = db.query(models.Vehicle).all()
     items = services.compute_maintenance_calendar_projections(db, vehicles)
     if user.role == "technician":
         items = [
@@ -2880,14 +3001,7 @@ def get_maintenance(
         raise HTTPException(403, "Bu bakım size atanmamış")
     detail = schemas.MaintenanceDetail.model_validate(m)
     detail.items = _build_item_tree(m.items, db)
-    # Bu bakımın kapsadığı tüm periyotlar (kademeli birleşik maddelerden)
-    covered: set[int] = set()
-    for it in m.items:
-        if it.tiers:
-            for part in it.tiers.split(","):
-                if part.strip().isdigit():
-                    covered.add(int(part))
-    detail.covered_tiers = sorted(covered)
+    detail.covered_tiers = services.compute_covered_tiers(m)
     return detail
 
 
@@ -3277,6 +3391,7 @@ def assign_maintenance(
         f"Bakım atandı: {m.vehicle.code} — {m.plan.name} → {target}",
         old_value=old_target, new_value=target,
     )
+    m.covered_tiers = services.compute_covered_tiers(m)
     return m
 
 
@@ -3723,7 +3838,6 @@ def system_status(db: Session = Depends(get_db), _=Depends(require_admin)):
         started_at=_APP_STARTED_AT,
         uptime_seconds=(datetime.now() - _APP_STARTED_AT).total_seconds(),
         vehicle_count=db.query(models.Vehicle).count(),
-        active_vehicle_count=db.query(models.Vehicle).filter_by(is_active=True).count(),
         user_count=db.query(models.User).count(),
         plan_count=plan_q.count(),
         catalog_only_plan_count=plan_q.filter(models.MaintenancePlan.is_catalog_only == True).count(),  # noqa: E712
@@ -3876,13 +3990,12 @@ def export_audit(
 # ================================================================ Günlük KM Simülasyonu
 def _km_sim_status(db: Session) -> schemas.KmSimConfig:
     cfg = services.get_km_sim_config(db)
-    active = db.query(models.Vehicle).filter_by(is_active=True).count()
     return schemas.KmSimConfig(
         enabled=cfg["enabled"],
         min_km=cfg["min_km"],
         max_km=cfg["max_km"],
         last_date=cfg["last_date"],
-        active_vehicles=active,
+        vehicle_count=db.query(models.Vehicle).count(),
     )
 
 
@@ -4246,14 +4359,26 @@ def update_alarm_state(
 
 
 def _send_critical_alarm_emails(db: Session) -> int:
-    """Yeni (henüz e-posta gönderilmemiş) kritik alarmlar için admin/
-    mühendis/amir rolündeki, doğrulanmış e-postası olan kullanıcılara tek
-    seferlik bir uyarı e-postası gönderir. Aynı alarma (vehicle_id+target_km)
-    tekrar tekrar e-posta atılmaması için AlarmState.emailed_at kullanılır —
-    bir kez gönderildikten sonra o alarm için bir daha gönderilmez, alarm
-    zaten onaylanmış/çözülmüş/kapatılmışsa hiç gönderilmez (bir insan zaten
-    görmüş demektir). SMTP yapılandırılmamışsa (email_utils.is_configured()
-    False) sessizce 0 döner — sistemin geri kalanını etkilemez."""
+    """Yeni (henüz e-posta gönderilmemiş) alarmlar için admin/mühendis/amir
+    rolündeki, doğrulanmış e-postası olan T Ü M kullanıcılara (tek bir
+    hesaba değil, herkese) tek seferlik bir uyarı e-postası gönderir.
+
+    Tetikleyici (kullanıcı isteği: yalnızca "gecikti" değil, "aralığa
+    girip henüz planlanmamış" bakımlar için de e-posta gitsin): Araçlar
+    sayfasındaki 4 durumdan (bkz. services._classify_upcoming_status)
+    "planlanacak" (bakım takip periyoduna girmiş ama henüz iş emri
+    açılıp başlatılmamış — birinin harekete geçmesi gerekiyor) veya
+    "gecikti" (periyot aşılmış) olan her bakım için gönderilir.
+    "yaklaşıyor" (henüz pencereye girmemiş, çok erken) ve "planlandı"
+    (zaten bir iş emri açılıp başlatılmış, birisi zaten haberdar) durumları
+    e-posta tetiklemez.
+
+    Aynı alarma (vehicle_id+target_km) tekrar tekrar e-posta atılmaması
+    için AlarmState.emailed_at kullanılır — bir kez gönderildikten sonra o
+    alarm için bir daha gönderilmez, alarm zaten onaylanmış/çözülmüş/
+    kapatılmışsa hiç gönderilmez (bir insan zaten görmüş demektir). SMTP
+    yapılandırılmamışsa (email_utils.is_configured() False) sessizce 0
+    döner — sistemin geri kalanını etkilemez."""
     if not email_utils.is_configured():
         return 0
     recipients = (
@@ -4269,25 +4394,39 @@ def _send_critical_alarm_emails(db: Session) -> int:
 
     sent = 0
     for it in _compute_upcoming_merged(db, include_open=True):
+        status = it.get("status")
+        if status not in ("planlanacak", "gecikti"):
+            continue
         remaining = it["remaining_km"]
-        overdue = remaining <= 0
-        if not (overdue or it.get("critical")):
-            continue  # yalnızca kritik seviye — bkz. alarm_center() ile aynı koşul
+        overdue = status == "gecikti"
         v = it["vehicle"]
-        state = _get_or_create_alarm_state(db, v.id, it["target_km"], it["plan_name"], "critical")
+        priority = "critical" if overdue else "warning"
+        state = _get_or_create_alarm_state(db, v.id, it["target_km"], it["plan_name"], priority)
         if state.emailed_at is not None or state.acknowledged or state.resolved or state.closed:
             continue
 
         target_date = it.get("target_date")
-        if target_date is not None:
-            detail = f"{abs(remaining)} gün geçti (hedef {target_date.strftime('%d.%m.%Y')})"
+        if overdue:
+            if target_date is not None:
+                detail = f"{abs(remaining)} gün geçti (hedef {target_date.strftime('%d.%m.%Y')})"
+            else:
+                detail = f"{fmt_km(abs(remaining))} km geçildi"
+            subject = f"[Ulaşım Bakım] Bakım gecikti: {v.code} — {it['plan_name']}"
+            body = (
+                f"{v.code} ({v.name}) aracının {it['plan_name']} bakımı gecikti: {detail}.\n\n"
+                f"Ulaşım-Bakım sistemine giriş yapıp Araçlar sayfasından inceleyebilirsiniz."
+            )
         else:
-            detail = f"{fmt_km(abs(remaining))} km geçildi"
-        subject = f"[Ulaşım Bakım] Kritik alarm: {v.code} — {it['plan_name']}"
-        body = (
-            f"{v.code} ({v.name}) aracının {it['plan_name']} bakımı gecikti: {detail}.\n\n"
-            f"Ulaşım-Bakım sistemine giriş yapıp Alarm Merkezi'nden inceleyebilirsiniz."
-        )
+            if target_date is not None:
+                detail = f"hedef tarih {target_date.strftime('%d.%m.%Y')}"
+            else:
+                detail = f"{fmt_km(remaining)} km kaldı"
+            subject = f"[Ulaşım Bakım] Bakım planlanmalı: {v.code} — {it['plan_name']}"
+            body = (
+                f"{v.code} ({v.name}) aracının {it['plan_name']} bakımı bakım takip "
+                f"periyoduna girdi ({detail}) ve henüz planlanmadı.\n\n"
+                f"Ulaşım-Bakım sistemine giriş yapıp Araçlar sayfasından planlayabilirsiniz."
+            )
         any_ok = False
         for u in recipients:
             if email_utils.send_email(u.email, subject, body):
@@ -4556,7 +4695,6 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     ).count()
 
     vehicle_count = db.query(models.Vehicle).count()
-    active_vehicle_count = db.query(models.Vehicle).filter_by(is_active=True).count()
 
     pending_user_approvals = 0
     if user.role == "admin":
@@ -4569,7 +4707,7 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     # için kullanılan sabit bir önizleme aralığıdır. Mantık services.py'de
     # tek yerde tutulur (Araçlar sayfasındaki kırmızı vurgulama da aynı
     # fonksiyonu kullanır).
-    vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+    vehicles = db.query(models.Vehicle).all()
     plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
     upcoming = [
         schemas.UpcomingItem(**item)
@@ -4623,7 +4761,24 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
 
     due_now = [_due_item(dm) for dm in due_rows]
 
-    recent_q = db.query(models.Maintenance).filter_by(status="completed")
+    # Yalnızca Bakım Planları sayfasında (GET /api/plans, varsayılan) GERÇEKTEN
+    # görünen bir plana bağlı tamamlanan bakımlar gösterilir — o sayfa hem
+    # pasif (is_active=False, ör. tier-merge ile birleştirilmiş) hem de yalnızca
+    # katalog amaçlı (is_catalog_only=True, ör. bir temel periyodun tam katı —
+    # kendi başına bakım tetiklemez) planları GÖSTERMEZ; burası da aynı iki
+    # koşulu uygulamalı, aksi halde Bakım Planları'nda hiç karşılığı olmayan
+    # garip/eski km değerleri (ör. "150M") görünmeye devam eder.
+    # (Bakım Geçmişi sayfası bundan ETKİLENMEZ — tüm tamamlanan kayıtları,
+    # planı pasif/katalog-amaçlı olsa bile, kalıcı olarak göstermeye devam eder.)
+    recent_q = (
+        db.query(models.Maintenance)
+        .join(models.MaintenancePlan)
+        .filter(
+            models.Maintenance.status == "completed",
+            models.MaintenancePlan.is_active == True,  # noqa: E712
+            models.MaintenancePlan.is_catalog_only == False,  # noqa: E712
+        )
+    )
     if user.role == "technician":
         recent_q = recent_q.filter(
             (models.Maintenance.assigned_to_id == user.id)
@@ -4632,6 +4787,8 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     recent_completed = (
         recent_q.order_by(models.Maintenance.completed_at.desc()).limit(5).all()
     )
+    for m in recent_completed:
+        m.covered_tiers = services.compute_covered_tiers(m)
 
     # Plan ve araç bazlı özetlerdeki bekleyen/devam eden sayıları da
     # deduped_open'dan hesaplanır — aksi halde bir aracın hem küçük hem büyük
@@ -4687,7 +4844,6 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
 
     return schemas.DashboardOut(
         vehicle_count=vehicle_count,
-        active_vehicle_count=active_vehicle_count,
         pending_count=pending_count,
         in_progress_count=in_progress_count,
         completed_count=completed_count,

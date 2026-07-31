@@ -4,6 +4,8 @@ import type { KmSimConfig, KmSimRunResult, Maintenance, UpcomingItem, User, Vehi
 import { STATUS_TR } from '../types'
 import { PageHeader, Badge, SearchInput, EmptyState, SkeletonTableRows, StatCard } from '../components/ui'
 import { showToast } from '../components/toast'
+import { useLiveEvent } from '../liveEvents'
+import { targetLabel } from '../format'
 import {
   ArrowLeft,
   Truck,
@@ -178,7 +180,7 @@ function KmSimCard({ onChanged }: { onChanged: () => void }) {
           {pendingDays > 0 ? `Otomatik Güncelle (+${pendingDays} gün)` : 'Güncel'}
         </button>
         <span className="muted" style={{ marginLeft: 'auto' }}>
-          {cfg.active_vehicles} aktif araç
+          {cfg.vehicle_count} araç
           {cfg.last_date && <> · Son otomatik gün: {cfg.last_date}</>}
         </span>
       </div>
@@ -199,8 +201,7 @@ const remainingDisplayV = (u: UpcomingItem) =>
       ? `${Math.abs(u.remaining_km)} gün geçti`
       : `${u.remaining_km} gün kaldı`
     : kmDisplayV(u.remaining_km)
-const hedefLabelV = (m: Maintenance) =>
-  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+const hedefLabelV = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
 
 // ---------------------------------------------------------- Araç Profil Sayfası
 function InfoField({ label, value }: { label: string; value: React.ReactNode }) {
@@ -247,6 +248,10 @@ function VehicleDetail({
       .catch(() => setHistory([]))
   }
   useEffect(load, [vehicle.id])
+  // Bu araca ait bir bakım başka bir sayfada (Bakımlar) tamamlanır/açılırsa
+  // profil burada açıkken de otomatik tazelensin — aksi halde "Yaklaşan
+  // Bakım"/geçmiş, kullanıcı sayfayı yeniden açana kadar bayat kalır.
+  useLiveEvent(['maintenance', 'vehicle'], load)
 
   const v = profile?.vehicle ?? vehicle
 
@@ -357,7 +362,6 @@ function VehicleDetail({
                 <span className="vehicle-code">{v.code}</span>
                 {v.name && <span className="muted"> — {v.name}</span>}
               </h1>
-              <Badge tone={v.is_active ? 'completed' : 'neutral'}>{v.is_active ? 'Aktif' : 'Pasif'}</Badge>
             </div>
             <div className="vprofile-meta">
               <InfoField label="Anlık KM" value={<strong>{fmtKm(v.current_km)} km</strong>} />
@@ -430,7 +434,15 @@ function VehicleDetail({
               ? remainingDisplayV(profile.next_upcoming)
               : 'Yok'
           }
-          tone={profile?.next_upcoming?.critical ? 'danger' : undefined}
+          tone={
+            profile?.next_upcoming?.status === 'gecikti'
+              ? 'danger'
+              : profile?.next_upcoming?.status === 'planlanacak'
+                ? 'pending'
+                : profile?.next_upcoming?.status === 'planlandi'
+                  ? 'in_progress'
+                  : undefined
+          }
           icon={<AlertTriangle size={16} />}
         />
       </div>
@@ -615,7 +627,6 @@ export default function VehiclesPage({
   const fileRef = useRef<HTMLInputElement>(null)
 
   const [search, setSearch] = useState('')
-  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'inactive'>('active')
   const [modelFilter, setModelFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [knownModels, setKnownModels] = useState<string[]>([])
@@ -650,6 +661,12 @@ export default function VehiclesPage({
   useEffect(() => {
     load()
   }, [])
+  // Bir bakım başka bir sayfada (Bakımlar) tamamlanınca/açılınca bu
+  // listedeki "Çok Kritik/Yaklaşıyor" rozetleri ve araç listesi otomatik
+  // güncellensin — önceden yalnızca sayfa ilk açıldığında yükleniyordu,
+  // bu yüzden tamamlanan bir bakım Araçlar sayfasını etkilemiyordu (kullanıcı
+  // manuel olarak sayfayı yeniden açana kadar eski/kritik rozet kalıyordu).
+  useLiveEvent(['maintenance', 'vehicle'], load)
 
   // Global aramadan bir araç profili açılmak istendiğinde doğrudan o
   // aracın detayına geç. initialVehicleId null'a döndüğünde
@@ -670,12 +687,25 @@ export default function VehiclesPage({
     return m
   }, [alerts])
 
-  const urgentCount = useMemo(
-    () => Array.from(alertByVehicleId.values()).filter((a) => a.urgent).length,
+  // Araçların "sonraki ilk bakım" durumu — 4 sabit kategori (kullanıcının
+  // onayladığı tanım): Yaklaşıyor (<=5.000 km kaldı), Planlanacak (bakım
+  // takip periyodu içinde ve henüz planlanmadı), Planlandı (aynı pencere
+  // içinde ve zaten bir iş emri açılmış), Bakım gecikti (periyot aşılmış).
+  // Bkz. backend services._classify_upcoming_status.
+  const approachingCount = useMemo(
+    () => Array.from(alertByVehicleId.values()).filter((a) => a.status === 'yaklasiyor').length,
     [alertByVehicleId],
   )
-  const criticalCount = useMemo(
-    () => Array.from(alertByVehicleId.values()).filter((a) => a.critical).length,
+  const toPlanCount = useMemo(
+    () => Array.from(alertByVehicleId.values()).filter((a) => a.status === 'planlanacak').length,
+    [alertByVehicleId],
+  )
+  const plannedCount = useMemo(
+    () => Array.from(alertByVehicleId.values()).filter((a) => a.status === 'planlandi').length,
+    [alertByVehicleId],
+  )
+  const overdueCount = useMemo(
+    () => Array.from(alertByVehicleId.values()).filter((a) => a.status === 'gecikti').length,
     [alertByVehicleId],
   )
 
@@ -693,8 +723,6 @@ export default function VehiclesPage({
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     const base = (list ?? []).filter((v) => {
-      if (statusFilter === 'active' && !v.is_active) return false
-      if (statusFilter === 'inactive' && v.is_active) return false
       if (modelFilter && v.model !== modelFilter) return false
       if (q && !(
         v.code.toLowerCase().includes(q) ||
@@ -706,7 +734,7 @@ export default function VehiclesPage({
     })
     // Favori araçlar her zaman listenin en üstünde — mühendis sürekli aynı
     return [...base].sort((a, b) => Number(favIds.includes(b.id)) - Number(favIds.includes(a.id)))
-  }, [list, search, statusFilter, modelFilter, favIds])
+  }, [list, search, modelFilter, favIds])
 
   const recentVehicles = useMemo(
     () => recentIds.map((id) => (list ?? []).find((v) => v.id === id)).filter((v): v is Vehicle => !!v),
@@ -798,11 +826,7 @@ export default function VehiclesPage({
   async function handleExport() {
     setError('')
     try {
-      // Tablodaki durum filtresiyle (Tümü/Yalnızca Aktif/Yalnızca Pasif)
-      // aynı kapsamda dışa aktarır — önceden bu seçim yalnızca ekrandaki
-      // tabloyu etkiliyordu, indirilen Excel her zaman filtreden bağımsız
-      // TÜM araçları içeriyordu.
-      await apiDownload(`/vehicles/export?status=${statusFilter}`, 'araclar.xlsx')
+      await apiDownload('/vehicles/export', 'araclar.xlsx')
     } catch (err) {
       setError((err as Error).message)
     }
@@ -852,18 +876,9 @@ export default function VehiclesPage({
               />
             </label>
             {perms.export_excel && (
-              <button
-                onClick={handleExport}
-                title={
-                  statusFilter === 'all'
-                    ? 'Tüm araçlar (aktif + pasif) indirilir'
-                    : statusFilter === 'active'
-                      ? 'Yalnızca aktif araçlar indirilir — aşağıdaki tablo filtresini "Tümü" yapın diğerlerini de dahil etmek için'
-                      : 'Yalnızca pasif araçlar indirilir — aşağıdaki tablo filtresini "Tümü" yapın diğerlerini de dahil etmek için'
-                }
-              >
+              <button onClick={handleExport} title="Tüm araçlar indirilir">
                 <Download size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
-                Excel'e Aktar ({statusFilter === 'all' ? 'Tümü' : statusFilter === 'active' ? 'Aktif' : 'Pasif'})
+                Excel'e Aktar
               </button>
             )}
           </div>
@@ -932,11 +947,6 @@ export default function VehiclesPage({
       <div className="table-card fade-in vehicle-list-card">
         <div className="table-toolbar vehicle-toolbar">
           <SearchInput value={search} onChange={setSearch} placeholder="Kod, ad, üretici veya model ara…" />
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as typeof statusFilter)}>
-            <option value="active">Yalnızca Aktif</option>
-            <option value="inactive">Yalnızca Pasif</option>
-            <option value="all">Tümü</option>
-          </select>
           <select
             className="vehicle-model-filter"
             value={modelFilter}
@@ -953,19 +963,24 @@ export default function VehiclesPage({
               Tip filtresini temizle
             </button>
           )}
-          {alerts.length > 0 && (
+          {approachingCount > 0 && (
             <span className="alert-pill">
-              <AlertTriangle size={12} /> {alertByVehicleId.size} araçta bakım yaklaşıyor
+              <AlertTriangle size={12} /> {approachingCount} araçta bakım yaklaşıyor (&le;5.000 km)
             </span>
           )}
-          {urgentCount > 0 && (
-            <span className="urgent-pill">
-              <AlertTriangle size={12} /> {urgentCount} araçta kritik (periyodun %15'inden az kaldı)
+          {toPlanCount > 0 && (
+            <span className="toplan-pill">
+              <AlertTriangle size={12} /> {toPlanCount} araç planlanacak (bakım takip periyodunda, henüz planlanmadı)
             </span>
           )}
-          {criticalCount > 0 && (
+          {plannedCount > 0 && (
+            <span className="planned-pill">
+              <AlertTriangle size={12} /> {plannedCount} araç planlandı (iş emri açıldı)
+            </span>
+          )}
+          {overdueCount > 0 && (
             <span className="critical-pill">
-              <AlertTriangle size={12} /> {criticalCount} araçta çok kritik (periyodun %5'inden az kaldı)
+              <AlertTriangle size={12} /> {overdueCount} araçta bakım gecikti
             </span>
           )}
           <span className="muted" style={{ marginLeft: 'auto' }}>
@@ -981,7 +996,7 @@ export default function VehiclesPage({
                 <th>Anlık KM</th>
                 <th>Üretici / Model</th>
                 <th>Son Güncelleme</th>
-                <th>Durum</th>
+                <th>Bakım Uyarısı</th>
                 <th style={{ width: 260 }}>KM Güncelle</th>
                 <th></th>
               </tr>
@@ -990,7 +1005,17 @@ export default function VehiclesPage({
               {list === null && <SkeletonTableRows columns={8} />}
               {list !== null && filtered.map((v) => {
                 const alert = alertByVehicleId.get(v.id)
-                const rowClass = alert ? (alert.critical ? 'critical-row' : alert.urgent ? 'urgent-row' : 'alert-row') : ''
+                const rowClass = alert
+                  ? alert.status === 'gecikti'
+                    ? 'critical-row'
+                    : alert.status === 'planlanacak'
+                      ? 'toplan-row'
+                      : alert.status === 'planlandi'
+                        ? 'planned-row'
+                        : alert.status === 'yaklasiyor'
+                          ? 'alert-row'
+                          : ''
+                  : ''
                 const isFav = favIds.includes(v.id)
                 return (
                   <tr key={v.id} className={rowClass}>
@@ -1014,19 +1039,26 @@ export default function VehiclesPage({
                     <td>{fmt(v.last_km_update_at)}</td>
                     <td>
                       {alert ? (
-                        alert.critical ? (
+                        alert.status === 'gecikti' ? (
                           <span
                             className="critical-pill"
-                            title={`${alert.plan_name} — ${remainingDisplayV(alert)}, tahmini ~${alert.estimated_days} gün`}
+                            title={`${alert.plan_name} — ${remainingDisplayV(alert)} geçti, bakım periyodu aşıldı`}
                           >
-                            <AlertTriangle size={12} /> Çok Kritik!
+                            <AlertTriangle size={12} /> Bakım Gecikti!
                           </span>
-                        ) : alert.urgent ? (
+                        ) : alert.status === 'planlanacak' ? (
                           <span
-                            className="urgent-pill"
-                            title={`${alert.plan_name} yaklaşıyor (${remainingDisplayV(alert)}, tahmini ~${alert.estimated_days} gün)`}
+                            className="toplan-pill"
+                            title={`${alert.plan_name} bakım takip periyoduna girdi (${remainingDisplayV(alert)}) — henüz planlanmadı`}
                           >
-                            <AlertTriangle size={12} /> ~{alert.estimated_days} Gün Kaldı!
+                            <AlertTriangle size={12} /> Planlanacak
+                          </span>
+                        ) : alert.status === 'planlandi' ? (
+                          <span
+                            className="planned-pill"
+                            title={`${alert.plan_name} bakım takip periyodunda (${remainingDisplayV(alert)}) — iş emri açıldı`}
+                          >
+                            <AlertTriangle size={12} /> Planlandı
                           </span>
                         ) : (
                           <span className="alert-pill" title={`${alert.plan_name} yaklaşıyor (${remainingDisplayV(alert)})`}>
@@ -1034,7 +1066,7 @@ export default function VehiclesPage({
                           </span>
                         )
                       ) : (
-                        <Badge tone={v.is_active ? 'completed' : 'neutral'}>{v.is_active ? 'Aktif' : 'Pasif'}</Badge>
+                        <span className="muted">—</span>
                       )}
                     </td>
                     <td>

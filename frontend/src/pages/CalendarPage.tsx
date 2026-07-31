@@ -4,12 +4,12 @@ import type { Maintenance } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Tabs, EmptyState, Badge } from '../components/ui'
 import { ChevronLeft, ChevronRight, CalendarDays, Wrench, PlayCircle } from 'lucide-react'
+import { targetLabel } from '../format'
 
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
 // Süre bazlı (aylık/yıllık) aday iş emirlerinde gerçek hedef target_date'de —
 // backend km alanını bu durumda gizler (null).
-const hedefLabel = (m: Maintenance) =>
-  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+const hedefLabel = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
 
 const DAILY_KM = 300
 

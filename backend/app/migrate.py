@@ -28,6 +28,11 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("plan_id", "INTEGER"),
         ("note", "TEXT DEFAULT ''"),
         ("card_code", "VARCHAR(50) DEFAULT ''"),
+        # ÖNEMLİ: default '1' (TRUE) — bu sütun eklenmeden ÖNCE var olan tüm
+        # ağaç maddeleri geriye dönük uyumluluk için "zorunlu" sayılmaya
+        # devam eder (davranış değişmez); yalnızca BUNDAN SONRA admin/
+        # mühendis/amir açıkça "zorunlu değil" işaretlerse farklılaşır.
+        ("is_mandatory", "BOOLEAN DEFAULT 1"),
     ],
     "maintenance_items": [
         ("source_node_id", "INTEGER"),

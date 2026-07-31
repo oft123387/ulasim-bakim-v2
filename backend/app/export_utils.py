@@ -392,6 +392,9 @@ def build_kpi_workbook(report: dict, title: str = "KPI Raporu") -> bytes:
     ws.append(["Tamamlanma Oranı (%)", c["completion_rate_pct"]])
     ws.append(["Aralıkta Tamamlanan (toplam)", c["completed_in_range"]])
     ws.append(["Ortalama Tamamlanma Süresi (gün)", c["avg_completion_days"] if c["avg_completion_days"] is not None else "-"])
+    ws.append(["Zamanında Tamamlanan Bakım", c["on_time_count"]])
+    ws.append(["Değerlendirilen Bakım (periyodu belirsiz olanlar hariç)", c["on_time_evaluated"]])
+    ws.append(["Zamanında Bakım Yapılan Araç Oranı (%)", c["on_time_rate_pct"] if c["on_time_rate_pct"] is not None else "-"])
     ws.append([])
     cr = report["critical"]
     ws.append(["Geciken/Kritik Bakımlar (güncel durum, tarih aralığından bağımsız)"])
@@ -399,7 +402,7 @@ def build_kpi_workbook(report: dict, title: str = "KPI Raporu") -> bytes:
     ws.append(["Kritik", cr["urgent_count"]])
     ws.append(["Çok Kritik", cr["very_critical_count"]])
     ws.append(["Gecikmiş (hedefi aşmış)", cr["overdue_count"]])
-    for row in (4, 13):
+    for row in (4, 14):
         ws.cell(row=row, column=1).font = excel_utils._HEADER_FONT
     ws.cell(row=1, column=1).font = excel_utils._HEADER_FONT
     _widths(ws, [38, 16])

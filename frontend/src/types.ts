@@ -24,7 +24,6 @@ export interface Vehicle {
   code: string
   name: string
   current_km: number
-  is_active: boolean
   manufacturer: string
   model: string
   chassis_no: string
@@ -92,8 +91,23 @@ export interface TreeNode {
   // Toplu bakım kataloğu içe aktarmasından gelen üretici kart/talimat kodu
   // (ör. "SKA-MRM-07-A05"). Boşsa rozet gösterilmez.
   card_code: string
+  // False ise bu madde "zorunlu değil" işaretlenmiştir — yeni açılan iş
+  // emirlerinde otomatik tikli gelir (usta elle dokunmasına gerek kalmaz).
+  // Varsayılan (ve mevcut tüm eski maddeler) true'dur — davranış değişmez.
+  is_mandatory: boolean
   children: TreeNode[]
   attachments: NodeAttachment[]
+}
+
+// Bir madde belirli bir ARAÇ için genel is_mandatory varsayılanından farklı
+// davranmasını sağlayan istisna (ör. genelde zorunlu bir madde, yalnızca
+// 3805 nolu araçta zorunlu değil).
+export interface TreeNodeVehicleException {
+  id: number
+  node_id: number
+  vehicle: Vehicle
+  is_mandatory: boolean
+  created_at: string
 }
 
 // Bir bakım ağacı maddesi tamamlanınca hangi parçadan kaç adet otomatik
@@ -172,6 +186,9 @@ export interface UpcomingItem {
   urgent?: boolean
   critical?: boolean
   maintenance_id?: number | null
+  // 4 durumlu sınıflandırma (bkz. backend services._classify_upcoming_status):
+  // "yaklasiyor" | "planlanacak" | "planlandi" | "gecikti" | null.
+  status?: 'yaklasiyor' | 'planlanacak' | 'planlandi' | 'gecikti' | null
 }
 
 export interface CalendarProjection {
@@ -204,7 +221,6 @@ export interface VehicleSummary {
 
 export interface Dashboard {
   vehicle_count: number
-  active_vehicle_count: number
   pending_count: number
   in_progress_count: number
   completed_count: number
@@ -228,7 +244,6 @@ export interface SystemStatus {
   started_at: string
   uptime_seconds: number
   vehicle_count: number
-  active_vehicle_count: number
   user_count: number
   plan_count: number
   catalog_only_plan_count: number
@@ -401,7 +416,7 @@ export interface KmSimConfig {
   min_km: number
   max_km: number
   last_date: string | null
-  active_vehicles: number
+  vehicle_count: number
 }
 
 export interface KmSimRunResult {
@@ -712,6 +727,13 @@ export interface KPICompletion {
   completion_rate_pct: number
   completed_in_range: number
   avg_completion_days: number | null
+  // Zamanında tamamlanan bakım oranı: (100 * zamanında tamamlanan) /
+  // (periyodu belirsiz olmayan, değerlendirilen bakım). Km bazlı planlarda
+  // km_at_open<=target_km, süre bazlı planlarda completed_at<=target_date
+  // ölçütü kullanılır — bkz. backend services.compute_kpi_report.
+  on_time_count: number
+  on_time_evaluated: number
+  on_time_rate_pct: number | null
 }
 
 export interface KPICritical {

@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import type { Dashboard, Maintenance, UpcomingItem, User } from '../types'
+import type { Dashboard, UpcomingItem, User } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, StatCard, CircularProgress, Badge, EmptyState, Skeleton } from '../components/ui'
 import ParticleNetwork from '../components/ParticleNetwork'
 import { useLiveEvent } from '../liveEvents'
+import { targetLabel, rawTargetLabel, mergedPeriodLabel } from '../format'
 import {
   Truck,
   Clock,
@@ -42,10 +43,7 @@ const remainingDisplay = (u: UpcomingItem) =>
       ? `${Math.abs(u.remaining_km)} gün geçti`
       : `${u.remaining_km} gün kaldı`
     : kmDisplay(u.remaining_km)
-const hedefDisplay = (u: UpcomingItem) =>
-  u.target_date ? new Date(u.target_date).toLocaleDateString('tr-TR') : fmtKm(u.target_km)
-const hedefLabel = (m: Maintenance) =>
-  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+const hedefDisplay = (u: UpcomingItem) => targetLabel(u.target_km, u.target_date, u.vehicle.model)
 
 type NavTarget = 'vehicles' | 'plans' | 'tree' | 'users' | 'history'
 
@@ -405,9 +403,11 @@ export default function DashboardPage({
                   </span>
                   <span style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ fontWeight: 600, fontSize: 13.5 }}>
-                      {m.vehicle.code} · {hedefLabel(m)}
+                      {m.vehicle.code} · {mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}
                     </div>
-                    <div className="muted" style={{ fontSize: 12 }}>{fmt(m.completed_at)}</div>
+                    <div className="muted" style={{ fontSize: 12 }}>
+                      {rawTargetLabel(m.target_km, m.target_date)} · {fmt(m.completed_at)}
+                    </div>
                   </span>
                   <Badge tone="completed">{STATUS_TR.completed}</Badge>
                 </div>

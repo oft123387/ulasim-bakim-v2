@@ -139,6 +139,55 @@ CRITICAL_WITHIN_KM = 1000
 KRITIK_PCT_OF_INTERVAL = 15.0
 COK_KRITIK_PCT_OF_INTERVAL = 5.0
 
+# ---------------------------------------------------------------------------
+# Araçlar sayfasındaki "sonraki ilk bakım" durumu için 4 sabit kategori
+# (kullanıcının onayladığı somut tanım):
+#   Yaklaşıyor     : hedefe kalan km <= 5.000 (henüz "bakım takip periyodu"
+#                    penceresine girmemiş, ama uzaktan görülüyor).
+#   Planlanacak    : "bakım takip periyodu" penceresi içinde VE henüz bir iş
+#                    emri açılıp başlatılmamış.
+#   Planlandı      : aynı pencere içinde VE zaten bir iş emri açılıp
+#                    başlatılmış (is_activated=True).
+#   Bakım gecikti  : araç bu pencerenin de ötesine geçmiş (hedefi aşmış).
+#
+# "Bakım takip periyodu" = planın KENDİ (periyoda oranlı, MAX_TOLERANCE_KM'de
+# tavanlanan) önizleme penceresi (bkz. PREVIEW_LOWER_PCT/PREVIEW_UPPER_PCT
+# yukarıda) — kullanıcının verdiği "(-3000, +3000)" örneği, bu pencerenin
+# büyük periyotlarda ulaştığı tavan (cap) değeridir; küçük periyotlarda
+# (ör. 1M/3M) pencere zaten daha dardır, bu doğal olarak korunur.
+#
+# Süre bazlı (aylık/yıllık) planlarda karşılık gelen birim km değil gündür;
+# burada YENİ bir sabit icat etmek yerine önceden var olan URGENT_WITHIN_DAYS
+# (14 gün, "Yaklaşıyor" dış sınırı) ve CRITICAL_WITHIN_DAYS (7 gün, takip
+# penceresinin yarı genişliği) sabitleri aynı anlamla yeniden kullanılır.
+APPROACHING_WITHIN_KM = 5000.0
+
+
+def _classify_upcoming_status(
+    remaining: float, lower_offset: float, upper_offset: float,
+    approaching_offset: float, is_started: bool,
+) -> str | None:
+    """Yukarıdaki 4 kategoriyi tek bir yerde hesaplayan ortak yardımcı —
+    hem km hem süre bazlı `compute_upcoming_*` fonksiyonlarınca kullanılır.
+
+    `remaining`: hedefe kalan (km ya da gün, İMZALI — negatifse hedef
+    aşılmış demektir). `lower_offset`/`upper_offset`: "bakım takip
+    periyodu" penceresinin hedefin ÖNCESİ/SONRASI yarı genişlikleri.
+    `approaching_offset`: pencerenin dışında ama hâlâ "Yaklaşıyor"
+    sayılacağı üst sınır (km: APPROACHING_WITHIN_KM, süre: URGENT_WITHIN_DAYS).
+    `is_started`: gerçekten açılıp başlatılmış (is_activated=True) bir iş
+    emri var mı — pencere içindeyken Planlandı/Planlanacak ayrımını belirler.
+
+    Döner: "gecikti" | "planlandi" | "planlanacak" | "yaklasiyor" | None
+    (None: henüz hiçbir uyarı gösterilecek kadar yakın değil)."""
+    if remaining < -upper_offset:
+        return "gecikti"
+    if remaining <= lower_offset:
+        return "planlandi" if is_started else "planlanacak"
+    if remaining <= approaching_offset:
+        return "yaklasiyor"
+    return None
+
 
 def plan_window(plan: "models.MaintenancePlan", target: int) -> tuple[float, float]:
     """Bir planın belirli bir hedef km için açılma (tolerans) penceresini
@@ -205,7 +254,7 @@ def check_and_open_maintenances(
         p for p in plans
         if p.interval_km > 0
         and not p.is_catalog_only
-        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+        and _model_matches(p.vehicle_model, vehicle.model)
     ]
     if not active_plans:
         return opened
@@ -275,6 +324,30 @@ def _is_sirio_model(vehicle_model: str | None) -> bool:
     if not vehicle_model:
         return False
     return "sirio" in vehicle_model.translate(_TR_MAP).lower()
+
+
+def _norm_model(s: str | None) -> str:
+    """Bir araç modeli adını karşılaştırmaya uygun, normalize edilmiş hale
+    getirir: baştaki/sondaki boşluklar kırpılır, Türkçe karakterler
+    (İ/I/ı/i, ş/Ş, ç/Ç, ...) ASCII karşılıklarına çevrilir ve küçük harfe
+    indirilir (bkz. _TR_MAP/_is_sirio_model — aynı normalizasyon)."""
+    return (s or "").strip().translate(_TR_MAP).lower()
+
+
+def _model_matches(plan_vehicle_model: str | None, vehicle_model: str | None) -> bool:
+    """Bir planın `vehicle_model`'inin, verilen aracın modeliyle uygulanabilir
+    olup olmadığını belirler. Boş/None `plan_vehicle_model` HER ZAMAN
+    uygulanabilirdir ("Genel / Tüm Araçlar" planı). Aksi halde karşılaştırma
+    büyük/küçük harf, baş/son boşluk ve Türkçe karakter farklarından
+    BAĞIMSIZ yapılır — aksi halde ör. "Sirio" / "SİRİO" / "Sirio " gibi salt
+    yazım farkı olan bir plan, aracın modeliyle görsel olarak aynı görünse
+    bile birebir (==) karşılaştırmada sessizce eşleşmeyip TÜM kademeli/
+    otomatik-açma/yaklaşan-bakım hesaplarından dışlanabiliyordu (kullanıcı
+    geri bildirimi: bir "3M" planı, aynı modeldeki 1M/6M planlarıyla birlikte
+    birleşik bakıma dahil olması gerekirken sessizce dışlanıyordu)."""
+    if not plan_vehicle_model:
+        return True
+    return _norm_model(plan_vehicle_model) == _norm_model(vehicle_model)
 
 
 # Sirio km-tolerans tablosundaki periyot kodlarıyla BİREBİR aynı birim
@@ -425,7 +498,7 @@ def check_and_open_time_maintenances(
         p for p in plans
         if p.interval_months and p.interval_months > 0
         and not p.is_catalog_only
-        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+        and _model_matches(p.vehicle_model, vehicle.model)
     ]
     if not active_plans:
         return opened
@@ -485,11 +558,11 @@ def check_and_open_time_maintenances(
 def check_and_open_time_maintenances_all_vehicles(db: Session) -> list[models.Maintenance]:
     """Zamanlanmış arka plan görevinin çağırdığı toplu kontrol — bkz.
     main.py `_time_maintenance_background_loop` (km-sim/backup ile aynı
-    desen). Her aktif ve hizmete başlama tarihi tanımlı araç için çalışır."""
+    desen). Hizmete başlama tarihi tanımlı her araç için çalışır."""
     opened: list[models.Maintenance] = []
     vehicles = (
         db.query(models.Vehicle)
-        .filter(models.Vehicle.is_active == True, models.Vehicle.commissioning_date.isnot(None))  # noqa: E712
+        .filter(models.Vehicle.commissioning_date.isnot(None))
         .all()
     )
     for v in vehicles:
@@ -507,11 +580,9 @@ def create_manual_time_maintenance(
     """create_manual_maintenance'ın süre planları için karşılığı."""
     if plan.plan_type != "time":
         raise ValueError("Bu plan süre bazlı değil — target_date yerine target_km kullanın")
-    if not vehicle.is_active:
-        raise ValueError(f"{vehicle.code} aracı pasif — pasif bir araç için bakım iş emri açılamaz")
     if not plan.is_active:
         raise ValueError(f"'{plan.name}' planı pasif — pasif bir plan için bakım iş emri açılamaz")
-    if plan.vehicle_model and plan.vehicle_model != vehicle.model:
+    if plan.vehicle_model and not _model_matches(plan.vehicle_model, vehicle.model):
         raise ValueError(
             f"'{plan.name}' planı yalnızca '{plan.vehicle_model}' modeli için tanımlı — "
             f"{vehicle.code} bu modelde değil ({vehicle.model or 'model belirtilmemiş'})"
@@ -623,11 +694,9 @@ def create_manual_maintenance(
     işlemi olduğundan doğrudan is_activated=True ile oluşturulur."""
     if target_km <= 0:
         raise ValueError("Hedef km 0'dan büyük olmalı")
-    if not vehicle.is_active:
-        raise ValueError(f"{vehicle.code} aracı pasif — pasif bir araç için bakım iş emri açılamaz")
     if not plan.is_active:
         raise ValueError(f"'{plan.name}' planı pasif — pasif bir plan için bakım iş emri açılamaz")
-    if plan.vehicle_model and plan.vehicle_model != vehicle.model:
+    if plan.vehicle_model and not _model_matches(plan.vehicle_model, vehicle.model):
         raise ValueError(
             f"'{plan.name}' planı yalnızca '{plan.vehicle_model}' modeli için tanımlı — "
             f"{vehicle.code} bu modelde değil ({vehicle.model or 'model belirtilmemiş'})"
@@ -676,7 +745,7 @@ def create_manual_maintenance(
     active_plans = [
         p for p in db.query(models.MaintenancePlan).filter_by(is_active=True).all()
         if p.plan_type == "km" and p.interval_km > 0 and not p.is_catalog_only
-        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+        and _model_matches(p.vehicle_model, vehicle.model)
     ]
     applicable = [p for p in active_plans if target_km % p.interval_km == 0]
     if plan.id not in {p.id for p in applicable}:
@@ -714,6 +783,24 @@ def _plan_roots(db: Session, plan: models.MaintenancePlan) -> list[models.TreeNo
     return roots
 
 
+def _load_vehicle_mandatory_exceptions(db: Session, vehicle_id: int) -> dict[int, bool]:
+    """Bir araç için tanımlı tüm TreeNodeVehicleException'ları
+    {node_id: is_mandatory} sözlüğüne önceden yükler — ağaç kopyalanırken
+    düğüm başına ayrı bir sorgu atmamak için (bkz. _copy_tree_snapshot /
+    resync_maintenance_tiers)."""
+    return {
+        e.node_id: e.is_mandatory
+        for e in db.query(models.TreeNodeVehicleException).filter_by(vehicle_id=vehicle_id).all()
+    }
+
+
+def _node_is_mandatory_for_vehicle(node: models.TreeNode, exceptions: dict[int, bool]) -> bool:
+    """Bir düğümün bu araç için zorunlu olup olmadığı: önce araca özel bir
+    istisna var mı bakılır (varsa o geçerlidir), yoksa düğümün GENEL (tüm
+    araçlar) varsayılanı (TreeNode.is_mandatory) kullanılır."""
+    return exceptions.get(node.id, node.is_mandatory)
+
+
 def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: list[models.MaintenancePlan]) -> None:
     """Bakım ağacı şablon(lar)ını iş emrine kopyalar.
 
@@ -733,6 +820,7 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
     (PartHotspot, plana özel) doğru maddeye bağlanmaya devam eder.
     """
     ordered = sorted(applicable_plans, key=_plan_size)
+    mandatory_exceptions = _load_vehicle_mandatory_exceptions(db, m.vehicle_id)
 
     if len(ordered) <= 1:
         plan = ordered[0] if ordered else None
@@ -745,6 +833,11 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
                 source_node_id=node.id,
                 name=node.name,
                 order_index=node.order_index,
+                # Madde bu araç için "zorunlu değil" olarak işaretlenmişse
+                # (genel varsayılan ya da bu araca özel istisna üzerinden),
+                # iş emri açılır açılmaz otomatik tiklenmiş gelir — usta
+                # ekstra bir işlem yapmasına gerek kalmaz.
+                is_completed=not _node_is_mandatory_for_vehicle(node, mandatory_exceptions),
             )
             db.add(item)
             db.flush()
@@ -774,6 +867,7 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
                 source_node_id=node.id,
                 name=node.name,
                 order_index=idx,
+                is_completed=not _node_is_mandatory_for_vehicle(node, mandatory_exceptions),
             )
             db.add(item)
             db.flush()
@@ -822,7 +916,7 @@ def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
     active_plans = [
         p for p in db.query(models.MaintenancePlan).filter_by(is_active=True).all()
         if p.plan_type == "km" and p.interval_km > 0 and not p.is_catalog_only
-        and (not p.vehicle_model or p.vehicle_model == vehicle.model)
+        and _model_matches(p.vehicle_model, vehicle.model)
     ]
     applicable = [p for p in active_plans if m.target_km % p.interval_km == 0]
     if m.plan_id not in {p.id for p in applicable}:
@@ -866,6 +960,7 @@ def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
         order_counter[item.parent_id] = max(order_counter.get(item.parent_id, -1), item.order_index) + 1
 
     added = 0
+    mandatory_exceptions = _load_vehicle_mandatory_exceptions(db, m.vehicle_id)
 
     def ensure(node: models.TreeNode, parent_item: models.MaintenanceItem | None,
                parent_path: tuple[str, ...], km: int) -> tuple[models.MaintenanceItem, tuple[str, ...]]:
@@ -882,6 +977,7 @@ def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
                 source_node_id=node.id,
                 name=node.name,
                 order_index=idx,
+                is_completed=not _node_is_mandatory_for_vehicle(node, mandatory_exceptions),
             )
             db.add(item)
             db.flush()
@@ -928,7 +1024,7 @@ def compute_upcoming_maintenances(
              "remaining_km": int, "covered_tiers": list[int]}, ...]
     """
     if vehicles is None:
-        vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+        vehicles = db.query(models.Vehicle).all()
     if plans is None:
         plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
 
@@ -939,7 +1035,7 @@ def compute_upcoming_maintenances(
         # modeliyle birebir eşleşen planlar bu araç için değerlendirilir.
         active_plans = [
             p for p in plans
-            if p.interval_km > 0 and (not p.vehicle_model or p.vehicle_model == v.model)
+            if p.interval_km > 0 and _model_matches(p.vehicle_model, v.model)
         ]
         if not active_plans:
             continue
@@ -990,6 +1086,16 @@ def compute_upcoming_maintenances(
                 # due_now listesinde gösterdiği için burada atlar.
                 if not include_open or exists.status == "completed":
                     continue
+            elif include_open:
+                # Araçlar sayfası (include_open=True): "Yaklaşıyor" durumu
+                # planın dar otomatik-açma toleransından bağımsız olarak
+                # APPROACHING_WITHIN_KM (5.000 km) öncesinden başlamalı, ve
+                # "Bakım gecikti" durumu iş emri HİÇ açılmamış olsa bile (ne
+                # kadar aşılmış olursa olsun) gösterilebilmeli — bu yüzden
+                # burada yalnızca "henüz çok erken" (>5.000 km kala) adaylar
+                # elenir; ne kadar gecikmiş olduğuna üst sınır KONULMAZ.
+                if km < target - APPROACHING_WITHIN_KM:
+                    continue
             else:
                 # ÖNEMLİ: Önizleme penceresi (PREVIEW_LOWER/UPPER_PCT) yalnızca
                 # HENÜZ AÇILMAMIŞ adaylar için "yaklaşıyor mu?" kontrolüdür.
@@ -999,12 +1105,34 @@ def compute_upcoming_maintenances(
                 # önizleme penceresine takılıp listeden düşerse, o gerçek/
                 # bekleyen iş emri "yaklaşan bakım" olarak hiç görünmez ve
                 # yerine (yanlışlıkla) daha eski/aşılmış başka bir adayın
-                # gösterilmesine yol açar.
+                # gösterilmesine yol açar. Dashboard'un dar (limit=8) kutusu
+                # kalabalıklaşmasın diye burada (include_open=False) hâlâ
+                # planın KENDİ dar önizleme penceresi kullanılır.
                 lower_bound = target - min(governing.interval_km * PREVIEW_LOWER_PCT / 100, MAX_TOLERANCE_KM)
                 upper_bound = target + min(governing.interval_km * PREVIEW_UPPER_PCT / 100, MAX_TOLERANCE_KM)
                 if not (lower_bound <= km <= upper_bound):
                     continue
+            # "Bakım takip periyodu" penceresinin yarı genişlikleri (Yaklaşıyor/
+            # Planlanacak/Planlandı/Gecikti sınıflandırması için) — yukarıdaki
+            # lower_bound/upper_bound ile AYNI formül, ama artık `exists`
+            # dalından bağımsız olarak HER ZAMAN hesaplanır (o kontrol yalnızca
+            # henüz açılmamış adayları önizleme listesine alıp almamayı
+            # belirliyordu; durum sınıflandırması ise açılmış olsun olmasın
+            # her zaman gerekir).
+            window_lower_offset = min(governing.interval_km * PREVIEW_LOWER_PCT / 100, MAX_TOLERANCE_KM)
+            window_upper_offset = min(governing.interval_km * PREVIEW_UPPER_PCT / 100, MAX_TOLERANCE_KM)
             remaining_km = target - km
+            if not include_open and exists is None and remaining_km <= 0:
+                # Dashboard'daki "Yaklaşan Bakımlar" kutusu (include_open=
+                # False) yalnızca GERÇEKTEN yaklaşan (hedefe henüz ulaşılmamış)
+                # adayları göstermelidir. Hedefi çoktan geçmiş ama kimse
+                # "Başlat" demediği için hâlâ aday sayılan bir kayıt burada
+                # gösterilirse, sınırlı (limit=8) kutunun slotlarını işgal
+                # edip gerçekten yaklaşan başka bir aracı dışarıda bırakır —
+                # bu tür unutulmuş/başlatılmamış adaylar zaten Bakımlar
+                # sayfasındaki "Başlatılmayı Bekleyenler" listesinde ayrıca
+                # (aciliyet sırasına göre) görünür, burada tekrar gösterilmez.
+                continue
             # Günlük ortalama km varsayımıyla kaç güne kaldığı tahmini
             # (yalnızca bilgi amaçlı gösterim için — kritiklik artık buna
             # göre değil, aşağıdaki periyot-oranlı km eşiklerine göre belirlenir).
@@ -1019,6 +1147,14 @@ def compute_upcoming_maintenances(
             # doğal olarak kalıcıdır (bir kez tetiklenince geri dönmez).
             kritik_threshold_km = governing.interval_km * KRITIK_PCT_OF_INTERVAL / 100
             cok_kritik_threshold_km = governing.interval_km * COK_KRITIK_PCT_OF_INTERVAL / 100
+            # "Kritik/Çok Kritik" alarm rozeti yalnızca gerçekten AÇILMIŞ
+            # (is_activated=True) bir iş emri için gösterilir. Henüz kimse
+            # "Başlat" demediyse (exists burada None'dır — ya hiç kayıt yok
+            # ya da is_activated=False) hedef ne kadar geçilmiş olursa olsun
+            # yalnızca nötr "Bakım Yaklaşıyor" olarak görünür — aksi halde
+            # başlatılmayı bekleyen bir aday, sanki az önce tamamlanan bir
+            # bakımla ilgiliymiş gibi yanlışlıkla "hâlâ kritik" izlenimi verir.
+            is_started = exists is not None
             upcoming.append(
                 {
                     "vehicle": v,
@@ -1027,8 +1163,14 @@ def compute_upcoming_maintenances(
                     "remaining_km": remaining_km,
                     "covered_tiers": sorted(p.interval_km for p in applicable),
                     "estimated_days": estimated_days,
-                    "urgent": remaining_km <= kritik_threshold_km,
-                    "critical": remaining_km <= cok_kritik_threshold_km,
+                    "urgent": is_started and remaining_km <= kritik_threshold_km,
+                    "critical": is_started and remaining_km <= cok_kritik_threshold_km,
+                    # Yaklaşıyor/Planlanacak/Planlandı/Bakım gecikti — bkz.
+                    # _classify_upcoming_status docstring'i.
+                    "status": _classify_upcoming_status(
+                        remaining_km, window_lower_offset, window_upper_offset,
+                        APPROACHING_WITHIN_KM, is_started,
+                    ),
                     # Zaten açılmış (Bekliyor/Devam Ediyor) gerçek bir iş
                     # emrine karşılık geliyorsa o kaydın id'si; henüz
                     # açılmamış (yalnızca yaklaşan önizleme) bir aday ise None.
@@ -1086,7 +1228,7 @@ def compute_upcoming_time_maintenances(
         kuralıyla birebir uyumlu kalır.
       - target_date: gerçek takvim tarihi (yalnızca süre bakımlarında dolu)."""
     if vehicles is None:
-        vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+        vehicles = db.query(models.Vehicle).all()
     if plans is None:
         plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
     today = date.today()
@@ -1099,7 +1241,7 @@ def compute_upcoming_time_maintenances(
         active_plans = [
             p for p in plans
             if p.plan_type == "time" and p.interval_months
-            and (not p.vehicle_model or p.vehicle_model == v.model)
+            and _model_matches(p.vehicle_model, v.model)
         ]
         if not active_plans:
             continue
@@ -1128,17 +1270,36 @@ def compute_upcoming_time_maintenances(
             )
             if exists is not None and not exists.is_activated:
                 exists = None
+            target_date = add_months(v.commissioning_date, target)
+            signed_days = (target_date - today).days
             if exists is not None:
                 if not include_open or exists.status == "completed":
+                    continue
+            elif include_open:
+                # Araçlar sayfası: bkz. compute_upcoming_maintenances'daki
+                # AYNI genişletme — "Yaklaşıyor" durumu ay bazlı dar
+                # önizleme penceresinden bağımsız olarak URGENT_WITHIN_DAYS
+                # (14 gün) öncesinden başlamalı, "Bakım gecikti" durumu ise
+                # iş emri hiç açılmamış olsa bile (ne kadar gecikmiş olursa
+                # olsun) gösterilebilmeli.
+                if signed_days > URGENT_WITHIN_DAYS:
                     continue
             else:
                 lower_bound = target - governing.interval_months * PREVIEW_LOWER_PCT / 100
                 upper_bound = target + governing.interval_months * PREVIEW_UPPER_PCT / 100
                 if not (lower_bound <= elapsed <= upper_bound):
                     continue
-            target_date = add_months(v.commissioning_date, target)
-            signed_days = (target_date - today).days
+            if not include_open and exists is None and signed_days <= 0:
+                # Bkz. compute_upcoming_maintenances — aynı kural: Dashboard
+                # kutusu yalnızca gerçekten yaklaşan (henüz tarihi gelmemiş)
+                # adayları gösterir, başlatılmamış+tarihi çoktan geçmiş
+                # adaylar burada değil "Başlatılmayı Bekleyenler"de görünür.
+                continue
             estimated_days = max(0, signed_days)
+            # Bkz. compute_upcoming_maintenances — aynı kural: henüz
+            # "Başlat" denmemiş bir aday hiçbir zaman kritik/çok kritik
+            # rozetiyle gösterilmez, yalnızca nötr "yaklaşıyor" olarak görünür.
+            is_started = exists is not None
             upcoming.append(
                 {
                     "vehicle": v,
@@ -1148,8 +1309,16 @@ def compute_upcoming_time_maintenances(
                     "target_date": target_date,
                     "covered_tiers": sorted(p.interval_months for p in applicable),
                     "estimated_days": estimated_days,
-                    "urgent": signed_days <= URGENT_WITHIN_DAYS,
-                    "critical": signed_days <= CRITICAL_WITHIN_DAYS,
+                    "urgent": is_started and signed_days <= URGENT_WITHIN_DAYS,
+                    "critical": is_started and signed_days <= CRITICAL_WITHIN_DAYS,
+                    # Yaklaşıyor/Planlanacak/Planlandı/Bakım gecikti — km
+                    # tarafındaki APPROACHING_WITHIN_KM/pencere yerine burada
+                    # gün bazlı mevcut sabitler (URGENT_WITHIN_DAYS=dış sınır,
+                    # CRITICAL_WITHIN_DAYS=pencere yarı genişliği) kullanılır.
+                    "status": _classify_upcoming_status(
+                        signed_days, CRITICAL_WITHIN_DAYS, CRITICAL_WITHIN_DAYS,
+                        URGENT_WITHIN_DAYS, is_started,
+                    ),
                     "maintenance_id": exists.id if exists is not None else None,
                 }
             )
@@ -1200,7 +1369,7 @@ def compute_maintenance_calendar_projections(
              (ISO tarih), "status" (iş emri durumu ya da None), "maintenance_id"}]
     """
     if vehicles is None:
-        vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+        vehicles = db.query(models.Vehicle).all()
     if plans is None:
         plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
 
@@ -1214,7 +1383,7 @@ def compute_maintenance_calendar_projections(
         # modeliyle birebir eşleşen planlar bu araç için değerlendirilir.
         active_plans = [
             p for p in plans
-            if p.interval_km > 0 and (not p.vehicle_model or p.vehicle_model == v.model)
+            if p.interval_km > 0 and _model_matches(p.vehicle_model, v.model)
         ]
         # Hem henüz geçilmemiş bir sonraki hedef, hem de (iş emri zaten
         # açılmış ama tamamlanmamış olabileceği için) az önce geçilmiş
@@ -1355,6 +1524,23 @@ def add_maintenance_note(
     return note
 
 
+def compute_covered_tiers(m: "models.Maintenance") -> list[int]:
+    """Bir iş emrinin (kademeli/kümülatif kopyalamadan miras kalan
+    MaintenanceItem.tiers alanlarından) kapsadığı TÜM periyotları (km
+    planlarında interval_km, süre planlarında interval_months) döner,
+    artan sıralı. Tek-planlı (kademeli olmayan) bir bakımda hiçbir
+    maddede `tiers` set edilmediği için boş liste döner — çağıran taraf
+    bunu "yalnızca kendi planı" olarak yorumlamalı (bkz. _copy_tree_
+    snapshot'ın tek-plan `copy()` dalı vs. çok-plan `ensure()` dalı)."""
+    covered: set[int] = set()
+    for it in m.items:
+        if it.tiers:
+            for part in it.tiers.split(","):
+                if part.strip().isdigit():
+                    covered.add(int(part))
+    return sorted(covered)
+
+
 def _has_children(db: Session, item: models.MaintenanceItem) -> bool:
     return (
         db.query(models.MaintenanceItem).filter_by(parent_id=item.id).first()
@@ -1375,6 +1561,105 @@ def _cascade_up(db: Session, item: models.MaintenanceItem) -> None:
             parent_id = parent.parent_id
         else:
             break
+
+
+def _uncascade_up(db: Session, item: models.MaintenanceItem) -> None:
+    """`_cascade_up`'ın tersi: bir madde (zorunlu değilken otomatik tiklenmiş
+    olup sonradan tekrar zorunlu yapıldığı için) tamamlanmamış hale
+    getirildiğinde, bu yüzden yanlışlıkla 'tamamlanmış/kilitli' görünen üst
+    düğümleri de geri açar. Kardeş maddelerin GERÇEK tamamlanma durumuna
+    dokunmaz — yalnızca 'tüm çocuklar tamam' koşulu artık sağlanmadığı için
+    üst düğümün durumunu düzeltir; bir üst düğüm zaten tamamlanmamışsa
+    (ki bu durumda daha yukarısı da tamamlanmamış olmalı) hemen durur."""
+    parent_id = item.parent_id
+    while parent_id is not None:
+        parent = db.get(models.MaintenanceItem, parent_id)
+        if not parent.is_completed:
+            break
+        parent.is_completed = False
+        parent.is_locked = False
+        parent.completed_at = None
+        parent_id = parent.parent_id
+
+
+def resync_open_items_mandatory_state(
+    db: Session, node_id: int, vehicle_id: int | None = None
+) -> int:
+    """Bir bakım ağacı maddesinin zorunlu/opsiyonel ayarı (genel varsayılan
+    ya da belirli bir araç istisnası) DEĞİŞTİRİLDİĞİNDE, bu maddeye karşılık
+    gelen ve HÂLÂ AÇIK (tamamlanmamış iş emri) olan MaintenanceItem
+    kayıtlarını da hemen yeni duruma göre günceller — usta, yeni bir iş
+    emri açılmasını beklemeden, üzerinde çalıştığı bakımda da değişikliği
+    anında görür (bkz. kullanıcı isteği: "zorunlu değil yapılınca direkt
+    olarak tikli olacak, açık olan bakımlarda da").
+
+    Kurallar:
+      * Yalnızca en alt seviye (çocuğu olmayan) maddeler etkilenir — üst
+        düğümlerin tamamlanma durumu her zaman alt maddelerden türetilir
+        (bkz. _cascade_up/_uncascade_up), doğrudan set edilmez.
+      * Bir teknisyen tarafından GERÇEKTEN tamamlanmış (completed_by_id
+        dolu) maddelere ASLA dokunulmaz — yalnızca otomatik (opsiyonel
+        olduğu için önceden tiklenmiş, completed_by_id boş) ya da hâlâ
+        işaretlenmemiş maddeler güncellenir.
+      * Tamamlanmış (status='completed') iş emirleri hiç taranmaz — artık
+        kalıcı bir kayıttır, geriye dönük değiştirilmez.
+      * Stok (TreeNodePartUsage) bu otomatik geçişlerde DOKUNULMAZ — ilk
+        açılıştaki otomatik tikleme de stoğu etkilemiyordu (bkz.
+        _copy_tree_snapshot), simetri korunur.
+
+    vehicle_id verilirse yalnızca o aracın açık iş emirleri taranır (araç
+    istisnası eklenirken/kaldırılırken kullanılır); verilmezse genel
+    varsayılan değiştiğinde bu maddeye sahip TÜM açık iş emirleri taranır
+    — her biri için o aracın KENDİ istisnası (varsa) yine önceliklidir,
+    bu da _node_is_mandatory_for_vehicle üzerinden otomatik doğru hesaplanır.
+
+    Dönüş: değiştirilen madde sayısı (bilgi amaçlı)."""
+    node = db.get(models.TreeNode, node_id)
+    if not node:
+        return 0
+
+    q = (
+        db.query(models.MaintenanceItem)
+        .join(models.Maintenance, models.MaintenanceItem.maintenance_id == models.Maintenance.id)
+        .filter(
+            models.MaintenanceItem.source_node_id == node_id,
+            models.Maintenance.status != "completed",
+        )
+    )
+    if vehicle_id is not None:
+        q = q.filter(models.Maintenance.vehicle_id == vehicle_id)
+    items = q.all()
+
+    changed = 0
+    exceptions_cache: dict[int, dict[int, bool]] = {}
+    for item in items:
+        if _has_children(db, item):
+            continue  # yalnızca yaprak (checklist) maddeleri etkilenir
+
+        m = item.maintenance
+        exceptions = exceptions_cache.get(m.vehicle_id)
+        if exceptions is None:
+            exceptions = _load_vehicle_mandatory_exceptions(db, m.vehicle_id)
+            exceptions_cache[m.vehicle_id] = exceptions
+        desired_completed = not _node_is_mandatory_for_vehicle(node, exceptions)
+
+        if item.is_completed == desired_completed:
+            continue
+        if item.completed_by_id is not None:
+            continue  # gerçek bir teknisyen tamamlaması — asla ezilmez
+
+        if desired_completed:
+            item.is_completed = True
+            _cascade_up(db, item)
+            _check_maintenance_done(db, m)
+        else:
+            item.is_completed = False
+            _uncascade_up(db, item)
+        changed += 1
+
+    if changed:
+        db.commit()
+    return changed
 
 
 def _check_maintenance_done(db: Session, m: models.Maintenance) -> None:
@@ -1536,7 +1821,7 @@ def simulate_km_advance(
     lo = max(0, lo)
     hi = max(lo, hi)
 
-    vehicles = db.query(models.Vehicle).filter_by(is_active=True).all()
+    vehicles = db.query(models.Vehicle).all()
     total_added = 0
     opened_total = 0
     now = datetime.now()
@@ -2115,6 +2400,41 @@ def compute_kpi_report(
         round(sum(durations_days) / len(durations_days), 1) if durations_days else None
     )
 
+    # ---- 1b) Zamanında tamamlanan bakım oranı ----
+    # "Zamanında" tanımı (kullanıcının onayladığı, güncellenmiş kural):
+    #   - Km bazlı planlarda: iş emrinin AÇILDIĞI andaki km (km_at_open),
+    #     planın KENDİ tolerans penceresi (plan_window — lower_pct/upper_pct,
+    #     varsayılan -%5/+%10, ör. hedef 200.000 için [190.000, 220.000])
+    #     İÇİNDE ise zamanında sayılır. Km geçmişi (aracın hangi km'de
+    #     olduğu, gün gün) tutulmadığından tamamlanma anındaki gerçek km
+    #     bilinemez; bunun yerine açılış anındaki km kullanılır — zaten
+    #     check_and_open_maintenances de bir iş emrini ancak bu pencereye
+    #     girildiğinde otomatik açar, dolayısıyla pencere dışında açılmış
+    #     (ör. çok geç fark edilip elle/geç açılmış) bir iş emri zamanında
+    #     sayılmaz.
+    #   - Süre bazlı planlarda: tamamlanma tarihi hedef tarihte veya
+    #     ÖNCESİNDE ise zamanında sayılır (completed_at.date() <= target_date).
+    #   - Periyodu belirsiz ("unknown") planlar değerlendirmeye alınmaz
+    #     (ne zamanında ne geç sayılır — payda dışında tutulur).
+    on_time_count = 0
+    on_time_evaluated = 0
+    for m in completed_in_range_rows:
+        if m.plan.plan_type == "time":
+            if not m.target_date or not m.completed_at:
+                continue
+            on_time_evaluated += 1
+            if m.completed_at.date() <= m.target_date:
+                on_time_count += 1
+        elif m.plan.plan_type == "km":
+            on_time_evaluated += 1
+            window_lower, window_upper = plan_window(m.plan, m.target_km)
+            if window_lower <= m.km_at_open <= window_upper:
+                on_time_count += 1
+        # plan_type == "unknown": payda dışında bırakılır
+    on_time_rate_pct = (
+        round(100 * on_time_count / on_time_evaluated, 1) if on_time_evaluated else None
+    )
+
     # ---- 2) Kritik/geciken (GÜNCEL durum, tarih aralığından bağımsız) ----
     open_maintenances = (
         db.query(models.Maintenance)
@@ -2253,6 +2573,9 @@ def compute_kpi_report(
             "completion_rate_pct": completion_rate_pct,
             "completed_in_range": len(completed_in_range_rows),
             "avg_completion_days": avg_completion_days,
+            "on_time_count": on_time_count,
+            "on_time_evaluated": on_time_evaluated,
+            "on_time_rate_pct": on_time_rate_pct,
         },
         "critical": {
             "open_total": len(open_maintenances),

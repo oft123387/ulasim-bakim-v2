@@ -204,3 +204,49 @@ def test_resync_tiers_rejects_completed_maintenance(client, admin_token):
 def test_resync_tiers_requires_permission(client, usta_token):
     r = client.post("/api/maintenances/1/resync-tiers", headers=auth(usta_token))
     assert r.status_code == 403
+
+
+def test_covered_tiers_exposed_on_list_and_dashboard_not_just_detail(client, admin_token):
+    """covered_tiers yalnızca GET /api/maintenances/{id} (detay) değil, GET
+    /api/maintenances (liste) ve Dashboard'un recent_completed alanında da
+    dolu gelmeli — aksi halde arayüz (mergedPeriodLabel) bu ekranlarda
+    kademeli bakımın küçük periyodunu (ör. 1M) gizler, yalnızca yöneten
+    planın adını (ör. 3M) gösterir."""
+    admin = admin_token
+    v, plan_1m, plan_3m = _setup_plans(client, admin, "TierMergeModelE")
+    try:
+        r = client.post(
+            "/api/maintenances/manual", headers=auth(admin),
+            json={"vehicle_id": v["id"], "plan_id": plan_3m["id"], "target_km": 30_000},
+        )
+        assert r.status_code == 200, r.text
+        maint = r.json()
+
+        listed = client.get(
+            "/api/maintenances", headers=auth(admin), params={"vehicle_id": v["id"]},
+        ).json()
+        row = next(m for m in listed if m["id"] == maint["id"])
+        assert sorted(row["covered_tiers"]) == [10_000, 30_000]
+
+        # Tamamla ve Dashboard'un "Son Tamamlanan Bakımlar" listesinde de
+        # covered_tiers'ın dolu geldiğini doğrula.
+        detail = client.get(f"/api/maintenances/{maint['id']}", headers=auth(admin)).json()
+        leaf_ids = []
+
+        def _collect_leaf_ids(nodes):
+            for n in nodes:
+                if n["children"]:
+                    _collect_leaf_ids(n["children"])
+                else:
+                    leaf_ids.append(n["id"])
+
+        _collect_leaf_ids(detail["items"])
+        for lid in leaf_ids:
+            client.post(f"/api/items/{lid}/complete", headers=auth(admin))
+
+        dash = client.get("/api/dashboard", headers=auth(admin)).json()
+        recent_row = next((m for m in dash["recent_completed"] if m["id"] == maint["id"]), None)
+        assert recent_row is not None, "Az önce tamamlanan bakım Son Tamamlanan Bakımlar'da görünmeli"
+        assert sorted(recent_row["covered_tiers"]) == [10_000, 30_000]
+    finally:
+        _cleanup(client, admin, v, plan_1m, plan_3m)

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, apiDownload, apiUploadWithFields } from '../api'
 import { showToast } from '../components/toast'
+import { targetLabel, mergedPeriodLabel } from '../format'
 import Tram3D from '../components/Tram3D'
 import type { ExportFormat, Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Plan, Shift, ShiftModeConfig, User, Vehicle } from '../types'
 import { STATUS_TR } from '../types'
@@ -37,6 +38,7 @@ import {
   X,
   CheckCircle2,
   RotateCcw,
+  RefreshCw,
 } from 'lucide-react'
 
 // Paylaşılan tablet üzerinde vardiya seçimi, aynı tarayıcıda sayfa
@@ -146,8 +148,7 @@ const fmtDate = (d: Date) => d.toLocaleDateString('tr-TR')
 // Süre bazlı (aylık/yıllık) iş emirlerinde gerçek hedef bir km değil takvim
 // tarihidir (target_date) — backend km alanını bu durumda gizler (null).
 // Tablo/başlık gösterimlerinde ikisini de doğru biçimde tek bir metne çevirir.
-const hedefLabel = (m: Maintenance) =>
-  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+const hedefLabel = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
 
 // Plan periyodunu türüne göre okunur biçimde göster (km bazlı ↔ süre bazlı) —
 // seçim listelerinde kullanılır.
@@ -414,6 +415,11 @@ function TreeItem({
           <span className="who">
             <Avatar name={item.completed_by.full_name} size={20} />
             {item.completed_by.full_name} · {fmt(item.completed_at)}
+          </span>
+        )}
+        {isLeaf && item.is_completed && !item.completed_by && (
+          <span className="who muted" title="Bu madde zorunlu değil işaretlendiği için bakım açılırken otomatik tiklendi">
+            Otomatik (zorunlu değil)
           </span>
         )}
         {isLeaf && canEdit && (
@@ -968,6 +974,27 @@ function MaintenanceDetail({
     }
   }
 
+  async function resyncTiers() {
+    if (!m) return
+    setError('')
+    setStatusActionBusy(true)
+    try {
+      const result = await api<{ added_items: number; merged_periods: number[] }>(
+        `/maintenances/${m.id}/resync-tiers`, { method: 'POST' },
+      )
+      load()
+      if (result.added_items > 0) {
+        showToast(`✓ Eksik periyot eklendi (${result.added_items} yeni madde)`, 'info')
+      } else {
+        showToast('Eksik periyot bulunamadı, checklist zaten güncel', 'info')
+      }
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setStatusActionBusy(false)
+    }
+  }
+
   function jumpToItem(itemId: number) {
     const ancestors = m ? findAncestorIds(m.items ?? [], itemId) : null
     if (ancestors) setExpandIds((prev) => new Set([...prev, ...ancestors]))
@@ -1022,7 +1049,7 @@ function MaintenanceDetail({
       <div className="card">
         <div className="row">
           <h1 style={{ marginBottom: 0, fontSize: 20 }}>
-            {m.vehicle.code} — {m.plan.name}
+            {m.vehicle.code} — {mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}
           </h1>
           <Badge tone={m.status}>{STATUS_TR[m.status]}</Badge>
           <div className="row" style={{ marginLeft: 'auto', gap: 8 }}>
@@ -1046,6 +1073,17 @@ function MaintenanceDetail({
               >
                 <RotateCcw size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
                 Tamamlandıdan Çıkar
+              </button>
+            )}
+            {!!perms.create_maintenance && m.status !== 'completed' && m.plan.plan_type === 'km' && (
+              <button
+                className="small"
+                title="Bu iş emrinin hedef km'sinin kapsadığı ama (sonradan eklenen bir plan yüzünden) checklist'te eksik kalmış periyotların maddelerini ekler. Tamamlanmış maddelere dokunmaz."
+                disabled={statusActionBusy}
+                onClick={resyncTiers}
+              >
+                <RefreshCw size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+                Periyotları Yeniden Hizala
               </button>
             )}
             {perms.delete_maintenance && m.status !== 'completed' && (
@@ -1946,7 +1984,7 @@ export default function MaintenancesPage({
                     return (
                       <tr key={m.id}>
                         <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
-                        <td>{m.plan.name}</td>
+                        <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
                         <td>{hedefLabel(m)}</td>
                         <td>{fmtKm(m.km_at_open)} km</td>
                         <td>
@@ -2086,7 +2124,7 @@ export default function MaintenancesPage({
                 <tr key={m.id} className="clickable-row" onClick={() => setSelected(m.id)}>
                   <td style={{ fontWeight: 600 }}>#{m.id}</td>
                   <td><span className="vehicle-code">{m.vehicle.code}</span></td>
-                  <td>{m.plan.name}</td>
+                  <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
                   <td>{hedefLabel(m)}</td>
                   <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                   <td>

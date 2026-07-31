@@ -326,7 +326,11 @@ export default function App() {
     { key: 'vehicles', label: 'Araçlar', show: isStaff },
     { key: 'history', label: 'Bakım Geçmişi', show: true },
     { key: 'plans', label: 'Bakım Planları', show: isAdmin },
-    { key: 'tree', label: 'Bakım Ağacı', show: isAdmin },
+    // Ağaç düzenleme (madde ekle/sil/taşı) admin'e özel kalır, ama zorunlu/
+    // opsiyonel işaretleme mühendis/amir tarafından da yapılabilmeli — bu
+    // yüzden sayfanın kendisi isStaff'a açık, düzenleme düğmeleri sayfa
+    // içinde isAdmin'e göre gizlenir/gösterilir.
+    { key: 'tree', label: 'Bakım Ağacı', show: isStaff },
     { key: 'parts', label: 'Parça Bilgi Bankası', show: true },
     { key: 'suggestions', label: 'Öneriler', show: true },
     // KPI Raporu ustaya kasıtlı olarak kapalı — yönetici rollerine (admin/mühendis/amir) özeldir.
@@ -511,7 +515,7 @@ export default function App() {
             />
           )}
           {page === 'plans' && isAdmin && <PlansPage />}
-          {page === 'tree' && isAdmin && <TreeEditorPage />}
+          {page === 'tree' && isStaff && <TreeEditorPage user={user} />}
           {page === 'parts' && <PartsCatalogPage canEdit={isStaff} initialSelectedId={openPartId} />}
           {page === 'suggestions' && <SuggestionsPage user={user} />}
           {page === 'kpi' && isStaff && p.view_dashboard_analytics !== false && <KPIPage />}

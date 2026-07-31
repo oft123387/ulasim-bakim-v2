@@ -30,11 +30,6 @@ _STATUS_FONTS = {
     "in_progress": Font(color="1B4DA0", bold=True),
     "completed": Font(color="1E7A46", bold=True),
 }
-_ACTIVE_FILL = PatternFill("solid", fgColor="D9F2E3")
-_ACTIVE_FONT = Font(color="1E7A46", bold=True)
-_INACTIVE_FILL = PatternFill("solid", fgColor="E5E7EB")
-_INACTIVE_FONT = Font(color="6B7280", bold=True)
-
 
 def _style_header_row(ws, ncols: int) -> None:
     ws.freeze_panes = "A2"
@@ -533,7 +528,7 @@ def build_vehicles_workbook(vehicles: list[models.Vehicle]) -> bytes:
     Filoda birden fazla araç modeli varsa (bkz. Bakım Ağacı sayfasındaki
     model bazlı Excel yükleme) her model kendi sayfasına ayrılır (model
     girilmemiş araçlar "Genel" sayfasına düşer); tek model/model bilgisi
-    yoksa tek sayfa yeterlidir. Durum sütunu Aktif/Pasif'e göre renklendirilir.
+    yoksa tek sayfa yeterlidir.
     """
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -545,10 +540,9 @@ def build_vehicles_workbook(vehicles: list[models.Vehicle]) -> bytes:
         "Model",
         "Şasi No",
         "Not",
-        "Durum",
         "Son KM Güncelleme",
     ]
-    widths = [14, 20, 12, 16, 20, 16, 24, 10, 18]
+    widths = [14, 20, 12, 16, 20, 16, 24, 18]
 
     groups: dict[str, list[models.Vehicle]] = {}
     for v in vehicles:
@@ -571,17 +565,11 @@ def build_vehicles_workbook(vehicles: list[models.Vehicle]) -> bytes:
                     v.model,
                     v.chassis_no,
                     v.notes,
-                    "Aktif" if v.is_active else "Pasif",
                     v.last_km_update_at.strftime("%d.%m.%Y %H:%M")
                     if v.last_km_update_at
                     else "",
                 ]
             )
-            r = ws.max_row
-            status_cell = ws.cell(row=r, column=8)
-            status_cell.fill = _ACTIVE_FILL if v.is_active else _INACTIVE_FILL
-            status_cell.font = _ACTIVE_FONT if v.is_active else _INACTIVE_FONT
-            status_cell.alignment = Alignment(horizontal="center")
         for i, w in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(i)].width = w
         _autofilter(ws, len(headers), len(groups[gname]))

@@ -130,6 +130,122 @@ def test_thresholds_scale_with_period_6x_period_uses_same_percentage(client, adm
         _cleanup(client, admin, [v_scaled], [p_scaled])
 
 
+def test_not_yet_started_candidate_never_shows_critical_or_urgent(client, admin_token):
+    """Faz 26: check_and_open_maintenances tarafından otomatik açılan ama
+    admin/mühendis henüz "Başlat" DEMEDİĞİ (is_activated=False) bir aday,
+    hedefi ne kadar geçmiş olursa olsun HİÇBİR ZAMAN kritik/çok kritik
+    rozetiyle gösterilmemeli — yalnızca nötr "yaklaşıyor" olarak görünür.
+    Aksi halde, henüz kimsenin işleme almadığı bir aday, sanki yakın zamanda
+    tamamlanmış bir bakımla ilgiliymiş gibi yanlışlıkla "hâlâ kritik"
+    izlenimi verir (bkz. kullanıcı geri bildirimi). "Başlat" (is_activated=
+    True) yapılır yapılmaz aynı aday normal şekilde kritik/çok kritik
+    olabilmeli."""
+    admin = admin_token
+    r = client.post(
+        "/api/vehicles", headers=auth(admin),
+        json={"code": "CT-NS", "name": "Başlatılmamış Test Aracı", "current_km": 10_800, "model": "KritiklikNotStartedModel"},
+    )
+    assert r.status_code == 200, r.text
+    vehicle = r.json()
+
+    r = client.post(
+        "/api/plans", headers=auth(admin),
+        json={"name": "KritiklikNotStartedModel Planı", "plan_type": "km", "interval_km": 10_000, "vehicle_model": "KritiklikNotStartedModel"},
+    )
+    assert r.status_code == 200, r.text
+    plan = r.json()
+
+    try:
+        db = SessionLocal()
+        try:
+            # check_and_open_maintenances'ın ürettiği "henüz Başlat denmemiş
+            # aday" durumunu birebir temsil eder: is_activated=False, pending.
+            # target=10.000, araç km=10.800 -> 800 km geçmiş (COK_KRITIK eşiği
+            # 500 km altı olduğundan, AKTİVE OLSAYDI çoktan "çok kritik" olurdu).
+            m = models.Maintenance(
+                vehicle_id=vehicle["id"], plan_id=plan["id"], target_km=10_000,
+                km_at_open=9_600, status="pending", is_activated=False,
+            )
+            db.add(m)
+            db.commit()
+
+            v = db.query(models.Vehicle).filter_by(id=vehicle["id"]).one()
+            p = db.query(models.MaintenancePlan).filter_by(id=plan["id"]).one()
+            results = services.compute_upcoming_maintenances(db, vehicles=[v], plans=[p], include_open=True)
+            r_before = next(x for x in results if x["vehicle"].id == vehicle["id"])
+            assert r_before["maintenance_id"] is None  # henüz "açılmamış" gibi davranılır
+            assert r_before["urgent"] is False
+            assert r_before["critical"] is False
+
+            # Şimdi "Başlat" yapılmış gibi işaretle (gerçek uçtan uca akışta
+            # POST /api/maintenances/{id}/start ile olur) — artık aynı hedef
+            # normal şekilde kritik gösterilmeli.
+            m_db = db.query(models.Maintenance).filter_by(id=m.id).one()
+            m_db.is_activated = True
+            db.commit()
+
+            results_after = services.compute_upcoming_maintenances(db, vehicles=[v], plans=[p], include_open=True)
+            r_after = next(x for x in results_after if x["vehicle"].id == vehicle["id"])
+            assert r_after["maintenance_id"] == m.id
+            assert r_after["critical"] is True
+        finally:
+            db.close()
+    finally:
+        _cleanup(client, admin, [vehicle], [plan])
+
+
+def test_overdue_not_started_candidate_excluded_from_dashboard_upcoming(client, admin_token):
+    """Dashboard'un 'Yaklaşan Bakımlar' kutusu (include_open=False) yalnızca
+    GERÇEKTEN yaklaşan (hedefine henüz ulaşılmamış) adayları göstermeli.
+    Hedefi çoktan geçmiş ama hiç "Başlat" denmemiş bir aday (bkz. bir
+    önceki test) burada hiç görünmemeli — sınırlı (limit=8) kutunun
+    slotlarını işgal edip gerçekten yaklaşan başka bir aracı gizlememeli.
+    Araçlar sayfası (include_open=True) için ise bu davranış DEĞİŞMEMELİ —
+    orada hâlâ (nötr, kritik olmayan biçimde) görünmeye devam eder."""
+    admin = admin_token
+    r = client.post(
+        "/api/vehicles", headers=auth(admin),
+        json={"code": "CT-OD", "name": "Aşılmış Başlatılmamış Test Aracı", "current_km": 10_800, "model": "KritiklikOverdueModel"},
+    )
+    assert r.status_code == 200, r.text
+    vehicle = r.json()
+
+    r = client.post(
+        "/api/plans", headers=auth(admin),
+        json={"name": "KritiklikOverdueModel Planı", "plan_type": "km", "interval_km": 10_000, "vehicle_model": "KritiklikOverdueModel"},
+    )
+    assert r.status_code == 200, r.text
+    plan = r.json()
+
+    try:
+        db = SessionLocal()
+        try:
+            m = models.Maintenance(
+                vehicle_id=vehicle["id"], plan_id=plan["id"], target_km=10_000,
+                km_at_open=9_600, status="pending", is_activated=False,
+            )
+            db.add(m)
+            db.commit()
+
+            v = db.query(models.Vehicle).filter_by(id=vehicle["id"]).one()
+            p = db.query(models.MaintenancePlan).filter_by(id=plan["id"]).one()
+
+            # Dashboard kullanımı: include_open=False -> listeden düşmeli.
+            dash_results = services.compute_upcoming_maintenances(db, vehicles=[v], plans=[p])
+            assert all(x["vehicle"].id != vehicle["id"] for x in dash_results)
+
+            # Araçlar sayfası kullanımı: include_open=True -> hâlâ görünür
+            # (ve kritik/acil DEĞİL, bkz. önceki test).
+            veh_results = services.compute_upcoming_maintenances(db, vehicles=[v], plans=[p], include_open=True)
+            r_veh = next(x for x in veh_results if x["vehicle"].id == vehicle["id"])
+            assert r_veh["critical"] is False
+            assert r_veh["urgent"] is False
+        finally:
+            db.close()
+    finally:
+        _cleanup(client, admin, [vehicle], [plan])
+
+
 def test_very_critical_stays_true_once_past_the_5pct_threshold(client, admin_token):
     """Çok kritik durumu kalıcıdır: km yalnızca artabildiği için remaining_km
     de yalnızca azalır — bir kez %5 eşiğinin altına düşünce bir daha

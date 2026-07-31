@@ -13,13 +13,37 @@ amaçlı) uç noktaları da burada test edilir."""
 
 from datetime import date, timedelta
 
+import pytest
+
 from app import models
 from app.database import SessionLocal
 
 from .conftest import auth
 
 
-def _make_pending_candidate(client, admin, model):
+@pytest.fixture(scope="module")
+def engineer_token(client, admin_token):
+    client.post(
+        "/api/users", headers=auth(admin_token),
+        json={"username": "sch_muh", "full_name": "Zamanlama Test Mühendis", "role": "engineer", "password": "schmuhpass1"},
+    )
+    r = client.post("/api/auth/login", data={"username": "sch_muh", "password": "schmuhpass1"})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+@pytest.fixture(scope="module")
+def amir_token(client, admin_token):
+    client.post(
+        "/api/users", headers=auth(admin_token),
+        json={"username": "sch_amir", "full_name": "Zamanlama Test Amir", "role": "amir", "password": "schamirpass1"},
+    )
+    r = client.post("/api/auth/login", data={"username": "sch_amir", "password": "schamirpass1"})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def _make_pending_candidate(client, admin, model, code=None):
     """interval_km=10_000, lower_pct/upper_pct varsayılan (%5/%10, en fazla
     3.000 km'de tavanlanır) -> tolerans penceresi [9.500, 11.000]. Aracı bu
     pencerenin içinde ama hedefe henüz ulaşmamış (9.800 km) oluşturmak,
@@ -31,8 +55,9 @@ def _make_pending_candidate(client, admin, model):
     ).json()
     v = client.post(
         "/api/vehicles", headers=auth(admin),
-        json={"code": f"SCH-{model}", "name": "Zamanlama Test Aracı", "current_km": 9_800, "model": model},
+        json={"code": code or f"SCH-{model}"[:20], "name": "Zamanlama Test Aracı", "current_km": 9_800, "model": model},
     ).json()
+    assert "id" in v, v
     pend = client.get("/api/maintenances/pending-start", headers=auth(admin)).json()
     cand = next(p for p in pend if p["vehicle"]["id"] == v["id"])
     return v, plan, cand
@@ -156,3 +181,39 @@ def test_run_scheduled_starts_requires_admin(client, usta_token):
 def test_cancel_schedule_requires_permission(client, usta_token):
     r = client.post("/api/maintenances/1/cancel-schedule", headers=auth(usta_token))
     assert r.status_code == 403
+
+
+@pytest.mark.parametrize("token_fixture", ["engineer_token", "amir_token"])
+def test_engineer_and_amir_can_schedule_future_start(client, admin_token, request, token_fixture):
+    """Kullanıcı isteği: tarih belirleyerek bakım başlatmayı yalnızca admin
+    değil, mühendis ve amir de yapabilmeli. start_maintenance izni bu iki
+    rol için varsayılan olarak zaten açık (services._DEFAULT_ROLE_
+    PERMISSIONS) — bu test bunun GERÇEKTEN uçtan uca çalıştığını (yalnızca
+    kod okuyarak değil) doğrular."""
+    admin = admin_token
+    token = request.getfixturevalue(token_fixture)
+    short = "ENG" if token_fixture == "engineer_token" else "AMR"
+    v, plan, cand = _make_pending_candidate(client, admin, f"SchedRole{short}", code=f"SCH-{short}")
+    try:
+        future = (date.today() + timedelta(days=3)).isoformat()
+        r = client.post(
+            f"/api/maintenances/{cand['id']}/start", headers=auth(token),
+            json={"scheduled_start_at": future},
+        )
+        assert r.status_code == 200, r.text
+        m = r.json()
+        assert m["is_activated"] is False
+        assert m["scheduled_start_at"] == future
+
+        r2 = client.post(f"/api/maintenances/{cand['id']}/cancel-schedule", headers=auth(token))
+        assert r2.status_code == 200, r2.text
+        assert r2.json()["scheduled_start_at"] is None
+    finally:
+        _cleanup(client, admin, v, plan)
+
+
+@pytest.mark.parametrize("token_fixture", ["engineer_token", "amir_token"])
+def test_engineer_and_amir_can_view_pending_start_list(client, admin_token, request, token_fixture):
+    token = request.getfixturevalue(token_fixture)
+    r = client.get("/api/maintenances/pending-start", headers=auth(token))
+    assert r.status_code == 200, r.text

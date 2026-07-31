@@ -213,6 +213,134 @@ def test_kpi_export_requires_export_excel_permission_for_non_technician(client, 
         )
 
 
+def test_kpi_on_time_rate_km_based(client, admin_token, usta_token):
+    """Zamanında bakım yapılan araç oranı KPI'si: km bazlı bir bakım,
+    km_at_open planın KENDİ tolerans penceresi (varsayılan -%5/+%10,
+    interval_km=10.000 için hedef ± [500, 1000]) İÇİNDEYSE "zamanında"
+    sayılır; pencerenin DIŞINDA (ör. çok geç, hedef+1000'i aşmış) açılmışsa
+    sayılmaz — ama her iki durumda da "değerlendirilen" (payda) sayısına
+    dahildir."""
+    admin = admin_token
+    usta_id = _get_usta_id(client, admin)
+    today = date.today()
+    wide_from = (today - timedelta(days=1)).isoformat()
+    wide_to = (today + timedelta(days=1)).isoformat()
+
+    def _complete(item_id):
+        r = client.post(f"/api/items/{item_id}/complete", headers=auth(usta_token))
+        assert r.status_code == 200, r.text
+
+    before = client.get(
+        "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+    ).json()["completion"]
+
+    # Zamanında: km_at_open (9.800) pencere [9.500, 11.000] içinde.
+    v1, plan1, m1, item1 = _make_maintenance_with_item(
+        client, admin, "KPIOnTimeKm", current_km=9_800, target_km=10_000,
+    )
+    try:
+        client.patch(f"/api/maintenances/{m1['id']}/assign", headers=auth(admin), json={"assigned_to_id": usta_id})
+        _complete(item1["id"])
+
+        mid = client.get(
+            "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+        ).json()["completion"]
+        assert mid["on_time_count"] == before["on_time_count"] + 1
+        assert mid["on_time_evaluated"] == before["on_time_evaluated"] + 1
+
+        # Geç: km_at_open (11.500) pencerenin ÜST sınırını (11.000) aşmış —
+        # bakım daha açıldığı anda tolerans penceresinin dışındaydı,
+        # "zamanında" sayılmaz.
+        v2, plan2, m2, item2 = _make_maintenance_with_item(
+            client, admin, "KPILateKm", current_km=11_500, target_km=10_000,
+        )
+        try:
+            client.patch(f"/api/maintenances/{m2['id']}/assign", headers=auth(admin), json={"assigned_to_id": usta_id})
+            _complete(item2["id"])
+
+            after = client.get(
+                "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+            ).json()["completion"]
+            assert after["on_time_count"] == mid["on_time_count"]  # artmadı
+            assert after["on_time_evaluated"] == mid["on_time_evaluated"] + 1
+            assert after["on_time_rate_pct"] is not None
+            assert 0 <= after["on_time_rate_pct"] <= 100
+        finally:
+            _cleanup(client, admin, v2, plan2)
+    finally:
+        _cleanup(client, admin, v1, plan1)
+
+
+def test_kpi_on_time_rate_time_based(client, admin_token, usta_token):
+    """Süre bazlı bakımlarda "zamanında" ölçütü completed_at<=target_date'dir."""
+    admin = admin_token
+    usta_id = _get_usta_id(client, admin)
+    today = date.today()
+    wide_from = (today - timedelta(days=1)).isoformat()
+    wide_to = (today + timedelta(days=1)).isoformat()
+
+    def _setup_time_plan(model):
+        v = client.post(
+            "/api/vehicles", headers=auth(admin),
+            json={
+                "code": f"KPIT-{model}", "name": "KPI Süre Test Aracı", "model": model,
+                "commissioning_date": (today - timedelta(days=400)).isoformat(),
+            },
+        ).json()
+        plan = client.post(
+            "/api/plans", headers=auth(admin),
+            json={"plan_type": "time", "interval_months": 12, "vehicle_model": model},
+        ).json()
+        root = client.post("/api/tree", headers=auth(admin), json={"name": "ARAÇ İÇİ", "plan_id": plan["id"]}).json()
+        client.post("/api/tree", headers=auth(admin), json={"name": "Test Maddesi", "parent_id": root["id"]})
+        return v, plan
+
+    before = client.get(
+        "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+    ).json()["completion"]
+
+    # Zamanında: hedef tarih bugün ya da ileri bir tarih.
+    v1, plan1 = _setup_time_plan("KPIOnTimeSure")
+    try:
+        m1 = client.post(
+            "/api/maintenances/manual", headers=auth(admin),
+            json={"vehicle_id": v1["id"], "plan_id": plan1["id"], "target_date": (today + timedelta(days=5)).isoformat()},
+        ).json()
+        item1 = client.get(f"/api/maintenances/{m1['id']}", headers=auth(admin)).json()["items"][0]["children"][0]
+        client.patch(f"/api/maintenances/{m1['id']}/assign", headers=auth(admin), json={"assigned_to_id": usta_id})
+        r = client.post(f"/api/items/{item1['id']}/complete", headers=auth(usta_token))
+        assert r.status_code == 200, r.text
+
+        mid = client.get(
+            "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+        ).json()["completion"]
+        assert mid["on_time_count"] == before["on_time_count"] + 1
+        assert mid["on_time_evaluated"] == before["on_time_evaluated"] + 1
+
+        # Geç: hedef tarih geçmişte kalmış (bugünden önce) — tamamlanma
+        # bugün olduğu için completed_at.date() > target_date.
+        v2, plan2 = _setup_time_plan("KPILateSure")
+        try:
+            m2 = client.post(
+                "/api/maintenances/manual", headers=auth(admin),
+                json={"vehicle_id": v2["id"], "plan_id": plan2["id"], "target_date": (today - timedelta(days=5)).isoformat()},
+            ).json()
+            item2 = client.get(f"/api/maintenances/{m2['id']}", headers=auth(admin)).json()["items"][0]["children"][0]
+            client.patch(f"/api/maintenances/{m2['id']}/assign", headers=auth(admin), json={"assigned_to_id": usta_id})
+            r = client.post(f"/api/items/{item2['id']}/complete", headers=auth(usta_token))
+            assert r.status_code == 200, r.text
+
+            after = client.get(
+                "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+            ).json()["completion"]
+            assert after["on_time_count"] == mid["on_time_count"]  # artmadı
+            assert after["on_time_evaluated"] == mid["on_time_evaluated"] + 1
+        finally:
+            _cleanup(client, admin, v2, plan2)
+    finally:
+        _cleanup(client, admin, v1, plan1)
+
+
 def test_kpi_export_returns_valid_multisheet_xlsx(client, admin_token):
     admin = admin_token
     r = client.get("/api/kpi/export", headers=auth(admin))

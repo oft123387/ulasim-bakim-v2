@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api, apiDownload } from '../api'
 import type { KPIReport } from '../types'
 import { PageHeader, StatCard, Skeleton, EmptyState } from '../components/ui'
-import { Download, CheckCircle2, Clock, AlertTriangle, Flame, Truck, Users } from 'lucide-react'
+import { Download, CheckCircle2, Clock, AlertTriangle, Flame, Truck, Users, Timer } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
@@ -143,8 +143,8 @@ export default function KPIPage() {
 
       {!data && !error ? (
         <>
-          <div className="grid stat-grid-4" style={{ marginBottom: 16 }}>
-            {Array.from({ length: 4 }).map((_, i) => (
+          <div className="grid stat-grid-5" style={{ marginBottom: 16 }}>
+            {Array.from({ length: 5 }).map((_, i) => (
               <div key={i} className="card">
                 <Skeleton width="50%" height={11} style={{ marginBottom: 12 }} />
                 <Skeleton width="35%" height={26} />
@@ -155,12 +155,26 @@ export default function KPIPage() {
         </>
       ) : data ? (
         <>
-          <div className="grid stat-grid-4" style={{ marginBottom: 16 }}>
+          <div className="grid stat-grid-5" style={{ marginBottom: 16 }}>
             <StatCard
               label="Tamamlanma Oranı"
               value={`%${data.completion.completion_rate_pct.toLocaleString('tr-TR')}`}
               tone="completed"
               icon={<CheckCircle2 size={18} />}
+            />
+            <StatCard
+              label="Zamanında Bakım Oranı"
+              value={
+                data.completion.on_time_rate_pct != null
+                  ? `%${data.completion.on_time_rate_pct.toLocaleString('tr-TR')}`
+                  : '—'
+              }
+              tone={
+                data.completion.on_time_rate_pct != null && data.completion.on_time_rate_pct < 80
+                  ? 'danger'
+                  : 'completed'
+              }
+              icon={<Timer size={18} />}
             />
             <StatCard
               label="Ort. Tamamlanma Süresi"
@@ -187,6 +201,14 @@ export default function KPIPage() {
           <div className="muted" style={{ fontSize: 11.5, marginTop: -10, marginBottom: 16 }}>
             Kritik/gecikmiş sayıları her zaman güncel duruma göredir, seçilen tarih aralığından bağımsızdır.
             Seçilen aralıkta {data.completion.opened_in_range} iş emri açıldı, {data.completion.completed_in_range} iş emri tamamlandı.
+            {' '}Zamanında bakım oranı, {data.completion.on_time_evaluated} değerlendirilebilir tamamlanan bakımın{' '}
+            {data.completion.on_time_count} tanesinin, km bazlı planlarda planın kendi tolerans penceresi
+            içinde (varsayılan -%5/+%10) açılmış olmasına, süre bazlı planlarda ise hedef tarihte veya
+            öncesinde bitirilmiş olmasına göre hesaplanır
+            {data.completion.on_time_evaluated < data.completion.completed_in_range
+              ? ' (periyodu belirsiz bakımlar hariç tutulur)'
+              : ''}
+            .
           </div>
 
           {modelChartData.length > 0 && (

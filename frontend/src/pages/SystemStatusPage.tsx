@@ -99,7 +99,7 @@ export default function SystemStatusPage() {
                 Sayaçlar
               </div>
             </div>
-            <StatRow label="Araçlar" value={`${status.active_vehicle_count} aktif / ${status.vehicle_count} toplam`} />
+            <StatRow label="Araçlar" value={status.vehicle_count} />
             <StatRow label="Kullanıcılar" value={status.user_count} />
             <StatRow
               label="Bakım planları"

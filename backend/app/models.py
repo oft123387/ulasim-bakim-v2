@@ -84,7 +84,6 @@ class Vehicle(Base):
     code: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # ör. 38.01
     name: Mapped[str] = mapped_column(String(100), default="")
     current_km: Mapped[int] = mapped_column(Integer, default=0)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     manufacturer: Mapped[str] = mapped_column(String(100), default="")
     model: Mapped[str] = mapped_column(String(100), default="")
     chassis_no: Mapped[str] = mapped_column(String(100), default="")
@@ -223,6 +222,13 @@ class TreeNode(Base):
     # adının yanında küçük bir rozet olarak gösterilir — bkz. MaintenancesPage
     # .card-code-pill (pdf-pill ile aynı desen).
     card_code: Mapped[str] = mapped_column(String(50), default="")
+    # Bir bakım açıldığında bu maddenin GENEL varsayılan durumu: True (varsayılan)
+    # ise her araçta normal şekilde ustanın tiklemesi gerekir. Admin/mühendis/amir
+    # bunu "zorunlu değil" yaparsa (bkz. PATCH /api/tree/{id}/mandatory), BUNDAN
+    # SONRA açılan iş emirlerinde bu madde otomatik tiklenmiş gelir — usta ekstra
+    # işlem yapmaz. Belirli tek tek araçlar için bu genel değeri geçersiz kılmak
+    # üzere TreeNodeVehicleException kullanılır (bkz. aşağıda).
+    is_mandatory: Mapped[bool] = mapped_column(Boolean, default=True)
 
     children = relationship(
         "TreeNode", cascade="all, delete-orphan", order_by="TreeNode.order_index"
@@ -233,6 +239,38 @@ class TreeNode(Base):
         cascade="all, delete-orphan",
         order_by="NodeAttachment.id",
     )
+    vehicle_exceptions = relationship(
+        "TreeNodeVehicleException",
+        cascade="all, delete-orphan",
+        order_by="TreeNodeVehicleException.id",
+    )
+
+
+class TreeNodeVehicleException(Base):
+    """TreeNode.is_mandatory'nin GENEL (tüm araçlar için geçerli) varsayılanını
+    tek bir araç için geçersiz kılar — ör. bir madde genelde zorunluyken belirli
+    bir araçta (o parça zaten değiştirildiği/o araca özel bir durum olduğu için)
+    opsiyonel yapılabilir, ya da tam tersi (genelde opsiyonel ama bu araçta
+    zorunlu). Yalnızca satırı olan (node_id, vehicle_id) çiftleri için istisna
+    uygulanır; başka hiçbir araç bundan etkilenmez — bkz. services.py
+    _effective_node_mandatory."""
+
+    __tablename__ = "tree_node_vehicle_exceptions"
+    __table_args__ = (
+        UniqueConstraint("node_id", "vehicle_id", name="uq_tree_node_vehicle_exception"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    node_id: Mapped[int] = mapped_column(
+        ForeignKey("tree_nodes.id", ondelete="CASCADE"), index=True
+    )
+    vehicle_id: Mapped[int] = mapped_column(
+        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True
+    )
+    is_mandatory: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    vehicle = relationship("Vehicle")
 
 
 class TreeNodePartUsage(Base):

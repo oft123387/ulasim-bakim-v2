@@ -115,7 +115,6 @@ class VehicleOut(ORM):
     code: str
     name: str
     current_km: int
-    is_active: bool
     manufacturer: str
     model: str
     chassis_no: str
@@ -435,6 +434,11 @@ class TreeNodeOut(ORM):
     order_index: int
     note: str = ""
     card_code: str = ""
+    # Genel (tüm araçlar için) varsayılan: False ise bu madde bundan sonra
+    # açılan iş emirlerinde otomatik tiklenmiş gelir (bkz. PATCH
+    # /api/tree/{id}/mandatory). Belirli araçlar için bu değeri geçersiz
+    # kılan istisnalar GET /api/tree/{id}/vehicle-exceptions ile ayrıca sorgulanır.
+    is_mandatory: bool = True
     children: list["TreeNodeOut"] = []
     attachments: list[NodeAttachmentOut] = []
 
@@ -453,6 +457,27 @@ class TreeNodeUpdate(BaseModel):
     order_index: int | None = None
     note: str | None = None
     card_code: str | None = Field(default=None, max_length=50)
+
+
+class TreeNodeMandatoryUpdate(BaseModel):
+    """PATCH /api/tree/{id}/mandatory — madde için GENEL (tüm araçlar)
+    zorunluluk varsayılanını değiştirir ("hepsine uygula")."""
+    is_mandatory: bool
+
+
+class TreeNodeVehicleExceptionIn(BaseModel):
+    """POST /api/tree/{id}/vehicle-exceptions — tek bir araç için genel
+    varsayılanı geçersiz kılan istisna ekler/günceller."""
+    vehicle_id: int
+    is_mandatory: bool = False
+
+
+class TreeNodeVehicleExceptionOut(ORM):
+    id: int
+    node_id: int
+    vehicle: VehicleOut
+    is_mandatory: bool
+    created_at: datetime
 
 
 class TreeNodeFlatOut(ORM):
@@ -543,6 +568,15 @@ class MaintenanceOut(ORM):
     # "Başlat" derken ileri bir tarih seçildiyse dolu — o tarihte otomatik
     # başlatılır (bkz. services.run_scheduled_maintenance_starts).
     scheduled_start_at: date | None = None
+    # Bu bakımın kapsadığı tüm periyotlar (km planlarında interval_km, süre
+    # planlarında interval_months), artan sıralı. Kademeli/kümülatif bir
+    # bakımda birden fazla eleman olur (ör. [10000, 30000] — 1M+3M birleşik);
+    # tekil periyotlu bir bakımda boş kalır (yalnızca plan.name'e bakılır) —
+    # bkz. services.compute_covered_tiers. Arayüz, yalnızca "yöneten" (en
+    # büyük) planın adını (plan.name, ör. "3M") göstermenin, bakımın aslında
+    # daha küçük periyotları da kapsadığını gizlediği bir hatayı düzeltmek
+    # için bunu kullanır (frontend format.ts:mergedPeriodLabel).
+    covered_tiers: list[int] = []
 
     @model_validator(mode="after")
     def _hide_time_sentinel(self):
@@ -579,9 +613,6 @@ class NoteCreateBody(BaseModel):
 
 class MaintenanceDetail(MaintenanceOut):
     items: list[ItemOut] = []
-    # Bu bakımın kapsadığı tüm periyotlar (km), artan sıralı. Kademeli
-    # bakımda birden fazla; tek periyotlu bakımda tek eleman.
-    covered_tiers: list[int] = []
     notes: list[NoteOut] = []
 
 
@@ -638,6 +669,10 @@ class UpcomingItem(BaseModel):
     # bakımın id'si — dashboard'da satıra tıklayınca doğrudan açmak için.
     # Henüz açılmamış "yaklaşan" tahminler için None'dır.
     maintenance_id: int | None = None
+    # Araçlar sayfasındaki 4 durumlu sınıflandırma (bkz.
+    # services._classify_upcoming_status): "yaklasiyor" | "planlanacak" |
+    # "planlandi" | "gecikti" | None (henüz hiçbir uyarı yok).
+    status: str | None = None
 
 
 class CalendarProjectionItem(BaseModel):
@@ -673,7 +708,6 @@ class VehicleSummary(BaseModel):
 
 class DashboardOut(BaseModel):
     vehicle_count: int
-    active_vehicle_count: int
     pending_count: int
     in_progress_count: int
     completed_count: int
@@ -698,7 +732,6 @@ class SystemStatusOut(BaseModel):
     started_at: datetime
     uptime_seconds: float
     vehicle_count: int
-    active_vehicle_count: int
     user_count: int
     plan_count: int
     catalog_only_plan_count: int
@@ -787,7 +820,7 @@ class KmSimConfig(BaseModel):
     min_km: int
     max_km: int
     last_date: str | None
-    active_vehicles: int
+    vehicle_count: int
 
 
 class KmSimUpdate(BaseModel):
@@ -1020,6 +1053,13 @@ class KPICompletionOut(BaseModel):
     completion_rate_pct: float
     completed_in_range: int
     avg_completion_days: float | None = None
+    # Zamanında tamamlanan bakım oranı — bkz. services.compute_kpi_report
+    # docstring'i (km bazlı planlarda km_at_open<=target_km, süre bazlı
+    # planlarda completed_at<=target_date ölçütü kullanılır; periyodu
+    # belirsiz planlar payda dışında bırakılır).
+    on_time_count: int = 0
+    on_time_evaluated: int = 0
+    on_time_rate_pct: float | None = None
 
 
 class KPICriticalOut(BaseModel):

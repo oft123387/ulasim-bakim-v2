@@ -10,11 +10,14 @@ import type {
   Plan,
   TreeNode,
   TreeNodeFlat,
+  TreeNodeVehicleException,
   PartHotspot,
   NodeAttachment,
   PartCatalogItem,
   TreeNodePartUsage,
   VehicleModelMergeResult,
+  Vehicle,
+  User,
 } from '../types'
 
 // Parça ağacı (alt parçalar iç içe) iç içe geldiği için, "hangi maddede
@@ -129,6 +132,96 @@ function NodePartsSection({
           style={{ width: 80 }}
         />
         <button className="small primary" disabled={!partId || busy}>Ekle</button>
+      </form>
+      {error && <div className="error" style={{ marginTop: 6 }}>{error}</div>}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------- Zorunlu/opsiyonel araç istisnaları
+// Genel varsayılan (node.is_mandatory) TÜM araçlar için geçerlidir; burada
+// eklenen istisnalar yalnızca TEK BİR belirli araç için o varsayılanı
+// geçersiz kılar (ör. genelde zorunlu bir madde, yalnızca 3805 nolu araçta
+// zorunlu değil). Admin, mühendis ve amir kullanabilir.
+function NodeVehicleExceptionsSection({ nodeId }: { nodeId: number }) {
+  const [exceptions, setExceptions] = useState<TreeNodeVehicleException[]>([])
+  const [vehicles, setVehicles] = useState<Vehicle[]>([])
+  const [vehicleId, setVehicleId] = useState<number | ''>('')
+  const [mandatory, setMandatory] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  function load() {
+    api<TreeNodeVehicleException[]>(`/tree/${nodeId}/vehicle-exceptions`).then(setExceptions).catch(() => setExceptions([]))
+  }
+  useEffect(load, [nodeId])
+  useEffect(() => {
+    api<Vehicle[]>('/vehicles').then(setVehicles).catch(() => setVehicles([]))
+  }, [])
+
+  async function addException(e: React.FormEvent) {
+    e.preventDefault()
+    if (vehicleId === '') return
+    setBusy(true)
+    setError('')
+    try {
+      await api(`/tree/${nodeId}/vehicle-exceptions`, {
+        method: 'POST',
+        body: { vehicle_id: vehicleId, is_mandatory: mandatory },
+      })
+      setVehicleId('')
+      setMandatory(false)
+      load()
+    } catch (err) {
+      setError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function removeException(id: number) {
+    await api(`/tree/vehicle-exceptions/${id}`, { method: 'DELETE' })
+    load()
+  }
+
+  const usedIds = useMemo(() => new Set(exceptions.map((e) => e.vehicle.id)), [exceptions])
+  const availableVehicles = useMemo(() => vehicles.filter((v) => !usedIds.has(v.id)), [vehicles, usedIds])
+
+  return (
+    <div className="node-info-panel" style={{ marginTop: 4, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+      <label className="node-info-label">
+        Araç İstisnaları — belirli bir araçta genel zorunlu/zorunlu değil ayarını geçersiz kılar
+      </label>
+      {exceptions.length > 0 && (
+        <div className="attach-list" style={{ marginBottom: 8 }}>
+          {exceptions.map((exc) => (
+            <div key={exc.id} className="attach-list-row">
+              <span className="attach-chip">
+                <span>{exc.vehicle.code} — {exc.is_mandatory ? 'Zorunlu' : 'Zorunlu Değil'}</span>
+              </span>
+              <button className="small danger" onClick={() => removeException(exc.id)} title="İstisnayı kaldır (genel varsayılana döner)">
+                <Trash2 size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <form className="row" onSubmit={addException} style={{ flexWrap: 'wrap', gap: 6 }}>
+        <select
+          value={vehicleId}
+          onChange={(e) => setVehicleId(e.target.value ? Number(e.target.value) : '')}
+          style={{ minWidth: 200 }}
+        >
+          <option value="">Araç seç…</option>
+          {availableVehicles.map((v) => (
+            <option key={v.id} value={v.id}>{v.code} — {v.name}</option>
+          ))}
+        </select>
+        <label className="row" style={{ gap: 4, alignItems: 'center' }}>
+          <input type="checkbox" checked={mandatory} onChange={(e) => setMandatory(e.target.checked)} />
+          Bu araçta zorunlu olsun
+        </label>
+        <button className="small primary" disabled={vehicleId === '' || busy}>Ekle</button>
       </form>
       {error && <div className="error" style={{ marginTop: 6 }}>{error}</div>}
     </div>
@@ -349,11 +442,13 @@ function EditorNode({
   onChanged,
   allNodes,
   knownParts,
+  isAdmin,
 }: {
   node: TreeNode
   onChanged: () => void
   allNodes: { node: TreeNode; depth: number }[]
   knownParts: { id: number; label: string }[]
+  isAdmin: boolean
 }) {
   const [open, setOpen] = useState(true)
   const [adding, setAdding] = useState(false)
@@ -362,7 +457,24 @@ function EditorNode({
   const [name, setName] = useState(node.name)
   const [moving, setMoving] = useState(false)
   const [showInfo, setShowInfo] = useState(false)
+  const [showExceptions, setShowExceptions] = useState(false)
+  const [mandatoryBusy, setMandatoryBusy] = useState(false)
   const attCount = (node.attachments?.length ?? 0) + (node.note ? 1 : 0)
+
+  async function toggleMandatory() {
+    setMandatoryBusy(true)
+    try {
+      await api(`/tree/${node.id}/mandatory`, {
+        method: 'PATCH',
+        body: { is_mandatory: !node.is_mandatory },
+      })
+      onChanged()
+    } catch (e) {
+      alert((e as Error).message)
+    } finally {
+      setMandatoryBusy(false)
+    }
+  }
 
   async function addChild(e: React.FormEvent) {
     e.preventDefault()
@@ -423,26 +535,64 @@ function EditorNode({
           <span className="node-name">
             {node.name}
             {node.card_code && <span className="card-code-pill">{node.card_code}</span>}
+            {isLeaf && (
+              <span
+                className="card-code-pill"
+                style={
+                  node.is_mandatory
+                    ? undefined
+                    : { background: 'var(--amber-soft, #fde8c4)', color: 'var(--amber, #92600d)' }
+                }
+              >
+                {node.is_mandatory ? 'Zorunlu' : 'Zorunlu Değil'}
+              </span>
+            )}
           </span>
         )}
         {!renaming && (
           <span className="row" style={{ marginLeft: 'auto' }}>
-            <button className="small" onClick={() => setAdding(!adding)}>+ Alt Madde</button>
-            <button
-              className={`small ${showInfo ? 'primary' : ''}`}
-              onClick={() => setShowInfo(!showInfo)}
-              title="Not / fotoğraf / PDF / talimat ekle"
-            >
-              <Paperclip size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
-              Bilgi/Ek{attCount > 0 ? ` (${attCount})` : ''}
-            </button>
-            <button className="small" onClick={() => setRenaming(true)}>Yeniden Adlandır</button>
-            <button className="small" onClick={() => setMoving(!moving)}>Taşı</button>
-            <button className="small danger" onClick={remove}>Sil</button>
+            {isLeaf && (
+              <button
+                className="small"
+                disabled={mandatoryBusy}
+                onClick={toggleMandatory}
+                title={
+                  node.is_mandatory
+                    ? 'Bu maddeyi zorunlu değil yap — yeni açılan bakımlarda VE zaten açık olan bakımlarda otomatik tikli gelir'
+                    : 'Bu maddeyi tekrar zorunlu yap — zaten açık bakımlarda otomatik tik kaldırılır (usta elle tamamladıysa dokunulmaz)'
+                }
+              >
+                {node.is_mandatory ? 'Zorunlu Değil Yap' : 'Zorunlu Yap'}
+              </button>
+            )}
+            {isLeaf && (
+              <button
+                className={`small ${showExceptions ? 'primary' : ''}`}
+                onClick={() => setShowExceptions(!showExceptions)}
+                title="Belirli bir araç için genel ayarı geçersiz kıl"
+              >
+                Araç İstisnaları
+              </button>
+            )}
+            {isAdmin && <button className="small" onClick={() => setAdding(!adding)}>+ Alt Madde</button>}
+            {isAdmin && (
+              <button
+                className={`small ${showInfo ? 'primary' : ''}`}
+                onClick={() => setShowInfo(!showInfo)}
+                title="Not / fotoğraf / PDF / talimat ekle"
+              >
+                <Paperclip size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+                Bilgi/Ek{attCount > 0 ? ` (${attCount})` : ''}
+              </button>
+            )}
+            {isAdmin && <button className="small" onClick={() => setRenaming(true)}>Yeniden Adlandır</button>}
+            {isAdmin && <button className="small" onClick={() => setMoving(!moving)}>Taşı</button>}
+            {isAdmin && <button className="small danger" onClick={remove}>Sil</button>}
           </span>
         )}
       </div>
-      {showInfo && (
+      {showExceptions && isLeaf && <NodeVehicleExceptionsSection nodeId={node.id} />}
+      {showInfo && isAdmin && (
         <NodeInfoPanel node={node} onChanged={onChanged} isLeaf={isLeaf} knownParts={knownParts} />
       )}
       {moving && (
@@ -476,7 +626,7 @@ function EditorNode({
           <div className="tree-children-inner">
             <ul className="tree-sub">
               {node.children.map((c) => (
-                <EditorNode key={c.id} node={c} onChanged={onChanged} allNodes={allNodes} knownParts={knownParts} />
+                <EditorNode key={c.id} node={c} onChanged={onChanged} allNodes={allNodes} knownParts={knownParts} isAdmin={isAdmin} />
               ))}
             </ul>
           </div>
@@ -892,86 +1042,6 @@ function BulkCatalogImportSection({
   )
 }
 
-// ---------------------------------------------------------- Katalog periyotları gözden geçirme
-// is_catalog_only planlar (bir temel periyodun katı, ör. 800.000 km) Bakım
-// Planı seçicisinde artık gösterilmiyor — zamanla "unutulan" kat periyotlar
-// birikmesin diye, TÜM modellerdeki bu planları tek listede gösterip
-// gerekirse silebilen küçük bir gözden geçirme paneli.
-function CatalogOnlyPlansPanel({ plans, onChanged }: { plans: Plan[]; onChanged: () => void }) {
-  const [open, setOpen] = useState(false)
-  const [busyId, setBusyId] = useState<number | null>(null)
-  const [error, setError] = useState('')
-
-  const catalogOnly = useMemo(
-    () =>
-      plans
-        .filter((p) => p.is_catalog_only)
-        .sort((a, b) => (a.vehicle_model || '').localeCompare(b.vehicle_model || '', 'tr') || a.interval_km - b.interval_km),
-    [plans],
-  )
-
-  async function remove(p: Plan) {
-    if (!confirm(`"${p.name}" (${p.vehicle_model || 'Genel'}) katalog periyodu silinsin mi?`)) return
-    setBusyId(p.id)
-    setError('')
-    try {
-      await api(`/plans/${p.id}`, { method: 'DELETE' })
-      onChanged()
-    } catch (e) {
-      setError((e as Error).message)
-    } finally {
-      setBusyId(null)
-    }
-  }
-
-  if (catalogOnly.length === 0) return null
-
-  return (
-    <div className="card" style={{ marginBottom: 16 }}>
-      <div className="row" style={{ justifyContent: 'space-between', cursor: 'pointer' }} onClick={() => setOpen(!open)}>
-        <strong>Katalog Periyotları ({catalogOnly.length})</strong>
-        <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
-          {open ? 'Gizle' : 'Göster'}
-        </button>
-      </div>
-      {open && (
-        <>
-          <p className="muted" style={{ marginTop: 8, fontSize: 12.5 }}>
-            Bunlar bir temel periyodun tam katı (ör. 800.000 km, 200.000 km'nin katı) — Bakım
-            Planları'nda ve periyot seçicide gösterilmiyorlar, kendi başlarına bakım
-            tetiklemiyorlar. Kaynak katalogdaki içerikleri artık gerekmiyorsa buradan silinebilir.
-          </p>
-          {error && <div className="error">{error}</div>}
-          <div className="table-scroll" style={{ marginTop: 8 }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Araç Modeli</th>
-                  <th>Plan</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {catalogOnly.map((p) => (
-                  <tr key={p.id}>
-                    <td>{p.vehicle_model || 'Genel'}</td>
-                    <td>{p.name}</td>
-                    <td>
-                      <button className="small danger" disabled={busyId === p.id} onClick={() => remove(p)}>
-                        {busyId === p.id ? 'Siliniyor…' : 'Sil'}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </>
-      )}
-    </div>
-  )
-}
-
 // ---------------------------------------------------------- Araç modeli birleştirme
 // Yanlış yazılmış/eski bir model adının (ör. Excel'den "BOZANKAYA" gelmiş,
 // filodaki gerçek modelle "Bozankaya Tip-1" birebir eşleşmeyen kayıtlar)
@@ -1064,7 +1134,8 @@ function VehicleModelMergePanel({ knownModels, onMerged }: { knownModels: string
   )
 }
 
-export default function TreeEditorPage() {
+export default function TreeEditorPage({ user }: { user: User }) {
+  const isAdmin = user.role === 'admin'
   const [plans, setPlans] = useState<Plan[]>([])
   const [planId, setPlanId] = useState<number | null>(null)
   const [tree, setTree] = useState<TreeNode[]>([])
@@ -1152,7 +1223,12 @@ export default function TreeEditorPage() {
   const load = () => {
     if (planId === null || showAll) return
     api<TreeNode[]>(`/tree?plan_id=${planId}`).then(setTree).catch(() => setTree([]))
-    api<TreeNodeFlat[]>(`/tree/flat?plan_id=${planId}`).then(setFlatNodes).catch(() => setFlatNodes([]))
+    // /tree/flat yalnızca 3D model eşleştirme seçicisi (admin-only) için
+    // gerekli — bu uç nokta admin'e özel olduğundan mühendis/amir için
+    // isteği hiç yapmıyoruz (403'ten kaçınmak için).
+    if (isAdmin) {
+      api<TreeNodeFlat[]>(`/tree/flat?plan_id=${planId}`).then(setFlatNodes).catch(() => setFlatNodes([]))
+    }
   }
   useEffect(load, [planId, showAll])
 
@@ -1223,7 +1299,7 @@ export default function TreeEditorPage() {
     <>
       <PageHeader title="Bakım Ağacı Şablonu" />
 
-      <BulkCatalogImportSection knownModels={knownModels} onImported={() => loadPlans()} />
+      {isAdmin && <BulkCatalogImportSection knownModels={knownModels} onImported={() => loadPlans()} />}
 
       <div className="card">
         <div className="row" style={{ flexWrap: 'wrap' }}>
@@ -1276,15 +1352,15 @@ export default function TreeEditorPage() {
         </div>
       </div>
 
-      <CatalogOnlyPlansPanel plans={plans} onChanged={() => loadPlans()} />
-
-      <VehicleModelMergePanel
-        knownModels={knownModels}
-        onMerged={() => {
-          loadKnownModels()
-          loadPlans()
-        }}
-      />
+      {isAdmin && (
+        <VehicleModelMergePanel
+          knownModels={knownModels}
+          onMerged={() => {
+            loadKnownModels()
+            loadPlans()
+          }}
+        />
+      )}
 
       {showAll ? (
         <div className="card">
@@ -1303,44 +1379,51 @@ export default function TreeEditorPage() {
       ) : (
         planId !== null && (
           <>
-            <div className="card">
-              <form className="row" onSubmit={addRoot}>
-                <input
-                  placeholder="Yeni ana bölüm (ör. Araç İçi)"
-                  value={newRoot}
-                  onChange={(e) => setNewRoot(e.target.value)}
-                />
-                <button className="primary">Ana Bölüm Ekle</button>
-                {tree.length > 0 && (
-                  <button
-                    type="button"
-                    className="small danger"
-                    style={{ marginLeft: 'auto' }}
-                    disabled={clearTreeBusy}
-                    onClick={clearCurrentPlanTree}
-                    title="Bu planın tüm ağacını (tüm bölüm/maddeleri) siler — plan kaydı ve geçmiş iş emirleri korunur"
-                  >
-                    <Trash2 size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
-                    {clearTreeBusy ? 'Siliniyor…' : 'Bu Planın Ağacını Tamamen Sil'}
-                  </button>
-                )}
-              </form>
-            </div>
+            {isAdmin && (
+              <div className="card">
+                <form className="row" onSubmit={addRoot}>
+                  <input
+                    placeholder="Yeni ana bölüm (ör. Araç İçi)"
+                    value={newRoot}
+                    onChange={(e) => setNewRoot(e.target.value)}
+                  />
+                  <button className="primary">Ana Bölüm Ekle</button>
+                  {tree.length > 0 && (
+                    <button
+                      type="button"
+                      className="small danger"
+                      style={{ marginLeft: 'auto' }}
+                      disabled={clearTreeBusy}
+                      onClick={clearCurrentPlanTree}
+                      title="Bu planın tüm ağacını (tüm bölüm/maddeleri) siler — plan kaydı ve geçmiş iş emirleri korunur"
+                    >
+                      <Trash2 size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                      {clearTreeBusy ? 'Siliniyor…' : 'Bu Planın Ağacını Tamamen Sil'}
+                    </button>
+                  )}
+                </form>
+              </div>
+            )}
             <div className="card">
               <ul className="tree">
                 {tree.map((n) => (
-                  <EditorNode key={n.id} node={n} onChanged={load} allNodes={all} knownParts={knownParts} />
+                  <EditorNode key={n.id} node={n} onChanged={load} allNodes={all} knownParts={knownParts} isAdmin={isAdmin} />
                 ))}
               </ul>
               {tree.length === 0 && (
-                <div className="muted">Bu plan için henüz bölüm yok. Yukarıdan ekleyin.</div>
+                <div className="muted">
+                  {isAdmin
+                    ? 'Bu plan için henüz bölüm yok. Yukarıdan ekleyin.'
+                    : 'Bu plan için henüz bölüm yok.'}
+                </div>
               )}
             </div>
-            <Model3DSection planId={planId} flatNodes={flatNodes} />
+            {isAdmin && <Model3DSection planId={planId} flatNodes={flatNodes} />}
           </>
         )
       )}
 
+      {isAdmin && (
       <div className="card" style={{ marginTop: 20, borderColor: 'var(--red)', background: 'var(--red-light)' }}>
         <div className="card-head">
           <div>
@@ -1390,6 +1473,7 @@ export default function TreeEditorPage() {
           </div>
         )}
       </div>
+      )}
     </>
   )
 }

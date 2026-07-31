@@ -4,12 +4,11 @@ import type { Maintenance, Plan, User, Vehicle } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Badge, EmptyState, SkeletonTableRows } from '../components/ui'
 import { ChevronRight, Download, ListFilter, History as HistoryIcon, Truck } from 'lucide-react'
+import { targetLabel, mergedPeriodLabel } from '../format'
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
-const fmtKm = (n: number) => n.toLocaleString('tr-TR')
 // Süre bazlı iş emirlerinde gerçek hedef target_date'dedir (target_km gizli/null).
-const hedefLabel = (m: Maintenance) =>
-  m.target_date ? new Date(m.target_date).toLocaleDateString('tr-TR') : `${fmtKm(m.target_km ?? 0)} km`
+const hedefLabel = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
 
 interface Filters {
   status: string
@@ -207,7 +206,7 @@ export default function HistoryPage({
                       <span className="vehicle-code"><Truck size={13} style={{ verticalAlign: -2, marginRight: 4 }} />{m.vehicle.code}</span>
                     </td>
                     <td style={{ fontWeight: 600 }}>#{m.id}</td>
-                    <td>{m.plan.name}</td>
+                    <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
                     <td>{hedefLabel(m)}</td>
                     <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                     <td>{fmt(m.completed_at)}</td>
