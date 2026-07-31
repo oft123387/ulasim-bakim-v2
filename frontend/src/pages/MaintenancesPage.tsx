@@ -979,14 +979,37 @@ function MaintenanceDetail({
     setError('')
     setStatusActionBusy(true)
     try {
-      const result = await api<{ added_items: number; merged_periods: number[] }>(
-        `/maintenances/${m.id}/resync-tiers`, { method: 'POST' },
-      )
+      const result = await api<{
+        added_items: number
+        merged_periods: number[]
+        diagnostics?: {
+          name: string
+          interval_km: number
+          vehicle_model: string
+          is_active: boolean
+          is_catalog_only: boolean
+          divides_target: boolean
+          excluded_reason: string | null
+        }[]
+      }>(`/maintenances/${m.id}/resync-tiers`, { method: 'POST' })
       load()
       if (result.added_items > 0) {
         showToast(`✓ Eksik periyot eklendi (${result.added_items} yeni madde)`, 'info')
       } else {
         showToast('Eksik periyot bulunamadı, checklist zaten güncel', 'info')
+        // Teşhis: bu araç modeliyle eşleşen HER km planının neden dahil
+        // olup olmadığını göster — "3M gelmiyor" gibi durumlarda hangi
+        // planın (pasif/katalog-amaçlı/hedefe bölünmüyor) dışlandığını
+        // tek bakışta görmek için (bkz. services._diagnose_missing_tiers).
+        const diag = result.diagnostics ?? []
+        if (diag.length) {
+          const lines = diag.map((d) => {
+            const model = d.vehicle_model ? `[${d.vehicle_model}]` : '[Genel]'
+            const status = d.excluded_reason ? `DIŞLANDI — ${d.excluded_reason}` : 'zaten dahil'
+            return `${d.name} ${model} — ${d.interval_km.toLocaleString('tr-TR')} km — ${status}`
+          })
+          alert(`Bu araç modeliyle eşleşen km planları:\n\n${lines.join('\n')}`)
+        }
       }
     } catch (e) {
       setError((e as Error).message)

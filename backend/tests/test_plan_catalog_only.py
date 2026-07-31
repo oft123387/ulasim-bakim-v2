@@ -70,6 +70,16 @@ def test_catalog_only_plan_excluded_from_merge(client, admin_token):
 
         r = client.post(f"/api/maintenances/{m['id']}/resync-tiers", headers=auth(admin))
         assert r.status_code == 200, r.text
-        assert r.json()["added_items"] == 0
+        result = r.json()
+        assert result["added_items"] == 0
+        # Teşhis: 3M planı listede görünmeli ve DIŞLANMA nedeni "katalog-
+        # amaçlı" olarak açıkça belirtilmeli — "3M gelmiyor ama neden
+        # belli değil" durumunu çözen özellik.
+        diag_3m = next(d for d in result["diagnostics"] if d["plan_id"] == plan_3m["id"])
+        assert diag_3m["is_catalog_only"] is True
+        assert diag_3m["divides_target"] is True
+        assert "katalog" in diag_3m["excluded_reason"]
+        diag_1m = next(d for d in result["diagnostics"] if d["plan_id"] == plan_1m["id"])
+        assert diag_1m["excluded_reason"] is None
     finally:
         _cleanup(client, admin, v, [plan_1m, plan_3m, plan_6m])

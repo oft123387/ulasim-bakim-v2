@@ -953,7 +953,7 @@ def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
 
     to_merge = [p for p in applicable if p.interval_km not in already_covered]
     if not to_merge:
-        return {"added_items": 0, "merged_periods": []}
+        return {"added_items": 0, "merged_periods": [], "diagnostics": _diagnose_missing_tiers(db, m)}
 
     order_counter: dict[int | None, int] = {}
     for item in by_id.values():
@@ -999,7 +999,43 @@ def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
             walk(r, None, tuple(), plan.interval_km)
 
     db.commit()
-    return {"added_items": added, "merged_periods": [p.interval_km for p in to_merge]}
+    return {"added_items": added, "merged_periods": [p.interval_km for p in to_merge], "diagnostics": []}
+
+
+def _diagnose_missing_tiers(db: Session, m: "models.Maintenance") -> list[dict]:
+    """resync_maintenance_tiers hiçbir eksik periyot bulamadığında ("checklist
+    zaten güncel") gerçekten öyle mi yoksa bir plan SESSİZCE mi dışlanıyor
+    anlaşılamıyordu (kullanıcı geri bildirimi: "3M gelmiyor" ama neden
+    olduğu belirsizdi). Bu fonksiyon, aracın modeliyle eşleşen (bkz.
+    _model_matches — büyük/küçük harf ve Türkçe karakterden bağımsız) HER
+    km bazlı planı, aktiflik/katalog/bölünebilirlik durumuyla birlikte
+    döner ki hangi planın neden dahil olmadığı tek bakışta görülebilsin."""
+    vehicle = m.vehicle
+    all_km_plans = [
+        p for p in db.query(models.MaintenancePlan).all()
+        if p.plan_type == "km" and p.interval_km > 0 and _model_matches(p.vehicle_model, vehicle.model)
+    ]
+    out: list[dict] = []
+    for p in sorted(all_km_plans, key=lambda p: p.interval_km):
+        divides = m.target_km % p.interval_km == 0
+        reasons = []
+        if not p.is_active:
+            reasons.append("plan pasif")
+        if p.is_catalog_only:
+            reasons.append("plan katalog-amaçlı işaretli")
+        if not divides:
+            reasons.append(f"hedef km ({m.target_km}) bu periyoda ({p.interval_km}) tam bölünmüyor")
+        out.append({
+            "plan_id": p.id,
+            "name": p.name,
+            "interval_km": p.interval_km,
+            "vehicle_model": p.vehicle_model,
+            "is_active": p.is_active,
+            "is_catalog_only": p.is_catalog_only,
+            "divides_target": divides,
+            "excluded_reason": ", ".join(reasons) if reasons else None,
+        })
+    return out
 
 
 # ------------------------------------------------------- yaklaşan bakımlar
