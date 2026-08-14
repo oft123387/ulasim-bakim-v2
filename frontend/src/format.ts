@@ -81,3 +81,25 @@ export function mergedPeriodLabel(
   if (planType === 'time') return sorted.map(monthsLabel).join(' + ')
   return sorted.map((km) => sirioKmCode(km, vehicleModel) ?? `${fmtKmTr(km)} km`).join(' + ')
 }
+
+/** Kademeli bir bakımın kapsadığı periyotlardan yalnızca EN BÜYÜĞÜNÜ (yöneten
+ * periyodu) gösterir — ör. "800.000 km" (altındaki 200.000 km vb. küçük
+ * periyotları listede tekrar tekrar yazmaz). Bakımlar sayfasındaki Bakım
+ * Akışı listesi için: küçük periyotlar zaten bakım detayına girilince
+ * ("Bu bakım şu periyotları birleştirir" bölümünde) görülüyor, listede ayrıca
+ * uzun "200.000 km + 800.000 km" etiketine gerek yok. Diğer ekranlarda
+ * (bakım detay başlığı, takvim vb.) kafa karışıklığını önlemek için TÜM
+ * periyotları gösteren mergedPeriodLabel kasıtlı olarak kullanılmaya devam
+ * eder — bu yardımcı yalnızca liste görünümü içindir. */
+export function topPeriodLabel(
+  coveredTiers: number[] | null | undefined,
+  planType: 'km' | 'time' | 'unknown' | undefined,
+  vehicleModel: string | null | undefined,
+  fallbackPlanName: string,
+): string {
+  const tiers = coveredTiers ?? []
+  if (tiers.length === 0) return fallbackPlanName
+  const top = Math.max(...tiers)
+  if (planType === 'time') return monthsLabel(top)
+  return sirioKmCode(top, vehicleModel) ?? `${fmtKmTr(top)} km`
+}

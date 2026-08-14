@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api, apiDownload } from '../api'
+import { useLiveEvent } from '../liveEvents'
 import type { KPIReport } from '../types'
 import { PageHeader, StatCard, Skeleton, EmptyState } from '../components/ui'
 import { Download, CheckCircle2, Clock, AlertTriangle, Flame, Truck, Users, Timer } from 'lucide-react'
@@ -75,11 +76,21 @@ export default function KPIPage() {
     return p.toString()
   }, [range])
 
+  const load = useCallback(() => {
+    api<KPIReport>(`/kpi?${query}`).then(setData).catch((e) => setError((e as Error).message))
+  }, [query])
+
   useEffect(() => {
     setData(null)
     setError('')
-    api<KPIReport>(`/kpi?${query}`).then(setData).catch((e) => setError((e as Error).message))
-  }, [query])
+    load()
+  }, [query, load])
+
+  // Kullanıcı isteği: "kpi ekranı aktif olarak güncellensin, araçlar
+  // tamamlandıkça/geciktikçe/kaldıkça kendini güncellesin" — bir bakım
+  // tamamlanınca/başlayınca, bir madde tiklenince ya da bir aracın km'si
+  // güncellenince (kritik/gecikmiş sayıları her zaman güncel duruma göre —
+  useLiveEvent(['maintenance', 'vehicle', 'item'], load)
 
   async function exportExcel() {
     setExporting(true)
@@ -104,7 +115,6 @@ export default function KPIPage() {
     <div>
       <PageHeader
         title="KPI Raporu"
-        subtitle="Filo genelinde tamamlanma, kritiklik, araç/model ve personel performansı"
         actions={
           <button className="primary" onClick={exportExcel} disabled={exporting || !data}>
             <Download size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
@@ -198,19 +208,6 @@ export default function KPIPage() {
               icon={<Flame size={18} />}
             />
           </div>
-          <div className="muted" style={{ fontSize: 11.5, marginTop: -10, marginBottom: 16 }}>
-            Kritik/gecikmiş sayıları her zaman güncel duruma göredir, seçilen tarih aralığından bağımsızdır.
-            Seçilen aralıkta {data.completion.opened_in_range} iş emri açıldı, {data.completion.completed_in_range} iş emri tamamlandı.
-            {' '}Zamanında bakım oranı, {data.completion.on_time_evaluated} değerlendirilebilir tamamlanan bakımın{' '}
-            {data.completion.on_time_count} tanesinin, km bazlı planlarda planın kendi tolerans penceresi
-            içinde (varsayılan -%5/+%10) açılmış olmasına, süre bazlı planlarda ise hedef tarihte veya
-            öncesinde bitirilmiş olmasına göre hesaplanır
-            {data.completion.on_time_evaluated < data.completion.completed_in_range
-              ? ' (periyodu belirsiz bakımlar hariç tutulur)'
-              : ''}
-            .
-          </div>
-
           {modelChartData.length > 0 && (
             <div className="card slide-up" style={{ marginBottom: 16 }}>
               <div className="card-head">

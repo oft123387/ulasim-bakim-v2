@@ -18,6 +18,7 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("production_year", "INTEGER"),
         ("photo_filename", "VARCHAR(300) DEFAULT ''"),
         ("commissioning_date", "DATE"),
+        ("baseline_km", "INTEGER"),
     ],
     "users": [
         ("email", "VARCHAR(200) DEFAULT ''"),
@@ -74,9 +75,9 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("activated_by_id", "INTEGER"),
         ("target_date", "DATE"),
         ("scheduled_start_at", "DATE"),
-    ],
-    "alarm_states": [
-        ("emailed_at", "DATETIME"),
+        ("planned_date", "DATE"),
+        ("assigned_shift_id", "INTEGER"),
+        ("completed_km", "INTEGER"),
     ],
     "audit_logs": [
         ("old_value", "TEXT DEFAULT ''"),
@@ -183,6 +184,22 @@ def _migrate_suggestions_hierarchical_approval(engine: Engine, existing_tables: 
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_suggestions_created_at ON suggestions (created_at)"))
 
 
+def _migrate_suggestions_flatten_approval(engine: Engine, existing_tables: set[str]) -> None:
+    """Faz 31 — öneri onayındaki iki aşamalı (amir -> mühendis) zincir
+    kaldırıldı. Zincirin ORTASINDA kalmış kayıtlar ('pending_engineer' —
+    amir onaylamış, mühendisin kararı bekleniyor) artık normal bir bekleyen
+    öneri gibi ele alınmalı ki yetkili biri tek kararla sonuçlandırabilsin.
+
+    Sonuçlanmış kayıtlara (approved/rejected/added) DOKUNULMAZ — geçmiş
+    aynen korunur. İdempotenttir: çevrilecek satır yoksa hiçbir şey yapmaz."""
+    if "suggestions" not in existing_tables:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "UPDATE suggestions SET status = 'pending' WHERE status = 'pending_engineer'"
+        ))
+
+
 def run_light_migrations(engine: Engine) -> None:
     if not engine.url.get_backend_name().startswith("sqlite"):
         return  # yalnızca SQLite için otomatik migration uygulanır
@@ -191,6 +208,7 @@ def run_light_migrations(engine: Engine) -> None:
     existing_tables = set(inspector.get_table_names())
 
     _migrate_suggestions_hierarchical_approval(engine, existing_tables)
+    _migrate_suggestions_flatten_approval(engine, existing_tables)
 
     # Güvenlik notu (Faz 23 denetimi): buradaki f-string yalnızca yukarıdaki
     # _NEW_COLUMNS sabitinden (kaynak kodda gömülü, kullanıcı girdisi

@@ -1,16 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, apiDownload, apiUploadWithFields } from '../api'
+import { useLiveEvent } from '../liveEvents'
 import { showToast } from '../components/toast'
-import { targetLabel, mergedPeriodLabel } from '../format'
+import { rawTargetLabel, mergedPeriodLabel, topPeriodLabel } from '../format'
+import { pushDetail, useDetailPopState } from '../useDetailHistory'
 import Tram3D from '../components/Tram3D'
-import type { ExportFormat, Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Plan, Shift, ShiftModeConfig, User, Vehicle } from '../types'
+import MaintenanceCalendar from '../components/MaintenanceCalendar'
+import type { Item, Maintenance, MaintenanceNote, Model3DWithStatus, NodeAttachment, Plan, Shift, ShiftModeConfig, UpcomingItem, User, Vehicle } from '../types'
 import { STATUS_TR } from '../types'
 import {
   PageHeader,
   Badge,
   Avatar,
   EmptyState,
-  SkeletonTableRows,
 } from '../components/ui'
 import {
   ArrowLeft,
@@ -30,7 +32,6 @@ import {
   Send,
   AlertTriangle,
   Users,
-  PlayCircle,
   ShieldAlert,
   Trash2,
   Plus,
@@ -39,11 +40,22 @@ import {
   CheckCircle2,
   RotateCcw,
   RefreshCw,
+  PlayCircle,
+  Pencil,
+  Check,
+  CalendarClock,
+  XCircle,
+  BookOpen,
 } from 'lucide-react'
 
 // Paylaşılan tablet üzerinde vardiya seçimi, aynı tarayıcıda sayfa
 // yenilense/gezinilse de hatırlansın diye localStorage'da tutulur.
 const ACTIVE_SHIFT_STORAGE_KEY = 'ulasim_bakim_active_shift_id'
+
+// Usta bakım takviminde geriye dönük kaç aylık TAMAMLANMIŞ bakımın
+// yükleneceği. Takvim ay ay gezilebildiği için bir sınır gerekiyor; daha
+// eskisi için Bakım Geçmişi sayfası kullanılır.
+const CALENDAR_HISTORY_MONTHS = 12
 
 // ---------------------------------------------------------- Madde ekleri (Faz 10)
 function AttachmentChip({ att }: { att: NodeAttachment }) {
@@ -140,15 +152,13 @@ function ItemExtras({
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
-// Tahmini Bakım Aralığı rozetinde km'nin yanında tahmini tarih de gösterilir
-// (ör. "en geç 12.08.2026") — DAILY_KM varsayımıyla hesaplanan earliest/latest
-// tarihlerin gün.ay.yıl biçiminde yazımı.
-const fmtDate = (d: Date) => d.toLocaleDateString('tr-TR')
 
 // Süre bazlı (aylık/yıllık) iş emirlerinde gerçek hedef bir km değil takvim
 // tarihidir (target_date) — backend km alanını bu durumda gizler (null).
 // Tablo/başlık gösterimlerinde ikisini de doğru biçimde tek bir metne çevirir.
-const hedefLabel = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
+// Kullanıcı isteği: hedef km HER ZAMAN tam km olarak yazılsın (Sirio kısa
+// M/Y kodu KULLANILMASIN — ör. "1.500.000 km", asla "150M").
+const hedefLabel = (m: Maintenance) => rawTargetLabel(m.target_km, m.target_date)
 
 // Plan periyodunu türüne göre okunur biçimde göster (km bazlı ↔ süre bazlı) —
 // seçim listelerinde kullanılır.
@@ -161,110 +171,10 @@ const planPeriodLabel = (p: Plan) => {
   return `${fmtKm(p.interval_km)} km`
 }
 
-// Takvim/Dashboard'daki projeksiyonlarla aynı varsayım: günde ortalama 300 km.
-const DAILY_KM = 300
-
-// Kullanıcının onayladığı km-tolerans tablosuyla birebir aynı kural (bkz.
-// backend services.MAX_TOLERANCE_KM): yüzdelik (pct) tolerans, periyot
-// büyüdükçe sınırsız büyümez — her iki yönde de en fazla 3.000 km'de
-// tavanlanır. Burada da uygulanmazsa büyük periyotlu (ör. Sirio 12Y =
-// 1.440.000 km) planlarda tolerans penceresi backend'in gerçekte
-// uyguladığından çok daha geniş hesaplanır ve "toleranstan çıkmaya yakın"
-// sıralaması/tarihleri yanlış çıkardı.
-const MAX_TOLERANCE_KM = 3000
-
-/** Bir iş emri için tahmini bakım PENCERESİ — planın alt (-%lower) ve üst
- * (+%upper) tolerans sınırlarının, aracın güncel km'sinden günde ortalama
- * DAILY_KM ilerlediği varsayımıyla kaç gün sonra geleceğini hesaplar.
- * "En erken" tarih, aracın alt tolerans sınırına ulaşacağı (bakıma
- * başlanabileceği) tarihtir; "en geç" tarih üst tolerans sınırının
- * (planın otomatik açma penceresinin sonu) tarihidir. Yalnızca henüz
- * tamamlanmamış iş emirleri için anlamlıdır. */
-function estimateWindow(
-  m: Maintenance,
-): {
-  earliest: Date
-  latest: Date
-  earliestReached: boolean
-  overdue: boolean
-  remainingKm: number
-  upperKm: number
-} | null {
-  if (m.status === 'completed') return null
-  // Süre bazlı (aylık/yıllık) iş emirlerinde hedef bir km değil takvim
-  // tarihidir (target_date) — km projeksiyonu burada anlamsız, bu yüzden bu
-  // fonksiyon yalnızca km bazlı planlar için hesap yapar.
-  if (m.plan.plan_type === 'time' || m.target_km == null) return null
-  // Faz 26: plan yüzde (lower_pct/upper_pct) ya da sabit km (lower_km/
-  // upper_km) bazlı tolerans kullanabiliyor — hangisi geçerliyse ona göre
-  // hesapla (aksi halde km bazlı bir plan için burada hep varsayılan %50/%10
-  // kullanılıp yanlış tarih üretilirdi). Yüzdelik tip ayrıca MAX_TOLERANCE_KM
-  // ile tavanlanır (bkz. yukarıdaki sabitin açıklaması) — sabit km tipi
-  // (threshold_type==='km') admin'in bilinçli girdiği değerdir, tavanlanmaz.
-  const lowerDist = m.plan.threshold_type === 'km'
-    ? m.plan.lower_km
-    : Math.min((m.plan.interval_km * m.plan.lower_pct) / 100, MAX_TOLERANCE_KM)
-  const upperDist = m.plan.threshold_type === 'km'
-    ? m.plan.upper_km
-    : Math.min((m.plan.interval_km * m.plan.upper_pct) / 100, MAX_TOLERANCE_KM)
-  const lowerKm = m.target_km - lowerDist
-  const upperKm = m.target_km + upperDist
-  const remainingLower = lowerKm - m.vehicle.current_km
-  const remainingUpper = upperKm - m.vehicle.current_km
-  const earliestDays = Math.max(0, Math.ceil(remainingLower / DAILY_KM))
-  const latestDays = Math.max(0, Math.ceil(remainingUpper / DAILY_KM))
-  const earliest = new Date()
-  earliest.setDate(earliest.getDate() + earliestDays)
-  const latest = new Date()
-  latest.setDate(latest.getDate() + latestDays)
-  return {
-    earliest,
-    latest,
-    earliestReached: remainingLower <= 0,
-    overdue: remainingUpper <= 0,
-    // Sıralama ve gösterim için km bazlı kalan mesafe (negatifse süresi
-    // geçmiş demektir) — hedef km'den aracın güncel km'si çıkarılır.
-    remainingKm: m.target_km - m.vehicle.current_km,
-    // Üst tolerans sınırının mutlak km değeri — "toleranstan çıkmaya ne
-    // kadar kaldı" (upperKm - current_km) hesabı için (bkz. bekleyenler
-    // listesi aciliyet sıralaması).
-    upperKm,
-  }
-}
-
-// "Başlatılmayı Bekleyenler" listesi için aciliyet sıralaması (kullanıcı
-// isteği): 3 kademeli (bucket) bir öncelik —
-//   0) 1M periyodu (interval_km === 10.000) olan HERHANGİ bir bakım varsa,
-//      başka hiçbir kritere bakılmadan en üstte gösterilir (1M en sık
-//      tekrar eden, dolayısıyla en öncelikli periyot kabul edilir).
-//   1) Tam bakım km'si GEÇİLMİŞ (remainingKm <= 0) olanlar: üst tolerans
-//      sınırına ne kadar az kaldıysa (upperKm - current_km küçüldükçe,
-//      yani "artık toleranstan çıkabilir" tehlikesi arttıkça) o kadar
-//      öncelikli — bu değer zaten negatife düşebilir (tolerans da
-//      aşılmışsa), bu da otomatik olarak en tepeye çıkmasını sağlar.
-//   2) Henüz hedefe ulaşmamış olanlar: tam bakım km'sine en yakın olan
-//      (remainingKm en küçük, sıfıra en yakın) en üstte.
-//   3) Süre bazlı (aylık/yıllık) planlar gibi km projeksiyonu hesaplanamayan
-//      kayıtlar — en sona atılır, aralarında oluşturulma sırasına göre.
-function pendingUrgencyKey(m: Maintenance): [number, number] {
-  const isOneM = m.plan.plan_type === 'km' && m.plan.interval_km === 10_000
-  const w = estimateWindow(m)
-  if (!w) return [isOneM ? 0 : 3, 0]
-  if (isOneM) return [0, w.remainingKm]
-  if (w.remainingKm <= 0) return [1, w.upperKm - m.vehicle.current_km]
-  return [2, w.remainingKm]
-}
-
-function sortPendingByUrgency(list: Maintenance[]): Maintenance[] {
-  return list
-    .slice()
-    .sort((a, b) => {
-      const [ba, va] = pendingUrgencyKey(a)
-      const [bb, vb] = pendingUrgencyKey(b)
-      if (ba !== bb) return ba - bb
-      return va - vb
-    })
-}
+const upcomingRemainingLabel = (item: UpcomingItem) =>
+  item.remaining_km < 0
+    ? `${fmtKm(Math.abs(item.remaining_km))} km geçti`
+    : `${fmtKm(item.remaining_km)} km kaldı`
 
 function countLeaves(items: Item[]): [number, number] {
   let done = 0
@@ -291,6 +201,7 @@ function TreeItem({
   onEditNote,
   onAddPhoto,
   onDeletePhoto,
+  onOpenKnowledge,
   highlightId,
   showTierBadges,
   expandIds,
@@ -305,6 +216,9 @@ function TreeItem({
   // Faz 21 — bakım sırasında tablet kamerasıyla/galeriden görsel ekleme.
   onAddPhoto: (itemId: number, file: File) => void
   onDeletePhoto: (attachmentId: number) => void
+  // Faz 27 — "Bilgi" düğmesi: maddeyi Bakım Bilgi Bankası'nda açar (video /
+  // talimat / açıklama). Tikleme akışına DOKUNMAZ, yanına eklenir.
+  onOpenKnowledge?: (nodeId: number) => void
   highlightId?: number | null
   showTierBadges?: boolean
   // Notlu Maddeler panelinden bir maddeye atlanınca, ona giden yoldaki tüm
@@ -422,6 +336,16 @@ function TreeItem({
             Otomatik (zorunlu değil)
           </span>
         )}
+        {isLeaf && onOpenKnowledge && item.source_node_id != null && (
+          <button
+            className="small ghost"
+            title="Bu maddenin bilgi kartını aç — eğitim videosu, talimat ve açıklama"
+            onClick={() => onOpenKnowledge(item.source_node_id!)}
+          >
+            <BookOpen size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+            Bilgi
+          </button>
+        )}
         {isLeaf && canEdit && (
           <button
             className="small ghost"
@@ -509,6 +433,7 @@ function TreeItem({
                   onEditNote={onEditNote}
                   onAddPhoto={onAddPhoto}
                   onDeletePhoto={onDeletePhoto}
+                  onOpenKnowledge={onOpenKnowledge}
                   highlightId={highlightId}
                   showTierBadges={showTierBadges}
                   expandIds={expandIds}
@@ -672,23 +597,31 @@ function MaintenanceDetail({
   onDeleted,
   shiftModeEnabled,
   activeShiftId,
-  activeShiftName,
   shiftMembersVersion,
+  shifts,
+  onOpenKnowledge,
 }: {
   id: number
   user: User
   perms: Record<string, boolean>
   onBack: () => void
   onDeleted: () => void
-  // Vardiyalı çalışma kapalıyken madde tamamlama/not ekleme seçici
-  // göstermeden doğrudan oturum sahibine (user) atfedilir. Açıkken seçici
-  // yalnızca activeShiftId'deki kişileri listeler.
+  // Vardiyalı çalışma kapalıyken not ekleme seçici göstermeden doğrudan
+  // oturum sahibine (user) atfedilir. Açıkken seçici yalnızca
+  // activeShiftId'deki kişileri listeler. Madde tamamlama artık vardiya
+  // modundan bağımsız her zaman doğrudan oturum sahibine atfedilir (bkz.
+  // requestComplete) — kullanıcı isteği: "vardiya atandıktan sonra tek tek
+  // tiklerken isim seçme olmasın, direkt giriş yapmış kullanıcı gözüksün."
   shiftModeEnabled: boolean
   activeShiftId: number | null
-  activeShiftName: string | null
   // Vardiya üyeliği değişince (Bakımlar sayfasındaki vardiya barından üye
   // ekle/çıkar) isim seçici listesini hemen tazelemek için sayaç.
   shiftMembersVersion: number
+  // "Vardiya" ataması (m.assigned_shift) için seçenek listesi — "Atanan"
+  // (kişi) dropdown'undan bağımsız, ayrı bir satırda gösterilir.
+  shifts: Shift[]
+  // Faz 27 — madde satırındaki "Bilgi" düğmesi (Bakım Bilgi Bankası).
+  onOpenKnowledge?: (nodeId: number) => void
 }) {
   const [m, setM] = useState<Maintenance | null>(null)
   const [models3d, setModels3d] = useState<Model3DWithStatus[]>([])
@@ -704,16 +637,16 @@ function MaintenanceDetail({
   const [statusActionBusy, setStatusActionBusy] = useState(false)
   const [assignableUsers, setAssignableUsers] = useState<User[]>([])
   const [assignBusy, setAssignBusy] = useState(false)
+  const [shiftAssignBusy, setShiftAssignBusy] = useState(false)
+  // Bakım yapılırken girilen güncel km (yalnızca km bazlı planlarda) — bkz.
+  // saveCompletedKm.
+  const [completedKmInput, setCompletedKmInput] = useState('')
+  const [completedKmBusy, setCompletedKmBusy] = useState(false)
   // Vardiyalı çalışma AÇIKKEN "kim tikledi / kim not ekledi" seçicilerinde
   // yalnızca o an seçili vardiyadaki kişiler listelenir (assignableUsers'tan
   // ayrı tutulur — "Atanan" (iş emri sorumlusu) dropdown'u vardiyadan
   // bağımsız olarak her zaman herkesi gösterir).
   const [pickerUsers, setPickerUsers] = useState<User[]>([])
-  // Paylaşılan tablet senaryosu: bir madde tiklendiğinde, tikleyen kişi
-  // kendi adını seçer (oturum sahibinden bağımsız). Seçim yapılana kadar
-  // madde tamamlanmaz; bu yüzden itemId burada "onay bekliyor" anlamına gelir.
-  const [pickerItemId, setPickerItemId] = useState<number | null>(null)
-  const [pickerUserId, setPickerUserId] = useState<number | ''>('')
   const [noteText, setNoteText] = useState('')
   const [noteAuthorId, setNoteAuthorId] = useState<number | ''>('')
   const [noteBusy, setNoteBusy] = useState(false)
@@ -740,6 +673,7 @@ function MaintenanceDetail({
   }, [id])
 
   useEffect(load, [load])
+  useLiveEvent(['maintenance', 'vehicle'], load)
 
   useEffect(() => {
     // Teknisyenlerin de kendi aralarındaki isim listesini görebilmesi
@@ -773,41 +707,54 @@ function MaintenanceDetail({
     }
   }
 
-  // Vardiyalı çalışma KAPALIYKEN madde tamamlama doğrudan oturum sahibine
-  // (user) atfedilir, seçici gösterilmez — paylaşılan tablette tek kişi
-  // çalışıyorsa isim seçmeye gerek yoktur (backend zaten completed_by_id
-  // verilmezse oturum sahibini kullanır). AÇIKKEN ise eskisi gibi bir
-  // seçici açılır, ama yalnızca seçili vardiyadaki kişiler arasından;
-  // tamamlanan madde kilitlendiği için bu seçim sonradan değiştirilemez.
-  async function requestComplete(itemId: number) {
+  // "Atanan" (kişi) alanından bağımsız — iş emrini bir vardiyaya atar.
+  async function assignShift(shiftId: number | null) {
     setError('')
-    if (!shiftModeEnabled) {
-      try {
-        await api(`/items/${itemId}/complete`, { method: 'POST' })
-        load()
-        showToast('✓ Kaydedildi')
-      } catch (e) {
-        setError((e as Error).message)
-      }
-      return
+    setShiftAssignBusy(true)
+    try {
+      await api(`/maintenances/${id}/assign-shift`, { method: 'PATCH', body: { assigned_shift_id: shiftId } })
+      load()
+      showToast('✓ Vardiya ataması güncellendi')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setShiftAssignBusy(false)
     }
-    if (activeShiftId == null) {
-      setError('Lütfen önce üstteki listeden çalıştığınız vardiyayı seçin.')
-      return
-    }
-    setPickerUserId('')
-    setPickerItemId(itemId)
   }
 
-  async function confirmComplete() {
-    if (pickerItemId === null || pickerUserId === '') return
+  // Kullanıcı isteği: "bakım yapılırken bakım yapan usta veya kişi
+  // tarafından o anki güncel km girme olsun." Girilen km, hedef km'ye göre
+  // sapma yüzdesini (backend'de hesaplanır) belirler ve gerekirse aracın
+  // takip edilen km'sini de ileri taşır.
+  async function saveCompletedKm() {
+    const km = Number(completedKmInput)
+    if (!completedKmInput || Number.isNaN(km) || km <= 0) {
+      setError('Geçerli bir km giriniz')
+      return
+    }
+    setError('')
+    setCompletedKmBusy(true)
+    try {
+      await api(`/maintenances/${id}/completed-km`, { method: 'PATCH', body: { completed_km: km } })
+      setCompletedKmInput('')
+      load()
+      showToast('✓ Tamamlanan km kaydedildi')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setCompletedKmBusy(false)
+    }
+  }
+
+  // Kullanıcı isteği: vardiya atandıktan sonra da madde tamamlama "kim
+  // tikledi" seçicisi göstermesin — artık herkes kendi hesabıyla giriş
+  // yaptığı için doğrudan oturum sahibine (user) atfedilir, tıpkı vardiyalı
+  // çalışma kapalıyken olduğu gibi (backend zaten completed_by_id
+  // verilmezse oturum sahibini kullanır).
+  async function requestComplete(itemId: number) {
     setError('')
     try {
-      await api(`/items/${pickerItemId}/complete`, {
-        method: 'POST',
-        body: { completed_by_id: pickerUserId },
-      })
-      setPickerItemId(null)
+      await api(`/items/${itemId}/complete`, { method: 'POST' })
       load()
       showToast('✓ Kaydedildi')
     } catch (e) {
@@ -1132,7 +1079,10 @@ function MaintenanceDetail({
         </div>
         <div className="muted" style={{ margin: '10px 0' }}>
           İş Emri #{m.id} · {hedefLabel(m)}'de açıldı · Oluşturma: {fmt(m.created_at)} ·
-          Başlangıç: {fmt(m.started_at)} · Bitiş: {fmt(m.completed_at)} · Açılış KM: {fmtKm(m.km_at_open)}
+          Başlangıç: {fmt(m.started_at)} · Bitiş: {fmt(m.completed_at)} · Açılış KM: {fmtKm(m.km_at_open)} ·{' '}
+          <span title={m.vehicle.last_km_update_at ? `Son güncelleme: ${fmt(m.vehicle.last_km_update_at)}` : undefined}>
+            Aracın Anlık KM'si: <strong>{fmtKm(m.vehicle.current_km)}</strong>
+          </span>
         </div>
         <div className="row" style={{ marginBottom: 10, gap: 8 }}>
           <span className="muted" style={{ fontSize: 13 }}>Atanan:</span>
@@ -1170,6 +1120,55 @@ function MaintenanceDetail({
             </>
           )}
         </div>
+        <div className="row" style={{ marginBottom: 10, gap: 8 }}>
+          <span className="muted" style={{ fontSize: 13 }}>Vardiya:</span>
+          {isStaff ? (
+            <select
+              value={m.assigned_shift?.id ?? ''}
+              disabled={shiftAssignBusy}
+              onChange={(e) => assignShift(e.target.value ? Number(e.target.value) : null)}
+              style={{ fontSize: 12.5, padding: '5px 8px' }}
+            >
+              <option value="">Atanmamış</option>
+              {shifts.map((s) => (
+                <option key={s.id} value={s.id}>{s.name}</option>
+              ))}
+            </select>
+          ) : (
+            <span className="muted" style={{ fontSize: 13 }}>{m.assigned_shift?.name || 'Atanmamış'}</span>
+          )}
+        </div>
+        {m.plan.plan_type === 'km' && (
+          <div className="row" style={{ marginBottom: 10, gap: 8, flexWrap: 'wrap' }}>
+            <span className="muted" style={{ fontSize: 13 }}>Tamamlanan KM:</span>
+            {m.completed_km != null ? (
+              <span style={{ fontWeight: 600, fontSize: 13 }}>{fmtKm(m.completed_km)}</span>
+            ) : (
+              <span className="muted" style={{ fontSize: 13 }}>Girilmedi</span>
+            )}
+            {m.km_deviation_pct != null && (
+              <Badge tone={m.km_deviation_pct >= -5 && m.km_deviation_pct <= 10 ? 'completed' : 'danger'}>
+                Sapma {m.km_deviation_pct > 0 ? '+' : ''}{m.km_deviation_pct}%
+              </Badge>
+            )}
+            {(isStaff || (isTechnician && (!m.assigned_to || m.assigned_to.id === user.id))) && (
+              <>
+                <input
+                  type="number"
+                  min={1}
+                  placeholder="Güncel km"
+                  value={completedKmInput}
+                  onChange={(e) => setCompletedKmInput(e.target.value)}
+                  disabled={completedKmBusy}
+                  style={{ fontSize: 12.5, padding: '5px 8px', width: 120 }}
+                />
+                <button className="small" disabled={completedKmBusy} onClick={saveCompletedKm}>
+                  Kaydet
+                </button>
+              </>
+            )}
+          </div>
+        )}
         {isMulti && (
           <div className="row" style={{ marginBottom: 10, flexWrap: 'wrap', gap: 6 }}>
             <span className="muted">Bu bakım şu periyotları birleştirir:</span>
@@ -1292,6 +1291,7 @@ function MaintenanceDetail({
               onEditNote={openItemNote}
               onAddPhoto={uploadItemPhoto}
               onDeletePhoto={deleteItemPhoto}
+              onOpenKnowledge={onOpenKnowledge}
               highlightId={highlightId}
               showTierBadges={showTierBadges}
               expandIds={expandIds}
@@ -1358,50 +1358,6 @@ function MaintenanceDetail({
               <Send size={13} style={{ marginRight: 6, verticalAlign: -2 }} />
               Ekle
             </button>
-          </div>
-        </div>
-      )}
-
-      {pickerItemId !== null && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
-          }}
-          onClick={() => setPickerItemId(null)}
-        >
-          <div
-            className="card"
-            style={{ width: 340, maxWidth: '90vw' }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 style={{ marginTop: 0, fontSize: 15 }}>Bu maddeyi kim tamamladı?</h3>
-            <div className="muted" style={{ fontSize: 12.5, marginBottom: 12 }}>
-              {activeShiftName ? `${activeShiftName} — ` : ''}
-              Bu seçim tek seferliktir; onayladıktan sonra değiştirilemez.
-            </div>
-            <select
-              autoFocus
-              value={pickerUserId}
-              onChange={(e) => setPickerUserId(e.target.value ? Number(e.target.value) : '')}
-              style={{ width: '100%', fontSize: 13, padding: '8px 10px' }}
-            >
-              <option value="">İsminizi seçin…</option>
-              {pickerUsers.map((u) => (
-                <option key={u.id} value={u.id}>{u.full_name}</option>
-              ))}
-            </select>
-            {pickerUsers.length === 0 && (
-              <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-                Bu vardiyaya henüz kimse atanmamış. Kullanıcılar sayfasından vardiya ataması yapabilirsiniz.
-              </div>
-            )}
-            <div className="row" style={{ marginTop: 14, gap: 8, justifyContent: 'flex-end' }}>
-              <button className="ghost" onClick={() => setPickerItemId(null)}>Vazgeç</button>
-              <button className="primary" disabled={pickerUserId === ''} onClick={confirmComplete}>
-                Onayla ve Tamamla
-              </button>
-            </div>
           </div>
         </div>
       )}
@@ -1479,22 +1435,43 @@ export default function MaintenancesPage({
   user,
   perms,
   initialSelectedId,
+  onOpenVehicle,
   initialStatus,
   initialPlanName,
+  onOpenKnowledge,
 }: {
   user: User
   perms: Record<string, boolean>
   initialSelectedId?: number | null
+  // Bakım Akışı satırına tıklayınca aracın kartını (Araçlar sayfası profili) açar.
+  onOpenVehicle?: (vehicleId: number) => void
+  // Dashboard'daki "Planlanan Bakım"/"Devam Eden" kartları ve periyot
+  // grafiğinin Bekliyor/Devam Ediyor barlarından gelinirse Bakım Akışı'nı
+  // "Başlatılanlar" sekmesinde (bu ikisi de gerçekten açılmış iş emirleri —
+  // bkz. flowTabItems.started) ve verilen periyot adına göre önceden filtreler.
   initialStatus?: string
   initialPlanName?: string
+  // Bir bakım maddesinin yanındaki "Bilgi" düğmesinden Bakım Bilgi
+  // Bankası'nda o maddeyi açar (Faz 27).
+  onOpenKnowledge?: (nodeId: number) => void
 }) {
-  const [list, setList] = useState<Maintenance[] | null>(null)
-  const [listError, setListError] = useState('')
-  const [status, setStatus] = useState(initialStatus ?? '')
-  const [vehicleFilter, setVehicleFilter] = useState('')
-  const [planFilter, setPlanFilter] = useState(initialPlanName ?? '')
-  const [exportFormat, setExportFormat] = useState<ExportFormat>('xlsx')
   const [selected, setSelected] = useState<number | null>(initialSelectedId ?? null)
+  // Bir iş emri detayına girildiğinde tarayıcı geçmişine bir adım eklenir ki
+  // geri tuşuna basınca (ya da detay içindeki "Bakım Listesi" düğmesine
+  // basınca — o da history.back() çağırır, bkz. aşağıda) düzgünce listeye
+  // dönülsün (bkz. useDetailHistory.ts).
+  useDetailPopState<number>('maintenances', setSelected)
+  function openDetail(id: number) {
+    pushDetail('maintenances', id)
+    setSelected(id)
+  }
+  const [upcoming, setUpcoming] = useState<UpcomingItem[]>([])
+  const [upcomingBusy, setUpcomingBusy] = useState<number | null>(null)
+  const [upcomingError, setUpcomingError] = useState('')
+  // "İleri tarihe zamanla" inline tarih seçici — hangi satırın açık olduğunu
+  // (busyKey ile aynı anahtar) ve o an seçili tarihi tutar.
+  const [scheduleOpenKey, setScheduleOpenKey] = useState<number | null>(null)
+  const [scheduleDate, setScheduleDate] = useState('')
 
   // Vardiyalı çalışma: kapalıyken madde tamamlama/not ekleme otomatik
   // oturum sahibine atfedilir (seçici gösterilmez); açıkken "Vardiya 1/2/3"
@@ -1507,6 +1484,16 @@ export default function MaintenancesPage({
   })
   const [shiftBusy, setShiftBusy] = useState(false)
   const isStaff = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
+
+  // Kullanıcı isteği: vardiya isimleri değiştirilebilsin, yeni vardiya
+  // açılıp kapatılabilsin (bkz. POST/PATCH/DELETE /shifts — manage_users
+  // yetkisi gerektirir, üye atamasıyla aynı yetki).
+  const [editingShiftId, setEditingShiftId] = useState<number | null>(null)
+  const [shiftNameDraft, setShiftNameDraft] = useState('')
+  const [addShiftOpen, setAddShiftOpen] = useState(false)
+  const [newShiftName, setNewShiftName] = useState('')
+  const [shiftCrudBusy, setShiftCrudBusy] = useState(false)
+  const [shiftCrudError, setShiftCrudError] = useState('')
 
   // Vardiya üyelerini (kimin hangi vardiyada olduğunu) buradan yönetebilmek
   // için tüm atanabilir kullanıcıların listesi — "Kullanıcılar" sayfasına
@@ -1567,6 +1554,65 @@ export default function MaintenancesPage({
 
   const activeShiftName = shifts.find((s) => s.id === activeShiftId)?.name ?? null
 
+  function startEditShift(s: Shift) {
+    setEditingShiftId(s.id)
+    setShiftNameDraft(s.name)
+    setShiftCrudError('')
+  }
+
+  async function saveShiftName(id: number) {
+    const name = shiftNameDraft.trim()
+    if (!name) return
+    setShiftCrudBusy(true)
+    setShiftCrudError('')
+    try {
+      const updated = await api<Shift>(`/shifts/${id}`, { method: 'PATCH', body: { name } })
+      setShifts((prev) => prev.map((s) => (s.id === id ? updated : s)))
+      setEditingShiftId(null)
+    } catch (e) {
+      setShiftCrudError((e as Error).message)
+    } finally {
+      setShiftCrudBusy(false)
+    }
+  }
+
+  async function addShift() {
+    const name = newShiftName.trim()
+    if (!name) return
+    setShiftCrudBusy(true)
+    setShiftCrudError('')
+    try {
+      const created = await api<Shift>('/shifts', { method: 'POST', body: { name } })
+      setShifts((prev) => [...prev, created])
+      setNewShiftName('')
+      setAddShiftOpen(false)
+    } catch (e) {
+      setShiftCrudError((e as Error).message)
+    } finally {
+      setShiftCrudBusy(false)
+    }
+  }
+
+  async function removeShift(s: Shift) {
+    if (shifts.length <= 1) return
+    if (!confirm(`"${s.name}" vardiyasını silmek istiyor musunuz? Bu vardiyaya atanmış kullanıcıların vardiya ataması kaldırılır (kendileri silinmez).`)) return
+    setShiftCrudBusy(true)
+    setShiftCrudError('')
+    try {
+      await api(`/shifts/${s.id}`, { method: 'DELETE' })
+      setShifts((prev) => prev.filter((x) => x.id !== s.id))
+      if (activeShiftId === s.id) {
+        setActiveShiftId(null)
+        localStorage.removeItem(ACTIVE_SHIFT_STORAGE_KEY)
+      }
+      loadAllUsers()
+    } catch (e) {
+      setShiftCrudError((e as Error).message)
+    } finally {
+      setShiftCrudBusy(false)
+    }
+  }
+
   const shiftBar = (
     <div className="card" style={{ marginBottom: 16 }}>
       <div className="row" style={{ gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -1584,18 +1630,81 @@ export default function MaintenancesPage({
         {shiftMode?.enabled && (
           <>
             <span className="muted" style={{ fontSize: 13, marginLeft: 6 }}>Çalıştığınız vardiya:</span>
-            {shifts.map((s) => (
-              <button
-                key={s.id}
-                className={`small ${activeShiftId === s.id ? 'primary' : ''}`}
-                onClick={() => selectShift(s.id)}
-              >
-                {s.name}
-              </button>
-            ))}
+            {shifts.map((s) =>
+              editingShiftId === s.id ? (
+                <span key={s.id} className="row" style={{ gap: 4, alignItems: 'center' }}>
+                  <input
+                    autoFocus
+                    value={shiftNameDraft}
+                    onChange={(e) => setShiftNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') saveShiftName(s.id)
+                      if (e.key === 'Escape') setEditingShiftId(null)
+                    }}
+                    style={{ fontSize: 12.5, padding: '5px 8px', width: 120 }}
+                  />
+                  <button className="small primary" disabled={shiftCrudBusy || !shiftNameDraft.trim()} onClick={() => saveShiftName(s.id)} title="Kaydet">
+                    <Check size={13} />
+                  </button>
+                  <button className="small ghost" disabled={shiftCrudBusy} onClick={() => setEditingShiftId(null)} title="Vazgeç">
+                    <X size={13} />
+                  </button>
+                </span>
+              ) : (
+                <span key={s.id} className="row" style={{ gap: 2, alignItems: 'center' }}>
+                  <button
+                    className={`small ${activeShiftId === s.id ? 'primary' : ''}`}
+                    onClick={() => selectShift(s.id)}
+                  >
+                    {s.name}
+                  </button>
+                  {isStaff && (
+                    <>
+                      <button className="ghost" disabled={shiftCrudBusy} title="Vardiya adını değiştir" onClick={() => startEditShift(s)} style={{ padding: 4, minWidth: 0 }}>
+                        <Pencil size={12} />
+                      </button>
+                      {shifts.length > 1 && (
+                        <button className="ghost" disabled={shiftCrudBusy} title="Vardiyayı sil" onClick={() => removeShift(s)} style={{ padding: 4, minWidth: 0 }}>
+                          <Trash2 size={12} />
+                        </button>
+                      )}
+                    </>
+                  )}
+                </span>
+              ),
+            )}
+            {isStaff && (
+              addShiftOpen ? (
+                <span className="row" style={{ gap: 4, alignItems: 'center' }}>
+                  <input
+                    autoFocus
+                    value={newShiftName}
+                    onChange={(e) => setNewShiftName(e.target.value)}
+                    placeholder="Vardiya adı"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') addShift()
+                      if (e.key === 'Escape') { setAddShiftOpen(false); setNewShiftName('') }
+                    }}
+                    style={{ fontSize: 12.5, padding: '5px 8px', width: 120 }}
+                  />
+                  <button className="small primary" disabled={shiftCrudBusy || !newShiftName.trim()} onClick={addShift} title="Ekle">
+                    <Check size={13} />
+                  </button>
+                  <button className="small ghost" disabled={shiftCrudBusy} onClick={() => { setAddShiftOpen(false); setNewShiftName('') }} title="Vazgeç">
+                    <X size={13} />
+                  </button>
+                </span>
+              ) : (
+                <button className="small ghost" onClick={() => setAddShiftOpen(true)}>
+                  <Plus size={12} style={{ marginRight: 4, verticalAlign: -2 }} />
+                  Vardiya Ekle
+                </button>
+              )
+            )}
           </>
         )}
       </div>
+      {shiftCrudError && <div className="error" style={{ marginTop: 8 }}>{shiftCrudError}</div>}
       <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
         {shiftMode?.enabled
           ? 'Bir madde tikleyen/not ekleyen kişi, seçili vardiyadaki isimler arasından seçilir.'
@@ -1659,23 +1768,6 @@ export default function MaintenancesPage({
     </div>
   )
 
-  const loadList = useCallback(() => {
-    setList(null)
-    setListError('')
-    const q = status ? `?status=${status}` : ''
-    api<Maintenance[]>(`/maintenances${q}`)
-      .then(setList)
-      .catch((e) => {
-        setListError((e as Error).message)
-        setList([])
-      })
-  }, [status])
-
-  useEffect(() => {
-    if (selected !== null) return
-    loadList()
-  }, [loadList, selected])
-
   // Faz 26 — Bakım başlatma onayı: otomatik açılan ama admin/mühendis henüz
   // "Başlat" demediği için Bakımlar listesinde/Takvim'de görünmeyen aday iş
   // emirleri. Yalnızca start_maintenance yetkisi olanlara (admin/mühendis/
@@ -1683,57 +1775,207 @@ export default function MaintenancesPage({
   // Faz 26 UI — iki tablo alt alta karışık durmasın diye tek seferde
   // yalnızca biri gösterilir: "Başlatılanlar" (varsayılan) ya da
   // "Bekleyenler" (başlatma yetkisi olanlara, büyük sekme düğmeleriyle seçilir).
-  const [mainView, setMainView] = useState<'started' | 'pending'>('started')
-  const [pendingStart, setPendingStart] = useState<Maintenance[] | null>(null)
-  const [pendingStartBusy, setPendingStartBusy] = useState<number | null>(null)
-  const [pendingStartError, setPendingStartError] = useState('')
-  // Her bekleyen satır için seçili başlatma tarihi (varsayılan: bugün — yani
-  // ekstra bir şey seçmeden "Başlat" demek eskisi gibi ANINDA başlatır;
-  // ileri bir tarih seçilirse iş emri o tarihe otomatik zamanlanır).
-  const [pendingScheduleDate, setPendingScheduleDate] = useState<Record<number, string>>({})
+  // Bakım Akışı üst seçimi: dört kategori büyük sekme düğmeleriyle seçilir;
+  // aşağıda yalnızca seçilen kategorinin tablosu gösterilir.
+  // Bakım Akışı iki sekme: "Başlatılanlar" (iş emri açılmış — Planlandı +
+  // Bakım Gecikti) ve "Başlatılmayı Bekleyenler" (henüz iş emri yok —
+  // Planlanmayı Bekleyen + Yaklaşıyor). Her satırın kendi durumu DURUM
+  // sütununda gösterilir.
+  const [flowTab, setFlowTab] = useState<'started' | 'pending'>('started')
+  // Kullanıcı isteği (Faz 27): usta ekranında "Başlatılmayı Bekleyenler"
+  // hiç görünmesin — usta yalnızca gerçekten başlatılmış işleri görür.
+  // (Zaten teknisyen bu adayları açma yetkisine de sahip değil.)
+  const isTechnician = user.role === 'technician'
+  const showPendingTab = !isTechnician
+  // Bakım Akışı filtreleri: periyot (plan adı) ve araç tipi (model) — seçenekler
+  // aşağıdaki `upcoming` verisinden türetilir (ayrı bir /plans veya /vehicles
+  // çağrısına gerek yok). Dashboard'dan bir periyotla gelinirse (initialPlanName)
+  // aşağıdaki efektle önceden doldurulur.
+  const [flowFilterPlan, setFlowFilterPlan] = useState(initialPlanName ?? '')
+  const [flowFilterModel, setFlowFilterModel] = useState('')
+  // "Seçilen vardiyaya iş emri atama": Bakım Akışı tablosunda hem vardiyaya
+  // göre filtreleme (kullanıcı bir vardiyanın iş listesini görmek isteyebilir)
+  // hem de her satırdan hızlıca vardiya atama/değiştirme yapılabilir.
+  const [flowFilterShift, setFlowFilterShift] = useState<number | ''>('')
+  const [flowShiftAssignBusy, setFlowShiftAssignBusy] = useState<number | null>(null)
+  const flowCardRef = useRef<HTMLDivElement>(null)
+  const loadUpcoming = useCallback(() => {
+    api<UpcomingItem[]>('/vehicles/alerts').then(setUpcoming).catch(() => setUpcoming([]))
+  }, [])
 
-  const todayIso = () => new Date().toISOString().slice(0, 10)
+  // Faz 27 — Usta bakım takvimi. Listeli görünümün ÜSTÜNDE, başlatılmış ve
+  // kendisine atanan iş emirlerini aylık takvimde gösterir. Backend zaten
+  // teknisyene yalnızca kendisine atanan + atanmamış AKTİF (is_activated)
+  // iş emirlerini döndürür (bkz. _filtered_maintenance_query), bu yüzden
+  // burada ek bir yetki filtresi gerekmez.
+  //
+  // Tamamlananlar da gösterilir (yeşil): yönetici bir bakımı "Tamamlandı"
+  // yapınca takvimde GERÇEKTE tamamlandığı güne (completed_at) oturur, geçmiş
+  // aylarda da görünür. Geçmişin tamamı çekilmesin diye tamamlananlar son
+  // CALENDAR_HISTORY_MONTHS ayla sınırlanır — takvim bundan daha geriye
+  // gidilirse zaten Bakım Geçmişi sayfası kullanılır.
+  const [calMaintenances, setCalMaintenances] = useState<Maintenance[]>([])
+  const loadCalendar = useCallback(() => {
+    if (user.role !== 'technician') return
+    const since = new Date()
+    since.setMonth(since.getMonth() - CALENDAR_HISTORY_MONTHS)
+    const from = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-01`
+    Promise.all([
+      // Açık (tamamlanmamış) iş emirleri — planlanan günlerine düşer.
+      api<Maintenance[]>('/maintenances').then((rows) => rows.filter((m) => m.status !== 'completed')),
+      // Tamamlananlar — tamamlanma tarihine göre süzülür.
+      api<Maintenance[]>(
+        `/maintenances?status=completed&date_field=completed&date_from=${from}`,
+      ).catch(() => [] as Maintenance[]),
+    ])
+      .then(([open, done]) => setCalMaintenances([...open, ...done]))
+      .catch(() => setCalMaintenances([]))
+  }, [user.role])
 
-  const loadPendingStart = useCallback(() => {
-    if (!perms.start_maintenance) return
-    api<Maintenance[]>('/maintenances/pending-start')
-      .then(setPendingStart)
-      .catch(() => setPendingStart([]))
-  }, [perms.start_maintenance])
-
-  useEffect(() => {
-    if (selected !== null) return
-    loadPendingStart()
-  }, [loadPendingStart, selected])
-
-  async function startPendingMaintenance(id: number) {
-    const scheduledStartAt = pendingScheduleDate[id] || todayIso()
-    setPendingStartBusy(id)
-    setPendingStartError('')
+  // Kullanıcı isteği: Bakım Akışı'nda o an seçili filtreyle (periyot/araç
+  // tipi/sekme) BİREBİR aynı sonucu Excel'e aktar — her durum kategorisi
+  // (Bakım Gecikti/Planlandı/Yaklaşıyor/Planlanmayı Bekleyen) kendi
+  // sayfasında ("sheet sheet ayır").
+  const [flowExportError, setFlowExportError] = useState('')
+  const [flowExportBusy, setFlowExportBusy] = useState(false)
+  async function exportFlowExcel() {
+    setFlowExportError('')
+    setFlowExportBusy(true)
     try {
-      await api(`/maintenances/${id}/start`, {
-        method: 'POST',
-        body: { scheduled_start_at: scheduledStartAt },
-      })
-      loadPendingStart()
-      loadList()
+      const p = new URLSearchParams()
+      if (flowFilterPlan) p.set('plan_name', flowFilterPlan)
+      if (flowFilterModel) p.set('vehicle_model', flowFilterModel)
+      if (flowFilterShift !== '') p.set('shift_id', String(flowFilterShift))
+      p.set('started', flowTab === 'started' ? 'true' : 'false')
+      await apiDownload(`/vehicles/alerts/export?${p.toString()}`, 'bakim_akisi.xlsx')
     } catch (e) {
-      setPendingStartError((e as Error).message)
+      setFlowExportError((e as Error).message)
     } finally {
-      setPendingStartBusy(null)
+      setFlowExportBusy(false)
     }
   }
 
-  async function cancelPendingSchedule(id: number) {
-    setPendingStartBusy(id)
-    setPendingStartError('')
+  // Dashboard'dan bir filtreyle (initialStatus/initialPlanName) gelindiyse
+  // Bakım Akışı kartına kaydırır ve doğru sekmeyi seçer — "Planlanan
+  // Bakım"/"Devam Eden" kartları ile periyot grafiğinin Bekliyor/Devam
+  // Ediyor barları, ikisi de gerçekten açılmış (başlatılmış) iş emirlerini
+  // saydığı için her ikisi de "Başlatılanlar" sekmesine düşer.
+  useEffect(() => {
+    if (!initialStatus && !initialPlanName) return
+    if (initialStatus === 'pending' || initialStatus === 'in_progress') setFlowTab('started')
+    flowCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (selected !== null) return
+    loadUpcoming()
+    loadCalendar()
+  }, [loadUpcoming, loadCalendar, selected])
+
+  // Bakımlar sayfası eskiden canlı olayları dinlemediği için başka bir
+  // ekranda yapılan planlama/tamamlama/KM güncellemesi burada eski kalıyordu.
+  useLiveEvent(['maintenance', 'vehicle', 'plan'], () => {
+    if (selected === null) {
+      loadUpcoming()
+      loadCalendar()
+    }
+  })
+
+  // Kullanıcı isteği: "Başlatılmayı Bekleyenler" tablosundaki "Planlamaya Al"
+  // artık iki adımlı değil — TEK tıkla hem aday iş emrini açar hem de
+  // doğrudan başlatır, ardından kullanıcıyı otomatik olarak "Başlatılanlar"
+  // sekmesine geçirir ki sonucu hemen orada görsün.
+  // scheduledDate verilirse (YYYY-MM-DD, bugünden ileri): iş emri HEMEN
+  // başlamaz, yalnızca o tarihe zamanlanır ve "Başlatılmayı Bekleyenler"
+  // sekmesinde "Zamanlandı: X" rozetiyle kalır — arka plan zamanlayıcısı o
+  // tarih geldiğinde otomatik başlatır (bkz. services.schedule_maintenance_
+  // start/run_scheduled_maintenance_starts). Verilmezse eskisi gibi TEK
+  // tıkla hem aday iş emrini açar hem de anında başlatır.
+  async function planUpcoming(item: UpcomingItem, scheduledDate?: string) {
+    setUpcomingBusy(item.maintenance_id ?? -item.target_km)
+    setUpcomingError('')
     try {
-      await api(`/maintenances/${id}/cancel-schedule`, { method: 'POST' })
-      loadPendingStart()
+      const maintenanceId =
+        item.maintenance_id ??
+        (await api<Maintenance>('/maintenances/plan-upcoming', {
+          method: 'POST', body: { vehicle_id: item.vehicle.id, target_km: item.target_km },
+        })).id
+      await api(`/maintenances/${maintenanceId}/start`, {
+        method: 'POST',
+        body: scheduledDate ? { scheduled_start_at: scheduledDate } : {},
+      })
+      loadUpcoming()
+      if (scheduledDate) {
+        setScheduleOpenKey(null)
+        showToast(`✓ ${item.vehicle.code} bakımı ${new Date(scheduledDate).toLocaleDateString('tr-TR')} tarihine zamanlandı`, 'info')
+      } else {
+        setFlowTab('started')
+        showToast(`✓ ${item.vehicle.code} bakımı başlatıldı`, 'info')
+      }
     } catch (e) {
-      setPendingStartError((e as Error).message)
+      setUpcomingError((e as Error).message)
     } finally {
-      setPendingStartBusy(null)
+      setUpcomingBusy(null)
+    }
+  }
+
+  // Zaten zamanlanmış bir adayın zamanlamasını iptal eder — iş emri
+  // "Başlatılmayı Bekleyenler"de zamansız aday olarak kalmaya devam eder.
+  // maintenance_id bu satırda null olabileceğinden (bkz. UpcomingItem.
+  // scheduled_start_at açıklaması) önce plan-upcoming'e idempotent şekilde
+  // tekrar gidilip gerçek id bulunur.
+  async function cancelSchedule(item: UpcomingItem) {
+    setUpcomingBusy(item.maintenance_id ?? -item.target_km)
+    setUpcomingError('')
+    try {
+      const maintenanceId =
+        item.maintenance_id ??
+        (await api<Maintenance>('/maintenances/plan-upcoming', {
+          method: 'POST', body: { vehicle_id: item.vehicle.id, target_km: item.target_km },
+        })).id
+      await api(`/maintenances/${maintenanceId}/cancel-schedule`, { method: 'POST' })
+      loadUpcoming()
+      showToast('✓ Zamanlama iptal edildi')
+    } catch (e) {
+      setUpcomingError((e as Error).message)
+    } finally {
+      setUpcomingBusy(null)
+    }
+  }
+
+  // Kullanıcı isteği: "seçilen vardiyaya iş emri atama olsun" — Bakım Akışı
+  // tablosundaki bir satırdan, iş emrini bir vardiyaya atar/vardiyadan
+  // çıkarır. "Atanan" (kişi, assignTo) alanından bağımsızdır.
+  async function assignFlowShift(maintenanceId: number, shiftId: number | null) {
+    setFlowShiftAssignBusy(maintenanceId)
+    setUpcomingError('')
+    try {
+      await api(`/maintenances/${maintenanceId}/assign-shift`, {
+        method: 'PATCH', body: { assigned_shift_id: shiftId },
+      })
+      loadUpcoming()
+      showToast(shiftId ? '✓ İş emri vardiyaya atandı' : '✓ Vardiya ataması kaldırıldı')
+    } catch (e) {
+      setUpcomingError((e as Error).message)
+    } finally {
+      setFlowShiftAssignBusy(null)
+    }
+  }
+
+  async function completeUpcoming(item: UpcomingItem) {
+    if (!item.maintenance_id) return
+    if (!confirm(`${item.vehicle.code} — ${item.plan_name} bakımını doğrudan TAMAMLANDI yapmak istiyor musunuz?`)) return
+    setUpcomingBusy(item.maintenance_id)
+    setUpcomingError('')
+    try {
+      await api(`/maintenances/${item.maintenance_id}/force-complete`, { method: 'POST' })
+      loadUpcoming()
+      showToast('✓ İş emri tamamlandı yapıldı')
+    } catch (e) {
+      setUpcomingError((e as Error).message)
+    } finally {
+      setUpcomingBusy(null)
     }
   }
 
@@ -1789,8 +2031,7 @@ export default function MaintenancesPage({
           : { vehicle_id: manualVehicleId, plan_id: manualPlanId, target_km: Number(manualTargetKm) },
       })
       setManualOpen(false)
-      setMainView('started')
-      loadList()
+      loadUpcoming()
     } catch (e) {
       setManualError((e as Error).message)
     } finally {
@@ -1815,14 +2056,53 @@ export default function MaintenancesPage({
       await api('/maintenances/all', { method: 'DELETE' })
       setDangerOpen(false)
       setDangerConfirmText('')
-      loadList()
-      loadPendingStart()
+      loadUpcoming()
     } catch (e) {
       setDangerError((e as Error).message)
     } finally {
       setDangerBusy(false)
     }
   }
+
+  // Bakım Akışı kategori grupları + otomatik kategori seçimi.
+  // ÖNEMLİ: Bu hook'lar (useMemo/useEffect) aşağıdaki erken return'lerden
+  // ÖNCE çağrılmalı. Aksi halde bir bakım detayı açıldığında (selected !== null)
+  // hook sırası değişir ve React "rendered fewer hooks than expected" hatasıyla
+  // sayfayı çökertir.
+  // Sekme ayrımı DURUM etiketine (yaklasiyor/planlanacak/planlandi/gecikti)
+  // göre DEĞİL, doğrudan gerçekten başlatılmış olup olmadığına (maintenance_id
+  // dolu mu) göre yapılır — kullanıcı onayı: pencere dışında ama Başlat
+  // denmiş bir iş emri "Yaklaşıyor" etiketiyle görünse bile yine de
+  // Başlatılanlar'da kalmalı; DURUM sütunundaki metin bundan bağımsız,
+  // yalnızca km/tarih yakınlığını gösterir (bkz. backend
+  // services._classify_upcoming_status docstring'i).
+  // Sekme içinde en acil olan üstte görünsün diye DURUM etiketine göre
+  // sıralanır (gecikti en acil, sonra planlandı/yaklaşıyor/planlanacak).
+  const FLOW_STATUS_PRIORITY: Record<string, number> = { gecikti: 0, planlandi: 1, yaklasiyor: 2, planlanacak: 3 }
+  const flowSort = (a: UpcomingItem, b: UpcomingItem) =>
+    (FLOW_STATUS_PRIORITY[a.status ?? ''] ?? 4) - (FLOW_STATUS_PRIORITY[b.status ?? ''] ?? 4)
+  const flowStartedItems = useMemo(
+    () => upcoming.filter((x) => x.maintenance_id != null).sort(flowSort),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [upcoming],
+  )
+  const flowPendingItems = useMemo(
+    () => upcoming.filter((x) => x.maintenance_id == null).sort(flowSort),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [upcoming],
+  )
+
+  // Veri yenilendiğinde seçili sekme boşsa diğer (dolu) sekmeye otomatik geç.
+  // Ustada "Bekleyenler" sekmesi hiç olmadığı için bu otomatik geçiş de
+  // devre dışıdır (aksi halde görünmeyen bir sekme seçili kalırdı).
+  useEffect(() => {
+    if (!showPendingTab || upcoming.length === 0) return
+    const startedCount = flowStartedItems.length
+    const pendingCount = flowPendingItems.length
+    if (flowTab === 'started' && startedCount === 0 && pendingCount > 0) setFlowTab('pending')
+    else if (flowTab === 'pending' && pendingCount === 0 && startedCount > 0) setFlowTab('started')
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [upcoming])
 
   if (selected !== null)
     return (
@@ -1832,15 +2112,16 @@ export default function MaintenancesPage({
           id={selected}
           user={user}
           perms={perms}
-          onBack={() => setSelected(null)}
+          onBack={() => window.history.back()}
           onDeleted={() => {
-            setSelected(null)
-            setList(null)
+            window.history.back()
+            loadUpcoming()
           }}
           shiftModeEnabled={!!shiftMode?.enabled}
           activeShiftId={activeShiftId}
-          activeShiftName={activeShiftName}
           shiftMembersVersion={shiftMembersVersion}
+          shifts={shifts}
+          onOpenKnowledge={onOpenKnowledge}
         />
       </>
     )
@@ -1857,66 +2138,42 @@ export default function MaintenancesPage({
       </>
     )
 
-  const rawList = list ?? []
-
-  // Tamamlanan bakımlar artık bu sayfada (Bakımlar) hiç gösterilmez —
-  // yalnızca Bakım Geçmişi sayfasında listelenir. Geçmişe bakmak isteyen
-  // Dashboard/Bakım Geçmişi üzerinden ulaşır.
-  //
-  // Aynı araç için birden fazla açık (Bekliyor/Devam Ediyor) bakım varsa,
-  // yalnızca hedef km'si en büyük olanı listelenir — küçük periyotlar
-  // (ör. 25.000/50.000 km) zaten o büyük bakımın içine (kombine checklist)
-  // dahil edilmiştir, ayrı satır olarak tekrar gösterilmez.
-  // Faz: km ve süre bazlı iş emirleri artık aynı araçta eş zamanlı açık
-  // olabilir — bu yüzden dedup anahtarı sadece araç değil, (araç, plan
-  // türü) olmalı; aksi halde bir km iş emri diğer türdeki iş emrini
-  // gizleyebilir. target_km süre bazlı maddelerde null olabileceğinden
-  // mutlak değer + null-güvenli karşılaştırma kullanılır.
-  const maxOpenTargetByVehicle = new Map<string, number>()
-  const dedupKey = (m: Maintenance) => `${m.vehicle.id}:${m.plan.plan_type}`
-  for (const m of rawList) {
-    if (m.status === 'completed') continue
-    const key = dedupKey(m)
-    const val = Math.abs(m.target_km ?? 0)
-    const cur = maxOpenTargetByVehicle.get(key) ?? -Infinity
-    if (val > cur) maxOpenTargetByVehicle.set(key, val)
+  // Bakım Akışı kategorilerinin etiket / renk tonu / ikon eşlemeleri.
+  const flowLabel = { yaklasiyor: 'Yaklaşıyor', planlanacak: 'Planlanmayı Bekleyen', planlandi: 'Planlandı', gecikti: 'Bakım Gecikti' } as const
+  // Durum -> Badge tonu (DURUM sütunundaki renkli rozet için).
+  const flowBadgeTone = { gecikti: 'danger', planlandi: 'in_progress', planlanacak: 'pending', yaklasiyor: 'neutral' } as const
+  // İki sekmenin içerikleri artık DURUM etiketine göre değil, gerçekten
+  // başlatılmış olup olmadığına göre ayrılır (bkz. flowStartedItems/
+  // flowPendingItems yukarıda) — bir iş emri pencere dışında "Yaklaşıyor"
+  // etiketiyle görünse bile başlatılmışsa Başlatılanlar'da kalır.
+  const flowTabItems = {
+    started: flowStartedItems,
+    pending: flowPendingItems,
   }
-  const all = rawList.filter(
-    (m) => m.status !== 'completed' && Math.abs(m.target_km ?? 0) === maxOpenTargetByVehicle.get(dedupKey(m)),
-  )
 
-  const vehicleCodes = Array.from(new Set(all.map((m) => m.vehicle.code))).sort()
-  const planNames = Array.from(new Set(all.map((m) => m.plan.name))).sort(
-    (a, b) => (all.find((m) => m.plan.name === a)?.plan.interval_km ?? 0) -
-      (all.find((m) => m.plan.name === b)?.plan.interval_km ?? 0),
+  // Bakım Akışı filtre seçenekleri — mevcut `upcoming` verisinde GERÇEKTEN
+  // bulunan periyot/araç tipi değerlerinden türetilir (boş/uygunsuz seçenek
+  // sunulmaz).
+  const flowPlanOptions = Array.from(new Set(upcoming.map((u) => u.plan_name))).sort((a, b) => a.localeCompare(b, 'tr'))
+  const flowModelOptions = Array.from(new Set(upcoming.map((u) => u.vehicle.model).filter((m): m is string => !!m))).sort((a, b) => a.localeCompare(b, 'tr'))
+  const visibleFlowItems = flowTabItems[flowTab].filter(
+    (item) =>
+      (!flowFilterPlan || item.plan_name === flowFilterPlan) &&
+      (!flowFilterModel || item.vehicle.model === flowFilterModel) &&
+      (flowFilterShift === '' || item.assigned_shift_id === flowFilterShift),
   )
-
-  // Kalan kilometreye göre sıralanır (tarihe göre değil): kalan km'si en az
-  // (veya negatifse en çok süresi geçmiş) olan en üstte çıkar. Tamamlanmış
-  // bakımların kalan km'si olmadığı için en sona (en son tamamlanan en
-  // üstte olacak şekilde) eklenir.
-  const filtered = all
-    .filter(
-      (m) =>
-        (!vehicleFilter || m.vehicle.code === vehicleFilter) &&
-        (!planFilter || m.plan.name === planFilter),
-    )
-    .sort((a, b) => {
-      const wa = estimateWindow(a)
-      const wb = estimateWindow(b)
-      if (wa && wb) return wa.remainingKm - wb.remainingKm
-      if (wa && !wb) return -1
-      if (!wa && wb) return 1
-      const ta = a.completed_at ? new Date(a.completed_at).getTime() : 0
-      const tb = b.completed_at ? new Date(b.completed_at).getTime() : 0
-      return tb - ta
-    })
+  const flowHasFilter = !!flowFilterPlan || !!flowFilterModel || flowFilterShift !== ''
+  const canAssignShift = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
 
   return (
     <>
       <PageHeader
         title="Bakımlar"
-        subtitle="Açık iş emirlerini filtreleyin, bekleyenleri başlatın ve detaylara geçin."
+        subtitle={
+          isTechnician
+            ? 'Takvimde size atanan ve başlatılan bakımları görün, detaylara geçin.'
+            : 'Başlatılan ve başlatılmayı bekleyen bakımları izleyin, detaylara geçin.'
+        }
         actions={
           !!perms.create_maintenance && (
             <button className="primary" onClick={openManualAdd}>
@@ -1926,263 +2183,202 @@ export default function MaintenancesPage({
           )
         }
       />
-      {shiftBar}
-
-      {!!perms.start_maintenance && (
-        <div className="row maintenance-view-tabs" style={{ gap: 10, marginBottom: 16 }}>
-          <button
-            className={mainView === 'started' ? 'primary' : ''}
-            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
-            onClick={() => setMainView('started')}
-          >
-            <Wrench size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
-            Başlatılanlar
-          </button>
-          <button
-            className={mainView === 'pending' ? 'primary' : ''}
-            style={{ padding: '11px 22px', fontSize: 14.5, fontWeight: 700 }}
-            onClick={() => setMainView('pending')}
-          >
-            <PlayCircle size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
-            Bekleyenler
-            {!!pendingStart && pendingStart.length > 0 && (
-              <span
-                style={{
-                  marginLeft: 8, background: mainView === 'pending' ? 'rgba(255,255,255,0.28)' : 'var(--amber-light)',
-                  color: mainView === 'pending' ? '#fff' : 'var(--amber)',
-                  borderRadius: 999, padding: '1px 9px', fontSize: 12.5, fontWeight: 700,
-                }}
-              >
-                {pendingStart.length}
-              </span>
-            )}
-          </button>
-        </div>
+      {isTechnician && (
+        <MaintenanceCalendar
+          maintenances={calMaintenances}
+          user={user}
+          onOpenMaintenance={openDetail}
+        />
       )}
-
-      {mainView === 'pending' && !!perms.start_maintenance && (
-        <div className="card fade-in" style={{ marginBottom: 16 }}>
-          <div className="card-head">
-            <div>
-              <div className="card-title">
-                <PlayCircle size={15} style={{ marginRight: 6, verticalAlign: -3, color: 'var(--primary-600)' }} />
-                Başlatılmayı Bekleyenler
-              </div>
-            </div>
-            <Badge tone="pending">{pendingStart?.length ?? 0}</Badge>
-          </div>
-          {pendingStartError && <div className="error">{pendingStartError}</div>}
-          {pendingStart && pendingStart.length === 0 && (
-            <EmptyState
-              icon={<PlayCircle size={22} />}
-              title="Başlatılmayı bekleyen bakım yok"
-              description="Otomatik açılan tüm adaylar zaten başlatılmış."
-            />
-          )}
-          {pendingStart && pendingStart.length > 0 && (
-            <div className="table-scroll">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Araç</th>
-                    <th>Periyot</th>
-                    <th>Hedef KM</th>
-                    <th>Açılış KM</th>
-                    <th>Tahmini Bakım Aralığı</th>
-                    <th>Başlatma Tarihi</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {/* Kullanıcı isteği: en kritikler en üstte — 1M periyodu
-                      olan herhangi bir bakım her zaman en üstte; onun
-                      dışında tam bakım km'sine en yakın olanlar, hedefi
-                      geçmişse de tolerans sınırına en yakın (toleranstan
-                      çıkma tehlikesi en yüksek) olanlar öncelikli (bkz.
-                      sortPendingByUrgency). */}
-                  {sortPendingByUrgency(pendingStart).map((m) => {
-                    const isScheduled = !!m.scheduled_start_at
-                    const selectedDate = pendingScheduleDate[m.id] ?? todayIso()
-                    const window = estimateWindow(m)
-                    return (
-                      <tr key={m.id}>
-                        <td><span className="vehicle-code">{m.vehicle.code}</span> {m.vehicle.name}</td>
-                        <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
-                        <td>{hedefLabel(m)}</td>
-                        <td>{fmtKm(m.km_at_open)} km</td>
-                        <td>
-                          {window ? (
-                            <Badge tone={window.overdue ? 'danger' : window.earliestReached ? 'in_progress' : 'neutral'}>
-                              {window.overdue
-                                ? `Süresi geçti (aralık: ${fmtDate(window.earliest)} – ${fmtDate(window.latest)})`
-                                : `${fmtDate(window.earliest)} – ${fmtDate(window.latest)}`}
-                            </Badge>
-                          ) : '—'}
-                        </td>
-                        <td>
-                          {isScheduled ? (
-                            <Badge tone="pending">
-                              {new Date(m.scheduled_start_at as string).toLocaleDateString('tr-TR')}
-                            </Badge>
-                          ) : (
-                            <input
-                              type="date"
-                              min={todayIso()}
-                              value={selectedDate}
-                              onChange={(e) =>
-                                setPendingScheduleDate((prev) => ({ ...prev, [m.id]: e.target.value }))
-                              }
-                              style={{ width: 145 }}
-                            />
-                          )}
-                        </td>
-                        <td>
-                          {isScheduled ? (
-                            <button
-                              className="small"
-                              disabled={pendingStartBusy === m.id}
-                              onClick={() => cancelPendingSchedule(m.id)}
-                            >
-                              <X size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
-                              {pendingStartBusy === m.id ? 'İptal ediliyor…' : 'Zamanlamayı İptal Et'}
-                            </button>
-                          ) : (
-                            <button
-                              className="small primary"
-                              disabled={pendingStartBusy === m.id}
-                              onClick={() => startPendingMaintenance(m.id)}
-                            >
-                              <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
-                              {pendingStartBusy === m.id
-                                ? 'Başlatılıyor…'
-                                : selectedDate > todayIso() ? 'Zamanla' : 'Başlat'}
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      )}
-
-      {mainView === 'started' && (
-      <>
-      {listError && <div className="error" style={{ marginBottom: 12 }}>{listError}</div>}
-
-      <div className="table-card fade-in maintenance-list-card">
-        <div className="table-toolbar maintenance-toolbar">
-          <ListFilter size={15} color="var(--text-tertiary)" />
-          <select value={status} onChange={(e) => setStatus(e.target.value)}>
-            <option value="">Tüm Durumlar</option>
-            <option value="pending">Bekliyor</option>
-            <option value="in_progress">Devam Ediyor</option>
-          </select>
-          <select value={vehicleFilter} onChange={(e) => setVehicleFilter(e.target.value)}>
-            <option value="">Tüm Araçlar</option>
-            {vehicleCodes.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-          <select value={planFilter} onChange={(e) => setPlanFilter(e.target.value)}>
-            <option value="">Tüm Periyotlar</option>
-            {planNames.map((n) => (
-              <option key={n} value={n}>{n}</option>
-            ))}
-          </select>
-          {(vehicleFilter || planFilter || status) && (
-            <button className="small ghost" onClick={() => { setVehicleFilter(''); setPlanFilter(''); setStatus('') }}>
-              Filtreleri Temizle
-            </button>
-          )}
-          <span className="maintenance-record-count">
-            {filtered.length} kayıt
-          </span>
-          {perms.export_excel && (
-            <>
-              <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as ExportFormat)}>
-                <option value="xlsx">Excel</option>
-                <option value="pdf">PDF</option>
-                <option value="csv">CSV</option>
-                <option value="docx">Word</option>
-              </select>
-              <button
-                className="small"
-                onClick={() => {
-                  const qs = new URLSearchParams()
-                  if (status) qs.set('status', status)
-                  qs.set('format', exportFormat)
-                  const base = status === 'completed' ? 'bakim_gecmisi' : 'bakimlar'
-                  apiDownload(`/maintenances/export?${qs.toString()}`, `${base}.${exportFormat}`)
-                }}
-              >
+      <div className="card maintenance-flow-card fade-in" ref={flowCardRef}>
+        <div className="card-head">
+          <div><div className="card-title">Bakım Akışı</div><div className="card-subtitle">Araçlar ekranındaki uyarılar burada da planlanabilir ve yönetilebilir.</div></div>
+          <div className="row" style={{ gap: 8 }}>
+            {!!perms.export_excel && (
+              <button className="small ghost" disabled={flowExportBusy} onClick={exportFlowExcel} title="Seçili filtreye göre Excel'e aktar (durum kategorisine göre sayfa sayfa)">
                 <Download size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
-                Dışa Aktar
+                {flowExportBusy ? 'İndiriliyor…' : "Excel'e Aktar"}
               </button>
-            </>
-          )}
+            )}
+            <button className="small ghost" onClick={loadUpcoming}><RefreshCw size={13} style={{ marginRight: 5, verticalAlign: -2 }} /> Yenile</button>
+          </div>
         </div>
-        <div className="table-scroll">
-          <table>
-            <thead>
-              <tr>
-                <th>İş Emri</th>
-                <th>Araç</th>
-                <th>Periyot</th>
-                <th>Hedef KM</th>
-                <th>Durum</th>
-                <th>Tahmini Bakım Aralığı</th>
-                <th>Tamamlanma Tarihi</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {list === null && <SkeletonTableRows columns={8} />}
-              {list !== null && filtered.map((m) => {
-                const window = estimateWindow(m)
-                return (
-                <tr key={m.id} className="clickable-row" onClick={() => setSelected(m.id)}>
-                  <td style={{ fontWeight: 600 }}>#{m.id}</td>
-                  <td><span className="vehicle-code">{m.vehicle.code}</span></td>
-                  <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
-                  <td>{hedefLabel(m)}</td>
-                  <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
-                  <td>
-                    {window ? (
-                      <Badge tone={window.overdue ? 'danger' : window.earliestReached ? 'in_progress' : 'neutral'}>
-                        {window.overdue
-                          ? `Süresi geçti · ${fmtKm(Math.abs(window.remainingKm))} km geçildi (en geç ${fmtDate(window.latest)} tarihindeydi)`
-                          : window.earliestReached
-                            ? `En geç ${fmtDate(window.latest)} · ${fmtKm(window.remainingKm)} km kaldı`
-                            : `Kalan ${fmtKm(window.remainingKm)} km · en geç ${fmtDate(window.latest)}`}
-                      </Badge>
-                    ) : '—'}
-                  </td>
-                  <td>{fmt(m.completed_at)}</td>
-                  <td>
-                    <button className="small primary" onClick={(e) => { e.stopPropagation(); setSelected(m.id) }}>
-                      Aç <ChevronRight size={12} style={{ verticalAlign: -1, marginLeft: 2 }} />
-                    </button>
-                  </td>
-                </tr>
-                )
-              })}
-            </tbody>
-          </table>
-          {list !== null && filtered.length === 0 && (
-            <EmptyState
-              icon={<Wrench size={22} />}
-              title="Kayıt bulunamadı"
-              description="Seçtiğiniz filtrelere uyan bir bakım iş emri yok."
-            />
-          )}
+        {flowExportError && <div className="error">{flowExportError}</div>}
+        {upcomingError && <div className="error">{upcomingError}</div>}
+        <div className="row maintenance-view-tabs maintenance-flow-tabs" style={{ gap: 10, marginBottom: 14, flexWrap: 'wrap' }}>
+          {(showPendingTab
+            ? ([['started', 'Başlatılanlar', Wrench], ['pending', 'Başlatılmayı Bekleyenler', ListFilter]] as const)
+            : ([['started', 'Başlatılanlar', Wrench]] as const)
+          ).map(([key, label, Icon]) => {
+            const active = flowTab === key
+            const count = flowTabItems[key].length
+            return (
+              <button
+                key={key}
+                className={active ? 'primary' : ''}
+                style={{ padding: '11px 20px', fontSize: 14, fontWeight: 700 }}
+                onClick={() => setFlowTab(key)}
+              >
+                <Icon size={16} style={{ marginRight: 8, verticalAlign: -3 }} />
+                {label}
+                <span
+                  style={{
+                    marginLeft: 8,
+                    background: active ? 'rgba(255,255,255,0.28)' : 'var(--amber-light)',
+                    color: active ? '#fff' : 'var(--amber)',
+                    borderRadius: 999, padding: '1px 9px', fontSize: 12.5, fontWeight: 700,
+                  }}
+                >
+                  {count}
+                </span>
+              </button>
+            )
+          })}
         </div>
+        {upcoming.length > 0 && (
+          <div className="table-toolbar" style={{ flexWrap: 'wrap', marginBottom: 12 }}>
+            <ListFilter size={14} color="var(--text-tertiary)" />
+            <select value={flowFilterPlan} onChange={(e) => setFlowFilterPlan(e.target.value)}>
+              <option value="">Tüm Periyotlar</option>
+              {flowPlanOptions.map((name) => (
+                <option key={name} value={name}>{name}</option>
+              ))}
+            </select>
+            <select value={flowFilterModel} onChange={(e) => setFlowFilterModel(e.target.value)}>
+              <option value="">Tüm Araç Tipleri</option>
+              {flowModelOptions.map((model) => (
+                <option key={model} value={model}>{model}</option>
+              ))}
+            </select>
+            {shifts.length > 0 && (
+              <select
+                value={flowFilterShift}
+                onChange={(e) => setFlowFilterShift(e.target.value ? Number(e.target.value) : '')}
+              >
+                <option value="">Tüm Vardiyalar</option>
+                {shifts.map((s) => (
+                  <option key={s.id} value={s.id}>{s.name}</option>
+                ))}
+              </select>
+            )}
+            {flowHasFilter && (
+              <button className="small ghost" onClick={() => { setFlowFilterPlan(''); setFlowFilterModel(''); setFlowFilterShift('') }}>
+                Filtreleri Temizle
+              </button>
+            )}
+          </div>
+        )}
+        {upcoming.length === 0
+          ? <div className="muted" style={{ fontSize: 13 }}>Şu an bakım takip penceresinde bir araç yok.</div>
+          : visibleFlowItems.length === 0
+            ? (
+              <div className="muted" style={{ fontSize: 13 }}>
+                {flowHasFilter
+                  ? 'Seçili filtrelere uyan bir kayıt yok.'
+                  : flowTab === 'started' ? 'Açık iş emri olan (başlatılan) bakım yok.' : 'Başlatılmayı bekleyen bakım yok.'}
+              </div>
+            )
+            : <div className="maintenance-flow-groups">
+                <section className="maintenance-flow-group">
+                  <div className="table-scroll"><table><thead><tr><th>Araç</th><th>Periyot</th><th>Hedef KM</th><th>Durum</th><th>Kalan Durum</th><th>İş Emri</th><th>Vardiya</th><th>Planlanan Başlangıç</th><th>İşlem</th></tr></thead><tbody>{visibleFlowItems.map((item) => {
+                    const busyKey = item.maintenance_id ?? -item.target_km
+                    const st = item.status ?? undefined
+                    const durLabel = st ? flowLabel[st] : '—'
+                    const durTone = st ? flowBadgeTone[st] : 'neutral'
+                    const rowClickable = !!item.maintenance_id || !!onOpenVehicle
+                    const rowTitle = item.maintenance_id
+                      ? `İş emri #${item.maintenance_id} — bakım detayını aç`
+                      : onOpenVehicle ? `${item.vehicle.code} araç kartını aç` : undefined
+                    return <tr key={`${item.vehicle.id}-${item.target_km}`} className={rowClickable ? 'clickable-row' : ''} onClick={() => { if (item.maintenance_id) openDetail(item.maintenance_id); else onOpenVehicle?.(item.vehicle.id) }} title={rowTitle}><td><span className="vehicle-code">{item.vehicle.code}</span></td><td>{topPeriodLabel(item.covered_tiers, 'km', item.vehicle.model, item.plan_name)}</td><td>{rawTargetLabel(item.target_km, item.target_date)}</td><td><Badge tone={durTone}>{durLabel}</Badge></td><td>{upcomingRemainingLabel(item)}</td><td>{item.maintenance_id ? <button className="small ghost" onClick={(e) => { e.stopPropagation(); openDetail(item.maintenance_id!) }}>#{item.maintenance_id} Aç</button> : <span className="muted">Henüz yok</span>}</td><td onClick={(e) => e.stopPropagation()}>
+                      {!item.maintenance_id ? (
+                        <span className="muted">—</span>
+                      ) : canAssignShift ? (
+                        <select
+                          value={item.assigned_shift_id ?? ''}
+                          disabled={flowShiftAssignBusy === item.maintenance_id}
+                          onChange={(e) => assignFlowShift(item.maintenance_id!, e.target.value ? Number(e.target.value) : null)}
+                          style={{ fontSize: 12.5, padding: '4px 6px' }}
+                        >
+                          <option value="">Atanmamış</option>
+                          {shifts.map((s) => (
+                            <option key={s.id} value={s.id}>{s.name}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="muted">{item.assigned_shift_name || 'Atanmamış'}</span>
+                      )}
+                    </td><td>
+                      {item.scheduled_start_at ? (
+                        <Badge tone="in_progress">
+                          <CalendarClock size={11} style={{ marginRight: 4, verticalAlign: -2 }} />
+                          {new Date(item.scheduled_start_at).toLocaleDateString('tr-TR')}
+                        </Badge>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td><td onClick={(e) => e.stopPropagation()}>
+                      {!item.maintenance_id && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start' }}>
+                          {item.scheduled_start_at ? (
+                            // Tarih artık ayrı "Planlanan Başlangıç" sütununda gösteriliyor —
+                            // burada yalnızca iptal işlemi kalır.
+                            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                              <button className="small ghost" disabled={upcomingBusy === busyKey} onClick={() => cancelSchedule(item)}>
+                                <XCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                                İptal Et
+                              </button>
+                            </div>
+                          ) : null}
+                          {!!perms.start_maintenance && (
+                            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                              <button className="small primary" disabled={upcomingBusy === busyKey} onClick={() => planUpcoming(item)}>
+                                <PlayCircle size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                                {upcomingBusy === busyKey ? 'Başlatılıyor…' : 'Başlat'}
+                              </button>
+                              <button
+                                className="small ghost"
+                                title="İleri bir tarihe zamanla"
+                                disabled={upcomingBusy === busyKey}
+                                onClick={() => {
+                                  if (scheduleOpenKey === busyKey) { setScheduleOpenKey(null); return }
+                                  setScheduleOpenKey(busyKey)
+                                  setScheduleDate('')
+                                }}
+                              >
+                                <CalendarClock size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
+                                {item.scheduled_start_at ? 'Tarihi Değiştir' : 'İleri Tarihe Al'}
+                              </button>
+                            </div>
+                          )}
+                          {scheduleOpenKey === busyKey && (
+                            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                              <input
+                                type="date"
+                                value={scheduleDate}
+                                min={new Date(Date.now() + 86400000).toISOString().slice(0, 10)}
+                                onChange={(e) => setScheduleDate(e.target.value)}
+                                style={{ fontSize: 12.5, padding: '4px 6px' }}
+                              />
+                              <button
+                                className="small"
+                                disabled={!scheduleDate || upcomingBusy === busyKey}
+                                onClick={() => planUpcoming(item, scheduleDate)}
+                              >
+                                Zamanla
+                              </button>
+                              <button className="small ghost" onClick={() => setScheduleOpenKey(null)}>Vazgeç</button>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {user.role === 'admin' && !!item.maintenance_id && <button className="small" disabled={upcomingBusy === busyKey} onClick={() => completeUpcoming(item)}>Tamamlandı Yap</button>}
+                    </td></tr>
+                  })}</tbody></table></div>
+                </section>
+              </div>}
       </div>
-      </>
-      )}
+
+      {shiftBar}
 
       {!!perms.delete_all_maintenance && (
         <div className="card fade-in" style={{ marginTop: 20, borderColor: 'var(--red)', background: 'var(--red-light)' }}>

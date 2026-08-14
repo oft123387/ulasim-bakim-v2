@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { api, setRefreshToken, setToken } from '../api'
 import type { User } from '../types'
-import { Box, Eye, EyeOff, LockKeyhole, LogIn, Mail, UserRound } from 'lucide-react'
+import { Eye, EyeOff, LockKeyhole, LogIn, Mail, UserRound } from 'lucide-react'
 import ParticleNetwork from '../components/ParticleNetwork'
 
 interface RegisterResult {
@@ -319,7 +319,7 @@ export default function Login({ onLogin }: { onLogin: (u: User) => void }) {
       <div className="login-box slide-up">
         <div className="login-brand">
           <div className="login-logo">
-            <Box size={20} />
+            <img src="/favicon.svg" alt="Ulaşım Bakım logosu" />
           </div>
           <span>Filo Operasyonları</span>
         </div>

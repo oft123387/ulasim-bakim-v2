@@ -84,6 +84,12 @@ class Vehicle(Base):
     code: Mapped[str] = mapped_column(String(20), unique=True, index=True)  # ör. 38.01
     name: Mapped[str] = mapped_column(String(100), default="")
     current_km: Mapped[int] = mapped_column(Integer, default=0)
+    # Başlangıç (baseline) km: araç sisteme ilk girildiğindeki km. Bu değerin
+    # ALTINDA kalan bakım hedefleri (ör. sistemden önce yapılmış 200.000 km
+    # bakımı) ASLA otomatik açılmaz — yalnızca bu baseline'ın ÜSTÜNE gelen yeni
+    # bakımlar araç yaklaştıkça açılır (bkz. services.check_and_open_maintenances).
+    # None ise (henüz backfill edilmemiş) baseline uygulanmaz.
+    baseline_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
     manufacturer: Mapped[str] = mapped_column(String(100), default="")
     model: Mapped[str] = mapped_column(String(100), default="")
     chassis_no: Mapped[str] = mapped_column(String(100), default="")
@@ -336,10 +342,31 @@ class Maintenance(Base):
     # tarihi (aracın hizmete başlama tarihinden + N ay). KM bakımlarında None.
     target_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     km_at_open: Mapped[int] = mapped_column(Integer)
+    # Bakım yapılırken usta/teknisyenin girdiği GÜNCEL km (yalnızca km bazlı
+    # planlarda anlamlıdır) — km_at_open'dan (iş emri AÇILDIĞINDA aracın
+    # km'si) farklı: bu, işin GERÇEKTEN yapıldığı andaki km'dir, günler/
+    # haftalar sonra olabilir. Girildiğinde hem bu iş emrinin hedef km'den
+    # (target_km) periyoda (plan.interval_km) oranlı sapma yüzdesini
+    # hesaplamak için kullanılır (bkz. services.compute_km_deviation_pct —
+    # Bakım Geçmişi sayfası/Excel dışa aktarımında "Sapma %" olarak
+    # gösterilir) hem de PATCH /maintenances/{id}/completed-km ucu, girilen
+    # değer aracın mevcut km'sinden büyükse aracın current_km'sini de ileri
+    # taşır (normal km güncellemesiyle aynı yan etkiler — yeni adayların
+    # otomatik açılması dahil). None ise hiç girilmemiş demektir.
+    completed_km: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # pending (Bekliyor) | in_progress (Devam Ediyor) | completed (Tamamlandı)
     status: Mapped[str] = mapped_column(String(20), default="pending")
     assigned_to_id: Mapped[int | None] = mapped_column(
         ForeignKey("users.id"), nullable=True
+    )
+    # İş emrinin (bireysel kişiden BAĞIMSIZ olarak) atandığı vardiya —
+    # "Atanan" (assigned_to_id) kişi bazlı ve vardiyadan bağımsızdır (yukarı
+    # bakınız); bu alan ise Bakımlar sayfasındaki vardiya barında "seçili
+    # vardiyaya iş emri ata" akışı için kullanılır, o vardiyanın iş listesini
+    # (kimin çalıştığından bağımsız) oluşturur. Vardiya silinirse (bkz.
+    # main.py delete_shift) bu alan NULL'a çekilir, iş emri kaybolmaz.
+    assigned_shift_id: Mapped[int | None] = mapped_column(
+        ForeignKey("shifts.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     # DİKKAT: started_at, teknisyenin checklist'te İLK maddeyi tamamladığı an
@@ -371,9 +398,16 @@ class Maintenance(Base):
     # yalnızca "ne zaman otomatik başlasın" bilgisini tutar.
     scheduled_start_at: Mapped[date | None] = mapped_column(Date, nullable=True)
 
+    # Kullanıcı Takvim'de bir iş emrini elle sürükleyip başka bir güne
+    # taşıdığında o gün burada saklanır. Boşsa (varsayılan) iş emri, aracın
+    # hedef km'ye ulaşacağı TAHMİNİ gün üzerinde gösterilir (frontend
+    # CalendarPage.tsx: eventDay). Dolu olduğunda takvim bu günü esas alır.
+    planned_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
     vehicle = relationship("Vehicle", back_populates="maintenances")
     plan = relationship("MaintenancePlan")
     assigned_to = relationship("User", foreign_keys=[assigned_to_id])
+    assigned_shift = relationship("Shift", foreign_keys=[assigned_shift_id])
     activated_by = relationship("User", foreign_keys=[activated_by_id])
     items = relationship(
         "MaintenanceItem",
@@ -739,29 +773,36 @@ class RolePermission(Base):
 
 
 class Suggestion(Base):
-    """Faz 30 — Usta/mühendis/amir/admin'in sahada fark ettiği bir
-    eksikliği/iyileştirmeyi bildirdiği öneri. Artık BELİRLİ bir araca değil
-    bir ARAÇ MODELİNE (vehicle_model — ör. "Bozankaya Tip-1", "Sirio")
-    bağlanır, çünkü öneri genelde o modelin TÜMÜNÜ ilgilendirir (bkz.
-    /api/vehicle-models). vehicle_id, bu değişiklikten ÖNCE belirli bir
-    araca bağlı oluşturulmuş eski kayıtlar için geriye dönük uyumluluk
-    amacıyla hâlâ var ama artık NULL olabilir ve yeni önerilerde
-    kullanılmaz.
+    """İYİLEŞTİRME TALEBİ — usta/mühendis/amir/admin'in sahada fark ettiği
+    bir eksikliği/iyileştirmeyi bildirdiği kayıt. Kurumsal adlandırma
+    "İyileştirme Talebi"dir; sınıf, tablo ve API adları geriye dönük
+    uyumluluk için 'suggestion' olarak KORUNMUŞTUR (yeniden adlandırmak
+    mevcut veritabanlarını ve istemcileri bozardı).
 
-    İKİ AŞAMALI HİYERARŞİK ONAY: bir öneri önce AMİR'e düşer (amir_status);
-    amir onaylarsa (amir_status='approved') MÜHENDİS'e düşer (engineer_
-    status) ve mühendisin kararı (approved/rejected/added) NİHAİDİR; amir
-    reddederse (amir_status='rejected') öneri MÜHENDİSE HİÇ DÜŞMEZ, iş
-    orada biter. `status`, bu iki aşamanın DERLENMİŞ (üst düzey, filtreleme/
-    rozet için kullanılan) görünümüdür:
-      pending          -> yeni, amir'in kararını bekliyor
-      pending_engineer -> amir onayladı, mühendisin kararını bekliyor
-      rejected         -> amir VEYA mühendis reddetti (hangisi olduğu
-                          amir_status/engineer_status'tan ayırt edilir)
-      approved         -> mühendis onayladı (nihai)
-      added            -> mühendis bakım ağacına eklendi olarak işaretledi (nihai)
-    Bu alan, ilgili aşama alanıyla AYNI ANDA (bkz. services.apply_
-    suggestion_review) güncellenir — asla tek başına değiştirilmez."""
+    Talep, BELİRLİ bir araca değil bir ARAÇ MODELİNE (vehicle_model — ör.
+    "Bozankaya Tip-1", "Sirio") bağlanır, çünkü genelde o modelin TÜMÜNÜ
+    ilgilendirir (bkz. /api/vehicle-models). vehicle_id, bu değişiklikten
+    ÖNCE belirli bir araca bağlı oluşturulmuş eski kayıtlar için geriye
+    dönük uyumluluk amacıyla hâlâ var ama artık NULL olabilir ve yeni
+    taleplerde kullanılmaz.
+
+    TEK AŞAMALI ONAY: talebi mühendis, amir ya da admin DOĞRUDAN onaylar
+    veya reddeder; verilen ilk karar NİHAİDİR (bkz. services.apply_
+    suggestion_review). `status`:
+      pending  -> karar bekliyor
+      approved -> onaylandı (nihai)
+      rejected -> reddedildi (nihai)
+
+    ESKİ (kaldırılmış) iki aşamalı zincirden kalanlar — yalnızca geçmiş
+    kayıtlarda görülebilir, yeni kayıtlarda ÜRETİLMEZ:
+      pending_engineer -> zincirin ortasında kalmış talep; migrate.py bunu
+                          'pending'e çevirir (bkz. _migrate_suggestions_
+                          flatten_approval).
+      added            -> "bakım ağacına eklendi" işareti; bu karar tamamen
+                          kaldırıldı (bir talebi onaylamak ağacı kendiliğinden
+                          değiştirmez, ağaç düzenlemesi ayrı bir işlemdir).
+    amir_*/engineer_* alanları da bu dönemden kalmadır; artık yalnızca
+    "kim karar verdi" bilgisini taşırlar."""
 
     __tablename__ = "suggestions"
 
@@ -817,59 +858,6 @@ class Suggestion(Base):
     reviewed_by = relationship("User", foreign_keys=[reviewed_by_id])
     amir_reviewed_by = relationship("User", foreign_keys=[amir_reviewed_by_id])
     engineer_reviewed_by = relationship("User", foreign_keys=[engineer_reviewed_by_id])
-
-
-class AlarmState(Base):
-    """Canlı Alarm Merkezi'ndeki bir alarmın iş akışı durumu (Faz 22).
-
-    Alarmların kendisi her istekte anlık hesaplanır (bkz. /api/alarms),
-    kalıcı bir tabloda tutulmaz; ama bir alarmın "kimliği" (vehicle_id,
-    target_km) zaman içinde sabit kaldığından (aynı araç aynı hedef km'ye
-    ulaşana kadar), bu ikili üzerinden durum bilgisi (kritiklik/öncelik,
-    onaylandı/atandı/çözüldü/kapatıldı) ayrı bir tabloda saklanır ve alarm
-    her hesaplandığında bu tablodan eşlenir. Bir satır yoksa alarm ilk kez
-    görüldüğünde otomatik oluşturulur (öncelik o anki seviyeden gelir)."""
-
-    __tablename__ = "alarm_states"
-    __table_args__ = (
-        UniqueConstraint("vehicle_id", "target_km", name="uq_alarm_state"),
-    )
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True
-    )
-    target_km: Mapped[int] = mapped_column(Integer)
-    plan_name: Mapped[str] = mapped_column(String(100), default="")
-    # low | normal | high | critical — ilk oluşturulduğunda hesaplanan
-    # seviyeden (critical/warning/normal) gelir, sonra elle değiştirilebilir.
-    priority: Mapped[str] = mapped_column(String(20), default="normal")
-    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
-    acknowledged_by_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    assigned_to_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
-    )
-    resolved: Mapped[bool] = mapped_column(Boolean, default=False)
-    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    closed: Mapped[bool] = mapped_column(Boolean, default=False)
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    # Bu alarm için admin/mühendis/amir'e (doğrulanmış e-postası olanlara)
-    # kritik-alarm e-postası ne zaman gönderildi — None ise hiç gönderilmedi.
-    # Aynı alarma (aynı vehicle_id+target_km) tekrar tekrar e-posta
-    # atılmasını önlemek için kullanılır (bkz. main.py _send_critical_alarm_
-    # emails). Alarm onaylanır/çözülür/kapatılırsa da tekrar e-posta atılmaz.
-    emailed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime, default=datetime.now, onupdate=datetime.now
-    )
-
-    vehicle = relationship("Vehicle")
-    acknowledged_by = relationship("User", foreign_keys=[acknowledged_by_id])
-    assigned_to = relationship("User", foreign_keys=[assigned_to_id])
 
 
 class RefreshToken(Base):

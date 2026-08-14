@@ -31,6 +31,16 @@ def _make_vehicle_plan(client, admin, code, model, current_km, interval_km=10_00
         json={"code": code, "name": "Durum Test Aracı", "current_km": current_km, "model": model},
     ).json()
     assert "id" in v, v
+    # Bu testler 4 durumlu SINIFLANDIRMAYI izole doğrular. Başlangıç (baseline)
+    # km kuralı, hedefi güncel km'nin altında kalan senaryoları (gecikti) gizler;
+    # sınıflandırma mantığını baseline'dan bağımsız test edebilmek için baseline
+    # sıfırlanır. (Baseline davranışı ayrıca test_baseline_km.py'de doğrulanır.)
+    _db = SessionLocal()
+    try:
+        _db.query(models.Vehicle).filter_by(id=v["id"]).update({models.Vehicle.baseline_km: None})
+        _db.commit()
+    finally:
+        _db.close()
     plan = client.post(
         "/api/plans", headers=auth(admin),
         json={"name": f"{model} Planı", "plan_type": "km", "interval_km": interval_km, "vehicle_model": model},

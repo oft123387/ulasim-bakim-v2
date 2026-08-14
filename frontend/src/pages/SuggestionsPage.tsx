@@ -3,7 +3,7 @@ import { api } from '../api'
 import type { Plan, Suggestion, User } from '../types'
 import { SUGGESTION_STATUS_TR } from '../types'
 import { PageHeader, Badge, Avatar, EmptyState, SkeletonTableRows } from '../components/ui'
-import { Lightbulb, Send, Check, X, Workflow, Trash2, StickyNote, ShieldCheck } from 'lucide-react'
+import { Lightbulb, Send, Check, X, Trash2, StickyNote, ShieldCheck } from 'lucide-react'
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
 
@@ -15,17 +15,15 @@ const STATUS_TONE: Record<Suggestion['status'], 'pending' | 'in_progress' | 'com
   rejected: 'danger',
 }
 
-// Faz 30 — hiyerarşik onay: bir önerinin şu an hangi aşamanın kararını
-// beklediğini (backend'deki services.suggestion_pending_stage ile birebir
-// aynı mantık) döner — null ise öneri zaten sonuçlanmış (amir reddetti ya
-// da mühendis karar verdi), artık kimse değerlendiremez.
-function pendingStage(s: Suggestion): 'amir' | 'engineer' | null {
-  if (s.status === 'pending') return 'amir'
-  if (s.status === 'pending_engineer') return 'engineer'
-  return null
+// Onay TEK aşamalı (amir -> mühendis zinciri kaldırıldı). Talep ya hâlâ karar
+// bekliyordur ya da sonuçlanmıştır. 'pending_engineer' yalnızca eski
+// kayıtlarda görülebilir; o da normal bir bekleyen talep gibi ele alınır
+// (backend'deki services.suggestion_is_open ile birebir aynı mantık).
+function isOpen(s: Suggestion): boolean {
+  return s.status === 'pending' || s.status === 'pending_engineer'
 }
 
-// Öneri metni uzun olabilir; tabloda satır satır alta aksın diye normal
+// Talep metni uzun olabilir; tabloda satır satır alta aksın diye normal
 // kaydırma kullanılır, belli bir uzunluğu geçince de "Devamını gör" ile
 // tamamı açılıp okunabilir.
 const TEXT_PREVIEW_LEN = 140
@@ -50,41 +48,28 @@ function TruncatedText({ text }: { text: string }) {
   )
 }
 
-// Onay sürecinin iki aşamasını (amir/mühendis) tek bir hücrede özetler —
-// henüz sırası gelmemiş aşama "(sırada değil)" ile gösterilir.
-function ApprovalChain({ s }: { s: Suggestion }) {
-  const amirLine = s.amir_status === 'pending'
-    ? <span className="muted">Amir: bekliyor</span>
-    : (
-      <span>
-        Amir: {s.amir_status === 'approved' ? 'Onayladı' : 'Reddetti'}
-        {s.amir_reviewed_by && ` — ${s.amir_reviewed_by.full_name}`}
-        {s.amir_reviewed_at && ` · ${fmt(s.amir_reviewed_at)}`}
-      </span>
-    )
-  const engineerLine = s.amir_status !== 'approved'
-    ? <span className="muted">Mühendis: sırada değil</span>
-    : s.engineer_status === 'pending'
-      ? <span className="muted">Mühendis: bekliyor</span>
-      : (
-        <span>
-          Mühendis: {SUGGESTION_STATUS_TR[s.engineer_status === 'added' ? 'added' : s.engineer_status === 'approved' ? 'approved' : 'rejected']}
-          {s.engineer_reviewed_by && ` — ${s.engineer_reviewed_by.full_name}`}
-          {s.engineer_reviewed_at && ` · ${fmt(s.engineer_reviewed_at)}`}
-        </span>
-      )
+// Talebin kim tarafından, ne zaman ve hangi notla sonuçlandırıldığını
+// özetler. Zincir kalktığı için tek bir karar satırı gösterilir; eski (iki
+// aşamalı dönemden kalan) kayıtlarda aşama alanları doluysa oradan okunur.
+function ReviewSummary({ s }: { s: Suggestion }) {
+  if (isOpen(s)) return <span className="muted" style={{ fontSize: 12.5 }}>Karar bekliyor</span>
+
+  // Yeni kayıtlarda reviewed_by/at doludur; çok eski kayıtlarda boşsa
+  // mühendis/amir aşama alanlarına düşülür.
+  const who = s.reviewed_by ?? s.engineer_reviewed_by ?? s.amir_reviewed_by
+  const when = s.reviewed_at ?? s.engineer_reviewed_at ?? s.amir_reviewed_at
+  const note = s.admin_note || s.engineer_note || s.amir_note
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12.5 }}>
-      <div>{amirLine}</div>
-      {s.amir_note && (
+      <span>
+        {SUGGESTION_STATUS_TR[s.status]}
+        {who && ` — ${who.full_name}`}
+        {when && ` · ${fmt(when)}`}
+      </span>
+      {note && (
         <div className="muted" style={{ fontSize: 11, display: 'flex', gap: 4, alignItems: 'flex-start' }}>
-          <StickyNote size={11} style={{ marginTop: 1, flexShrink: 0 }} /><TruncatedText text={s.amir_note} />
-        </div>
-      )}
-      <div>{engineerLine}</div>
-      {s.engineer_note && (
-        <div className="muted" style={{ fontSize: 11, display: 'flex', gap: 4, alignItems: 'flex-start' }}>
-          <StickyNote size={11} style={{ marginTop: 1, flexShrink: 0 }} /><TruncatedText text={s.engineer_note} />
+          <StickyNote size={11} style={{ marginTop: 1, flexShrink: 0 }} /><TruncatedText text={note} />
         </div>
       )}
     </div>
@@ -98,14 +83,14 @@ export default function SuggestionsPage({ user }: { user: User }) {
   const [error, setError] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
 
-  // Yeni öneri formu — Faz 30: belirli bir araç değil, araç MODELİ seçilir
+  // Yeni talep formu — belirli bir araç değil, araç MODELİ seçilir
   // (Bozankaya/Sirio vb. — o modeldeki tüm araçları ilgilendirir).
   const [vehicleModel, setVehicleModel] = useState('')
   const [planId, setPlanId] = useState<number | ''>('')
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
 
-  // Değerlendirme: hangi öneri için not/karar paneli açık.
+  // Değerlendirme: hangi talep için not/karar paneli açık.
   const [reviewId, setReviewId] = useState<number | null>(null)
   const [reviewNote, setReviewNote] = useState('')
   const [reviewBusy, setReviewBusy] = useState(false)
@@ -152,7 +137,7 @@ export default function SuggestionsPage({ user }: { user: User }) {
     setReviewNote('')
   }
 
-  async function saveReview(status: 'approved' | 'rejected' | 'added') {
+  async function saveReview(status: 'approved' | 'rejected') {
     if (reviewId === null) return
     setReviewBusy(true)
     setError('')
@@ -171,7 +156,7 @@ export default function SuggestionsPage({ user }: { user: User }) {
   }
 
   async function remove(s: Suggestion) {
-    if (!confirm('Bu öneri kalıcı olarak silinsin mi?')) return
+    if (!confirm('Bu talep kalıcı olarak silinsin mi?')) return
     setError('')
     try {
       await api(`/suggestions/${s.id}`, { method: 'DELETE' })
@@ -183,24 +168,21 @@ export default function SuggestionsPage({ user }: { user: User }) {
 
   const all = list ?? []
   const reviewing = reviewId !== null ? all.find((s) => s.id === reviewId) ?? null : null
-  const reviewingStage = reviewing ? pendingStage(reviewing) : null
-  // Bu kullanıcı, önerinin İÇİNDE BULUNDUĞU aşamada karar verebilir mi?
-  // (backend'deki review_suggestion ile aynı kural: rol aşamayla eşleşmeli
-  // ya da admin olmalı.)
-  const canActOnStage = (stage: 'amir' | 'engineer' | null) =>
-    stage !== null && (user.role === stage || user.role === 'admin')
-  const canDelete = (s: Suggestion) =>
-    user.role === 'admin' || user.role === 'amir' || user.role === 'engineer' || s.created_by?.id === user.id
+  // Faz 31 — tek aşamalı onay: mühendis, amir ve admin (backend'deki
+  // services.can_review_suggestion ile aynı liste) bir talebi doğrudan
+  // onaylar ya da reddeder; verilen ilk karar nihaidir.
+  const canReview = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
+  const canDelete = (s: Suggestion) => canReview || s.created_by?.id === user.id
 
   return (
     <>
       <PageHeader
-        title="Öneriler"
-        subtitle="Öneri önce amire düşer; amir onaylarsa mühendise geçer ve mühendisin kararı nihaidir. Amir reddederse öneri mühendise hiç düşmez."
+        title="İyileştirme Talepleri"
+        subtitle="Herkesin talebi herkese açıktır. Mühendis, amir veya admin talebi onaylar ya da reddeder; verilen karar nihaidir."
       />
 
       <div className="card">
-        <div className="card-head"><div className="card-title">Yeni Öneri</div></div>
+        <div className="card-head"><div className="card-title">Yeni Talep</div></div>
         <form className="row" onSubmit={submit} style={{ flexWrap: 'wrap', gap: 8, alignItems: 'flex-start' }}>
           <select
             value={vehicleModel}
@@ -240,13 +222,11 @@ export default function SuggestionsPage({ user }: { user: User }) {
           <Lightbulb size={15} color="var(--text-tertiary)" />
           <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
             <option value="">Tüm Durumlar</option>
-            <option value="pending">Beklemede (Amir)</option>
-            <option value="pending_engineer">Beklemede (Mühendis)</option>
+            <option value="pending">Beklemede</option>
             <option value="approved">Onaylandı</option>
-            <option value="added">Ağaca Eklendi</option>
             <option value="rejected">Reddedildi</option>
           </select>
-          <span className="muted" style={{ marginLeft: 'auto' }}>{all.length} öneri</span>
+          <span className="muted" style={{ marginLeft: 'auto' }}>{all.length} talep</span>
         </div>
         <div className="table-scroll">
           <table>
@@ -254,19 +234,17 @@ export default function SuggestionsPage({ user }: { user: User }) {
               <tr>
                 <th>Araç Modeli</th>
                 <th>Periyot</th>
-                <th>Öneri</th>
+                <th>Talep</th>
                 <th>Öneren</th>
                 <th>Tarih</th>
                 <th>Durum</th>
-                <th>Onay Süreci</th>
+                <th>Değerlendirme</th>
                 <th></th>
               </tr>
             </thead>
             <tbody>
               {list === null && <SkeletonTableRows columns={8} />}
-              {list !== null && all.map((s) => {
-                const stage = pendingStage(s)
-                return (
+              {list !== null && all.map((s) => (
                 <tr key={s.id}>
                   <td style={{ whiteSpace: 'nowrap' }}>
                     {s.vehicle_model || (s.vehicle ? `${s.vehicle.code} (eski kayıt)` : <span className="muted">—</span>)}
@@ -284,11 +262,11 @@ export default function SuggestionsPage({ user }: { user: User }) {
                   <td style={{ whiteSpace: 'nowrap' }}>{fmt(s.created_at)}</td>
                   <td style={{ whiteSpace: 'nowrap' }}><Badge tone={STATUS_TONE[s.status]}>{SUGGESTION_STATUS_TR[s.status]}</Badge></td>
                   <td style={{ minWidth: 200, maxWidth: 280 }}>
-                    <ApprovalChain s={s} />
+                    <ReviewSummary s={s} />
                   </td>
                   <td>
                     <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
-                      {canActOnStage(stage) && (
+                      {canReview && isOpen(s) && (
                         <button className="small" onClick={() => openReview(s)}>
                           <ShieldCheck size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
                           Değerlendir
@@ -302,21 +280,20 @@ export default function SuggestionsPage({ user }: { user: User }) {
                     </div>
                   </td>
                 </tr>
-                )
-              })}
+              ))}
             </tbody>
           </table>
           {list !== null && all.length === 0 && (
             <EmptyState
               icon={<Lightbulb size={22} />}
-              title="Öneri bulunamadı"
-              description="Henüz hiç öneri gönderilmemiş."
+              title="Talep bulunamadı"
+              description="Henüz hiç iyileştirme talebi gönderilmemiş."
             />
           )}
         </div>
       </div>
 
-      {reviewing && reviewingStage && (
+      {reviewing && isOpen(reviewing) && (
         <div
           style={{
             position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)',
@@ -327,12 +304,10 @@ export default function SuggestionsPage({ user }: { user: User }) {
           <div className="card" style={{ width: 420, maxWidth: '90vw' }} onClick={(e) => e.stopPropagation()}>
             <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
               <Lightbulb size={15} />
-              {reviewingStage === 'amir' ? 'Amir Değerlendirmesi' : 'Mühendis Değerlendirmesi'}
+              Talebi Değerlendir
             </h3>
             <p className="muted" style={{ fontSize: 12.5, marginTop: -4 }}>
-              {reviewingStage === 'amir'
-                ? 'Onaylarsanız öneri mühendise düşer; reddederseniz mühendise hiç düşmez.'
-                : 'Bu aşamadaki karar nihaidir.'}
+              Verdiğiniz karar nihaidir — talep başka bir aşamaya düşmez.
             </p>
             <textarea
               autoFocus
@@ -348,16 +323,10 @@ export default function SuggestionsPage({ user }: { user: User }) {
                 <X size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
                 Reddet
               </button>
-              <button className="small" disabled={reviewBusy} onClick={() => saveReview('approved')}>
+              <button className="primary" disabled={reviewBusy} onClick={() => saveReview('approved')}>
                 <Check size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
                 Onayla
               </button>
-              {reviewingStage === 'engineer' && (
-                <button className="primary" disabled={reviewBusy} onClick={() => saveReview('added')}>
-                  <Workflow size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
-                  Ağaca Eklendi Olarak İşaretle
-                </button>
-              )}
             </div>
           </div>
         </div>

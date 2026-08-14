@@ -17,8 +17,10 @@ import openpyxl
 from app.excel_utils import build_maintenances_workbook
 
 
-def _plan(name, interval_km=0, interval_months=None):
-    return SimpleNamespace(name=name, interval_km=interval_km, interval_months=interval_months)
+def _plan(name, interval_km=0, interval_months=None, plan_type="km"):
+    return SimpleNamespace(
+        name=name, interval_km=interval_km, interval_months=interval_months, plan_type=plan_type,
+    )
 
 
 def _vehicle(code):
@@ -32,6 +34,11 @@ def _maintenance(vehicle, plan, target_km, status="completed"):
         plan=plan,
         target_km=target_km,
         km_at_open=target_km,
+        # Bakım yapılırken girilen güncel km (Faz — km sapma yüzdesi) — bu
+        # testler dışa aktarım format/sayfa bölünme davranışını doğruluyor,
+        # sapma hesaplamasını değil; None bırakmak compute_km_deviation_pct'in
+        # deviation=None dönmesini sağlar (sütun boş görünür, hata vermez).
+        completed_km=None,
         status=status,
         items=[],
         assigned_to=None,

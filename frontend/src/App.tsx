@@ -7,7 +7,7 @@ import Login from './pages/Login'
 import ParticleNetwork from './components/ParticleNetwork'
 import DashboardPage from './pages/DashboardPage'
 import MaintenancesPage from './pages/MaintenancesPage'
-import HistoryPage from './pages/HistoryPage'
+import HistoryPage, { type HistoryFilters } from './pages/HistoryPage'
 import AuditLogPage from './pages/AuditLogPage'
 import VehiclesPage from './pages/VehiclesPage'
 import PlansPage from './pages/PlansPage'
@@ -17,6 +17,7 @@ import PermissionsPage from './pages/PermissionsPage'
 import CalendarPage from './pages/CalendarPage'
 import ProfilePage from './pages/ProfilePage'
 import PartsCatalogPage from './pages/PartsCatalogPage'
+import KnowledgeBasePage from './pages/KnowledgeBasePage'
 import SuggestionsPage from './pages/SuggestionsPage'
 import KPIPage from './pages/KPIPage'
 import SystemStatusPage from './pages/SystemStatusPage'
@@ -25,6 +26,7 @@ import { Avatar } from './components/ui'
 import TopbarTools, { type HitType } from './components/TopbarTools'
 import { ToastHost } from './components/toast'
 import { OnboardingTour, ONBOARDING_STEPS } from './components/onboarding'
+import { pushDetail } from './useDetailHistory'
 import {
   LayoutDashboard,
   Workflow,
@@ -35,7 +37,6 @@ import {
   History as HistoryIcon,
   ScrollText,
   LogOut,
-  Box,
   ShieldCheck,
   CalendarDays,
   UserCircle2,
@@ -47,6 +48,7 @@ import {
   Activity,
   HelpCircle,
   BarChart3,
+  BookOpen,
 } from 'lucide-react'
 
 export type Page =
@@ -58,6 +60,7 @@ export type Page =
   | 'plans'
   | 'tree'
   | 'parts'
+  | 'knowledge'
   | 'suggestions'
   | 'kpi'
   | 'users'
@@ -78,6 +81,7 @@ const NAV_ICONS: Record<Page, ReactElement> = {
   vehicles: <Truck size={17} />,
   plans: <ClipboardList size={17} />,
   parts: <PackageSearch size={17} />,
+  knowledge: <BookOpen size={17} />,
   suggestions: <Lightbulb size={17} />,
   kpi: <BarChart3 size={17} />,
   users: <UsersIcon size={17} />,
@@ -97,7 +101,8 @@ const PAGE_TITLES: Record<Page, string> = {
   vehicles: 'Araçlar',
   plans: 'Bakım Planları',
   parts: 'Parça Bilgi Bankası',
-  suggestions: 'Öneriler',
+  knowledge: 'Bakım Bilgi Bankası',
+  suggestions: 'İyileştirme Talepleri',
   kpi: 'KPI Raporu',
   users: 'Kullanıcılar',
   permissions: 'Yetki Yönetimi',
@@ -114,8 +119,13 @@ export default function App() {
   const [page, setPage] = useState<Page>('dashboard')
   const [jumpToMaintenance, setJumpToMaintenance] = useState<number | null>(null)
   const [maintFilter, setMaintFilter] = useState<{ status?: string; planName?: string } | null>(null)
+  const [historyFilter, setHistoryFilter] = useState<Partial<HistoryFilters> | null>(null)
+  const [historyPlanName, setHistoryPlanName] = useState<string | null>(null)
   const [openVehicleId, setOpenVehicleId] = useState<number | null>(null)
   const [openPartId, setOpenPartId] = useState<number | null>(null)
+  // Bakım sırasında bir maddenin yanındaki "Bilgi" düğmesinden Bakım Bilgi
+  // Bankası'na geçilirken, açılacak ağaç maddesinin id'si (bkz. Faz 27).
+  const [openKnowledgeNodeId, setOpenKnowledgeNodeId] = useState<number | null>(null)
   const [navOpen, setNavOpen] = useState(false)
   // Masaüstünde kenar çubuğu daraltılıp (yalnızca ikonlar) genişletilebilir
   // ("içe girip çıkabilir") — tercih tarayıcıda hatırlanır. Mobilde zaten
@@ -264,6 +274,12 @@ export default function App() {
       setJumpToMaintenance(null)
       setMaintFilter(null)
     }
+    // Bakım Geçmişi'ne menüden/normal yoldan (Dashboard'daki "Bu Ay" kartı ya
+    // da periyot grafiği DIŞINDA) gidiliyorsa önceki filtre yapışık kalmasın.
+    if (next === 'history') {
+      setHistoryFilter(null)
+      setHistoryPlanName(null)
+    }
     // Menüden Araçlar'a geçişte, önceden global aramadan/Dashboard'dan
     // açılmış bir araç profili varsa temizle (liste görünümüyle başlasın).
     // Araçlar sayfasından BAŞKA bir sayfaya çıkarken de aynı şekilde
@@ -271,6 +287,7 @@ export default function App() {
     // olmadan) girildiğinde asla eski açık araç "yapışık" kalmaz.
     if (next === 'vehicles' || page === 'vehicles') setOpenVehicleId(null)
     if (next === 'parts') setOpenPartId(null)
+    if (next === 'knowledge') setOpenKnowledgeNodeId(null)
     setPage(next)
     setNavOpen(false)
     window.history.pushState({ page: next }, '', '')
@@ -281,7 +298,9 @@ export default function App() {
     setOpenVehicleId(id)
     setPage('vehicles')
     setNavOpen(false)
+    // bkz. openMaintenance'taki liste+detay yorumu — aynı mantık burada da geçerli.
     window.history.pushState({ page: 'vehicles' }, '', '')
+    pushDetail('vehicles', id)
   }
 
   // Global aramadan / QR koddan bir Parça Bilgi Bankası maddesini açar.
@@ -290,6 +309,16 @@ export default function App() {
     setPage('parts')
     setNavOpen(false)
     window.history.pushState({ page: 'parts' }, '', '')
+    pushDetail('parts', id)
+  }
+
+  // Bakım detayındaki bir maddenin "Bilgi" düğmesinden Bakım Bilgi
+  // Bankası'nda o maddeyi doğrudan açar.
+  function openKnowledgeNode(nodeId: number) {
+    setOpenKnowledgeNodeId(nodeId)
+    setPage('knowledge')
+    setNavOpen(false)
+    window.history.pushState({ page: 'knowledge' }, '', '')
   }
 
   // Dashboard'daki periyot grafiğinden ("50.000 km bakımda 9 araç
@@ -301,6 +330,35 @@ export default function App() {
     setPage('maintenances')
     setNavOpen(false)
     window.history.pushState({ page: 'maintenances' }, '', '')
+  }
+
+  // Dashboard'daki "Tamamlanan (Bu Ay)" kartı, gösterdiği sayıyla (bu ayın
+  // başından bugüne tamamlananlar) BİREBİR aynı filtreyle Bakım Geçmişi'ne
+  // götürür — aksi halde kart "3" derken filtresiz geçmiş sayfası TÜM
+  // zamanların tamamlananlarını (çok daha fazla) gösterir ve ikisi
+  // senkron olmazmış gibi görünürdü.
+  function goToHistoryThisMonth() {
+    const now = new Date()
+    const monthStart = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-01`
+    setHistoryFilter({ status: 'completed', date_from: monthStart, date_to: '' })
+    setHistoryPlanName(null)
+    setPage('history')
+    setNavOpen(false)
+    window.history.pushState({ page: 'history' }, '', '')
+  }
+
+  // Dashboard'daki periyoda göre bakım dağılımı grafiğinde "Tamamlandı"
+  // barına (ör. "50.000 km") tıklanınca — o barın kendisi zaten TÜM
+  // zamanların o periyottaki tamamlananlarını gösterdiği için burada tarih
+  // sınırlaması YOK, yalnızca o periyoda (plan) göre filtrelenir — aksi
+  // halde bar "50.000 km'de 7 tamamlanan" derken Geçmiş'e girince TÜM
+  // periyotların tamamlananları karışık görünürdü.
+  function goToHistoryForPlan(planName: string) {
+    setHistoryFilter({ status: 'completed' })
+    setHistoryPlanName(planName)
+    setPage('history')
+    setNavOpen(false)
+    window.history.pushState({ page: 'history' }, '', '')
   }
 
   if (loading) return null
@@ -332,7 +390,11 @@ export default function App() {
     // içinde isAdmin'e göre gizlenir/gösterilir.
     { key: 'tree', label: 'Bakım Ağacı', show: isStaff },
     { key: 'parts', label: 'Parça Bilgi Bankası', show: true },
-    { key: 'suggestions', label: 'Öneriler', show: true },
+    // Bakım Bilgi Bankası (Faz 27) — bakım ağacının salt-okunur, "nasıl
+    // yapılır" odaklı görünümü. Bakım Ağacı editörü isStaff'a kapalıyken
+    // usta buraya girip maddeye ait video/PDF/açıklamayı görebilir.
+    { key: 'knowledge', label: 'Bakım Bilgi Bankası', show: true },
+    { key: 'suggestions', label: 'İyileştirme Talepleri', show: true },
     // KPI Raporu ustaya kasıtlı olarak kapalı — yönetici rollerine (admin/mühendis/amir) özeldir.
     { key: 'kpi', label: 'KPI Raporu', show: isStaff && p.view_dashboard_analytics !== false },
     { key: 'users', label: 'Kullanıcılar', show: canManageUsers },
@@ -353,7 +415,11 @@ export default function App() {
     setMaintFilter(null)
     setPage('maintenances')
     setNavOpen(false)
+    // Önce liste, sonra detay girdisi eklenir ki geri tuşu doğrudan başka
+    // bir sayfaya atlamadan önce Bakımlar listesine uğrasın (bkz.
+    // useDetailHistory.ts / MaintenancesPage'teki useDetailPopState).
     window.history.pushState({ page: 'maintenances' }, '', '')
+    pushDetail('maintenances', id)
   }
 
   // Kullanıcının rolüne göre global aramada hangi sonuç türlerine
@@ -401,7 +467,7 @@ export default function App() {
         <div className="brand">
           <ParticleNetwork particleDensity={0.00025} minParticles={10} maxParticles={26} linkDistance={70} mouseLinkDistance={90} />
           <span className="logo-dot">
-            <Box size={17} />
+            <img src="/favicon.svg" alt="Ulaşım Bakım logosu" />
           </span>
           <span className="brand-text">
             Ulaşım Bakım
@@ -489,6 +555,8 @@ export default function App() {
               onGoToMaintenances={() => navigate('maintenances')}
               onFilterMaintenances={goToFilteredMaintenances}
               onNavigate={(p) => navigate(p)}
+              onGoToHistoryThisMonth={goToHistoryThisMonth}
+              onGoToHistoryForPlan={goToHistoryForPlan}
             />
           )}
           {page === 'maintenances' && (
@@ -498,13 +566,21 @@ export default function App() {
               initialSelectedId={jumpToMaintenance}
               initialStatus={maintFilter?.status}
               initialPlanName={maintFilter?.planName}
+              onOpenVehicle={openVehicleProfile}
+              onOpenKnowledge={openKnowledgeNode}
             />
           )}
           {page === 'calendar' && isStaff && (
             <CalendarPage perms={p} onOpenMaintenance={openMaintenance} />
           )}
           {page === 'history' && (
-            <HistoryPage user={user} perms={p} onOpenMaintenance={openMaintenance} />
+            <HistoryPage
+              user={user}
+              perms={p}
+              onOpenMaintenance={openMaintenance}
+              initialFilter={historyFilter ?? undefined}
+              initialPlanName={historyPlanName ?? undefined}
+            />
           )}
           {page === 'vehicles' && isStaff && (
             <VehiclesPage
@@ -517,6 +593,7 @@ export default function App() {
           {page === 'plans' && isAdmin && <PlansPage />}
           {page === 'tree' && isStaff && <TreeEditorPage user={user} />}
           {page === 'parts' && <PartsCatalogPage canEdit={isStaff} initialSelectedId={openPartId} />}
+          {page === 'knowledge' && <KnowledgeBasePage canEdit={isStaff} initialNodeId={openKnowledgeNodeId} />}
           {page === 'suggestions' && <SuggestionsPage user={user} />}
           {page === 'kpi' && isStaff && p.view_dashboard_analytics !== false && <KPIPage />}
           {page === 'users' && canManageUsers && <UsersPage currentUser={user} />}

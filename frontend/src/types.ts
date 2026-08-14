@@ -62,7 +62,10 @@ export interface Plan {
 export interface NodeAttachment {
   id: number
   node_id: number
-  kind: 'image' | 'pdf' | 'file' | 'link'
+  // Faz 27 (Bakım Bilgi Bankası): 'video' ve 'cad' de eklendi — video
+  // dosyaları ve tanınan video bağlantıları (YouTube/Vimeo) artık gömülü
+  // oynatıcıda açılır, eskiden olduğu gibi 'file'/'link' olarak kalmaz.
+  kind: 'image' | 'pdf' | 'video' | 'cad' | 'file' | 'link'
   label: string
   filename: string
   original_name: string
@@ -79,6 +82,21 @@ export interface ItemExecAttachment {
   original_name: string
   uploaded_by: User | null
   created_at: string
+}
+
+// ---------- Bakım Bilgi Bankası (Faz 27) ----------
+// GET /api/knowledge/search sonucu — madde + ağaçtaki yolu.
+export interface KnowledgeHit {
+  id: number
+  name: string
+  card_code: string
+  note: string
+  // Kökten maddeye kadar isim listesi, ör. ["Gövde", "Fren", "Balata"].
+  path: string[]
+  plan_id: number | null
+  plan_name: string
+  attachment_count: number
+  has_video: boolean
 }
 
 export interface TreeNode {
@@ -131,6 +149,9 @@ export interface Item {
   completed_by: User | null
   note: string
   card_code: string
+  // Faz 27: bu maddenin kopyalandığı bakım ağacı düğümü — "Bilgi" düğmesi
+  // Bakım Bilgi Bankası'nda bu düğümü açar (eski kayıtlarda null olabilir).
+  source_node_id: number | null
   attachments: NodeAttachment[]
   tier_kms: number[]
   exec_note: string
@@ -162,6 +183,9 @@ export interface Maintenance {
   vehicle: Vehicle
   plan: Plan
   assigned_to: User | null
+  // İş emrinin (kişiden bağımsız) atandığı vardiya — bkz. PATCH
+  // /maintenances/{id}/assign-shift.
+  assigned_shift?: Shift | null
   items?: Item[]
   covered_tiers?: number[]
   notes?: MaintenanceNote[]
@@ -171,6 +195,16 @@ export interface Maintenance {
   activated_by: User | null
   // "Başlat" derken ileri bir tarih seçildiyse dolu — o tarihte otomatik başlatılır.
   scheduled_start_at: string | null
+  // Takvim'de elle sürüklenip bir güne taşındıysa o gün (YYYY-MM-DD); boşsa
+  // takvim aracın hedef km'ye ulaşacağı tahmini günü kullanır.
+  planned_date?: string | null
+  // Bakımı yapan kişinin girdiği, bakımın gerçekte yapıldığı güncel km
+  // (yalnızca km bazlı planlarda anlamlıdır) — bkz. PATCH
+  // /maintenances/{id}/completed-km.
+  completed_km?: number | null
+  // completed_km girildiyse hedef km'ye göre sapma yüzdesi (negatif=erken,
+  // pozitif=geç yapıldı); backend'de hesaplanır, salt okunurdur.
+  km_deviation_pct?: number | null
 }
 
 export interface UpcomingItem {
@@ -189,6 +223,20 @@ export interface UpcomingItem {
   // 4 durumlu sınıflandırma (bkz. backend services._classify_upcoming_status):
   // "yaklasiyor" | "planlanacak" | "planlandi" | "gecikti" | null.
   status?: 'yaklasiyor' | 'planlanacak' | 'planlandi' | 'gecikti' | null
+  // Yalnızca maintenance_id doluysa anlamlı — bkz. Maintenance.assigned_shift.
+  assigned_shift_id?: number | null
+  assigned_shift_name?: string | null
+  // Henüz başlatılmamış ama "Başlat" derken ileri bir tarihe zamanlandıysa
+  // dolu (bkz. Maintenance.scheduled_start_at) — maintenance_id bu durumda
+  // hâlâ null olabilir (henüz açılmamış gibi davranılır).
+  scheduled_start_at?: string | null
+  // Takvim'deki tek-takvim sürükle-bırak kısıtlaması için: planın kendi
+  // threshold_type ayarına göre GERÇEK tolerans penceresi (takvim tarihine
+  // çevrilmiş) — bkz. backend services.compute_upcoming_maintenances /
+  // compute_upcoming_time_maintenances. Bu öğe bu iki tarihin DIŞINA
+  // sürüklenemez.
+  window_lower_date?: string | null
+  window_upper_date?: string | null
 }
 
 export interface CalendarProjection {
@@ -452,6 +500,7 @@ export const AUDIT_ENTITY_TR: Record<string, string> = {
   part: 'Parça',
   part_attachment: 'Parça Eki',
   alarm: 'Alarm',
+  suggestion: 'İyileştirme Talebi',
 }
 
 // ---------- Parça Bilgi Bankası ----------
@@ -594,57 +643,6 @@ export interface SearchResults {
   documents: SearchHit[]
 }
 
-// ---------- Canlı Alarm Merkezi ----------
-export type AlarmPriority = 'low' | 'normal' | 'high' | 'critical'
-
-export interface AlarmState {
-  id: number
-  priority: AlarmPriority
-  acknowledged: boolean
-  acknowledged_by: User | null
-  acknowledged_at: string | null
-  assigned_to: User | null
-  resolved: boolean
-  resolved_at: string | null
-  closed: boolean
-  closed_at: string | null
-}
-
-export interface AlarmItem {
-  level: 'critical' | 'warning' | 'normal'
-  vehicle: Vehicle
-  plan_name: string
-  target_km: number
-  target_date: string | null
-  remaining_km: number
-  estimated_days: number | null
-  overdue: boolean
-  maintenance_id: number | null
-  age_days: number | null
-  message: string
-  state: AlarmState | null
-}
-
-export interface AlarmCenter {
-  critical: number
-  warning: number
-  normal: number
-  items: AlarmItem[]
-}
-
-export const ALARM_LEVEL_TR: Record<AlarmItem['level'], string> = {
-  critical: 'Kritik',
-  warning: 'Uyarı',
-  normal: 'Normal',
-}
-
-export const ALARM_PRIORITY_TR: Record<AlarmPriority, string> = {
-  low: 'Düşük',
-  normal: 'Normal',
-  high: 'Yüksek',
-  critical: 'Kritik',
-}
-
 // ---------- Bildirim Merkezi ----------
 export interface NotificationItem {
   id: number
@@ -655,7 +653,9 @@ export interface NotificationItem {
   maintenance_id: number | null
 }
 
-// ---------- Öneriler (Faz 30 — araç modeli + hiyerarşik onay) ----------
+// ---------- İyileştirme Talepleri (araç modeli + tek aşamalı onay) ----------
+// Kurumsal adlandırma "İyileştirme Talebi"dir; API yolu, tablo ve tip adları
+// geriye dönük uyumluluk için 'suggestion' olarak kalmıştır.
 export interface Suggestion {
   id: number
   // Geriye dönük uyumluluk: bu özellikten önce belirli bir araca bağlı
@@ -665,9 +665,9 @@ export interface Suggestion {
   vehicle_model: string
   plan: Plan | null
   text: string
-  // pending: amir'in kararını bekliyor · pending_engineer: amir onayladı,
-  // mühendis bekleniyor · rejected: amir ya da mühendis reddetti ·
-  // approved/added: mühendisin nihai kararı.
+  // Faz 31 — onay TEK aşamalı: pending (karar bekliyor) · approved · rejected.
+  // 'pending_engineer' ve 'added' yalnızca Faz 30'daki iki aşamalı zincirden
+  // kalan ESKİ kayıtlarda görülebilir; yeni önerilerde hiç üretilmez.
   status: 'pending' | 'pending_engineer' | 'rejected' | 'approved' | 'added'
   admin_note: string
   created_by: User | null
@@ -687,10 +687,12 @@ export interface Suggestion {
 }
 
 export const SUGGESTION_STATUS_TR: Record<Suggestion['status'], string> = {
-  pending: 'Beklemede (Amir)',
-  pending_engineer: 'Beklemede (Mühendis)',
+  pending: 'Beklemede',
+  // Eski kayıtlar da tek bir "Beklemede" olarak görünür (zincir kalktı).
+  pending_engineer: 'Beklemede',
   rejected: 'Reddedildi',
   approved: 'Onaylandı',
+  // Artık işaretlenemez — yalnızca eski kayıtların etiketi.
   added: 'Ağaca Eklendi',
 }
 
@@ -727,10 +729,11 @@ export interface KPICompletion {
   completion_rate_pct: number
   completed_in_range: number
   avg_completion_days: number | null
-  // Zamanında tamamlanan bakım oranı: (100 * zamanında tamamlanan) /
-  // (periyodu belirsiz olmayan, değerlendirilen bakım). Km bazlı planlarda
-  // km_at_open<=target_km, süre bazlı planlarda completed_at<=target_date
-  // ölçütü kullanılır — bkz. backend services.compute_kpi_report.
+  // Zamanında tamamlanan bakım oranı: (100 * toleransta tamamlanan) /
+  // (periyodu belirsiz olmayan, değerlendirilen TAMAMLANMIŞ bakım). Km
+  // bazlı planlarda bakımın gerçekten yapıldığı km (completed_km) planın
+  // tolerans penceresi içinde mi, süre bazlı planlarda completed_at <=
+  // target_date mi diye bakılır — bkz. backend services.compute_kpi_report.
   on_time_count: number
   on_time_evaluated: number
   on_time_rate_pct: number | null

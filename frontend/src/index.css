@@ -290,11 +290,19 @@ select { cursor: pointer; }
 .sidebar .brand .logo-dot {
   display: inline-flex; align-items: center; justify-content: center;
   width: 29px; height: 29px; border-radius: 9px; flex-shrink: 0; color: #fff;
-  background: linear-gradient(135deg, var(--primary-500), var(--primary-900));
-  box-shadow: 0 6px 16px rgba(27, 77, 160, 0.32);
+  /* Favicon ile aynı marka görseli (bkz. public/favicon.svg) şeffaf zeminli
+     olduğundan, koyu temada da fark edilir kalması için zemin her zaman
+     açık tonda sabit tutulur (tema değişkeni değil). */
+  background: #fff;
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 16px rgba(27, 77, 160, 0.22);
+  overflow: hidden;
   /* Arkadaki nokta ağının üstünde kalması için. */
   position: relative;
   z-index: 1;
+}
+.sidebar .brand .logo-dot img {
+  width: 100%; height: 100%; object-fit: contain; padding: 3px; box-sizing: border-box;
 }
 .sidebar .brand .brand-text { line-height: 1.25; font-weight: 700; font-size: 13px; color: var(--text); letter-spacing: -0.01em; position: relative; z-index: 1; }
 .sidebar .brand .brand-text small { display: block; font-size: 10px; font-weight: 500; color: var(--text-tertiary); letter-spacing: 0.02em; }
@@ -819,8 +827,15 @@ table.standalone { background: var(--surface); border-radius: var(--radius-lg); 
 }
 .login-box .login-logo {
   width: 44px; height: 44px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
-  background: linear-gradient(135deg, var(--primary-500), var(--primary-900)); color: #fff;
-  box-shadow: 0 8px 20px rgba(27, 77, 160, 0.3);
+  /* Sidebar'daki .logo-dot ile AYNI marka görseli/zemin kuralı — bkz. o
+     kuralın yorumu. */
+  background: #fff; color: #fff;
+  border: 1px solid var(--border);
+  box-shadow: 0 8px 20px rgba(27, 77, 160, 0.2);
+  overflow: hidden;
+}
+.login-box .login-logo img {
+  width: 100%; height: 100%; object-fit: contain; padding: 5px; box-sizing: border-box;
 }
 .login-box h1 { font-size: 20px; font-weight: 800; margin-bottom: 5px; letter-spacing: -0.015em; }
 .login-box .sub { color: var(--text-secondary); margin-bottom: 26px; font-size: 13.5px; }
@@ -945,6 +960,42 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
 }
 [data-theme="dark"] tbody tr.planned-row td { background: #113329; }
 [data-theme="dark"] tbody tr.planned-row:hover td { background: #154033; }
+
+/* Bakımlar > Bakım Akışı: Araçlar'daki dört durum tek işlem panelinde. */
+.maintenance-flow-card { margin-bottom: 16px; }
+.maintenance-flow-summary { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.maintenance-flow-jump { text-decoration: none; cursor: pointer; }
+.maintenance-flow-jump strong { margin-left: 4px; font-size: 13px; }
+.maintenance-flow-groups { display: grid; gap: 14px; }
+.maintenance-flow-group { scroll-margin-top: 18px; border-top: 1px solid var(--border-soft); padding-top: 12px; }
+.maintenance-flow-group-head { display: flex; align-items: center; gap: 9px; margin-bottom: 8px; }
+
+/* Bakım Akışı tablosu 9 sütun taşıdığı için varsayılan (nowrap) tablo
+   davranışında ekrana/tablete sığmıyor, yatay kaydırma gerektiriyordu.
+   table-layout:fixed + sabit yüzdesel sütun genişlikleri kullanılıyor ki
+   tablonun toplam genişliği HER ZAMAN kart genişliğine eşit kalsın (içerik
+   ne olursa olsun taşma/kaydırma olmaz). Satır kırılımı + min-width:0 ile
+   rozet/seçim/buton gibi öğeler de kendi sütununun dışına taşmadan
+   küçülür; en çok yer isteyen "İşlem" ve "Periyot" sütunlarına daha fazla
+   pay verildi. */
+.maintenance-flow-group table { table-layout: fixed; width: 100%; }
+.maintenance-flow-group th, .maintenance-flow-group td {
+  white-space: normal; overflow-wrap: anywhere; word-break: break-word; padding: 8px 7px; min-width: 0;
+}
+.maintenance-flow-group td .row { min-width: 0; }
+.maintenance-flow-group td .badge { min-width: 0; }
+.maintenance-flow-group td select,
+.maintenance-flow-group td button { max-width: 100%; box-sizing: border-box; }
+.maintenance-flow-group td select { width: 100%; }
+.maintenance-flow-group th:nth-child(1), .maintenance-flow-group td:nth-child(1) { width: 9%; }
+.maintenance-flow-group th:nth-child(2), .maintenance-flow-group td:nth-child(2) { width: 15%; }
+.maintenance-flow-group th:nth-child(3), .maintenance-flow-group td:nth-child(3) { width: 10%; }
+.maintenance-flow-group th:nth-child(4), .maintenance-flow-group td:nth-child(4) { width: 9%; }
+.maintenance-flow-group th:nth-child(5), .maintenance-flow-group td:nth-child(5) { width: 10%; }
+.maintenance-flow-group th:nth-child(6), .maintenance-flow-group td:nth-child(6) { width: 8%; }
+.maintenance-flow-group th:nth-child(7), .maintenance-flow-group td:nth-child(7) { width: 13%; }
+.maintenance-flow-group th:nth-child(8), .maintenance-flow-group td:nth-child(8) { width: 10%; }
+.maintenance-flow-group th:nth-child(9), .maintenance-flow-group td:nth-child(9) { width: 16%; }
 
 .filter-bar { margin-bottom: var(--space-4); }
 .vehicle-code { font-weight: 700; letter-spacing: 0.01em; color: var(--text); }
@@ -1317,6 +1368,7 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
 .cal-chips { display: flex; flex-direction: column; gap: 3px; }
 
 .cal-chip {
+  position: relative;
   display: block;
   width: 100%;
   text-align: left;
@@ -1337,6 +1389,9 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
 .cal-chip.cal-pending { background: var(--amber-light); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 16%, transparent); }
 .cal-chip.cal-in_progress { background: var(--accent-light); color: var(--primary-600); border-color: color-mix(in srgb, var(--primary-600) 16%, transparent); }
 .cal-chip.cal-completed { background: var(--green-light); color: var(--green); border-color: color-mix(in srgb, var(--green) 16%, transparent); }
+/* Tek takvim yeniden tasarımı: henüz iş emri açılmamış (aday) araçlar gri
+   renkte gösterilir — bkz. CalendarPage.tsx CalItem.color === 'gray'. */
+.cal-chip.cal-gray { background: var(--surface-sunken); color: var(--text-secondary); border-color: var(--border); }
 
 /* Haftalık görünümdeki barlar (bkz. .cal-grid-week ve DayCell'in
    showDeadline prop'u) — araç/periyot adının altında ayrıca "en geç X
@@ -1369,6 +1424,30 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
   font-weight: 700;
   color: var(--text-tertiary);
   padding: 3px 5px;
+}
+
+/* Elle taşınmış (planned_date) takvim öğelerinde köşedeki "eski haline
+   döndür" butonu — bkz. CalendarPage.tsx CalItem.isManual. */
+.cal-chip-revert {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.1);
+  color: inherit;
+  cursor: pointer;
+  line-height: 0;
+}
+.cal-chip-revert:hover { background: rgba(0, 0, 0, 0.22); }
+.cal-chip-manual-tag {
+  font-weight: 700;
 }
 
 /* Takvim lejantı (renk kodlaması açıklaması) */
@@ -1515,51 +1594,6 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
 }
 @media (max-width: 620px) {
   .topbar-search { display: none; }
-}
-
-/* ============================================================ Alarm Merkezi */
-.alarm-header-actions { display: flex; align-items: center; gap: 10px; }
-.alarm-live-status {
-  display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary);
-  font-size: 12px; font-weight: 650; white-space: nowrap;
-}
-.alarm-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); margin-bottom: var(--space-6); }
-.alarm-sum-card {
-  display: flex; align-items: center; gap: 14px; padding: 16px 18px;
-  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-xs);
-  text-align: left; cursor: pointer; transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease), transform var(--dur-fast) var(--ease);
-}
-.alarm-sum-card:hover { border-color: var(--border-strong); box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-.alarm-sum-card .alarm-sum-ico {
-  width: 44px; height: 44px; border-radius: var(--radius-md); flex-shrink: 0;
-  display: inline-flex; align-items: center; justify-content: center;
-}
-.alarm-sum-card .alarm-sum-val { font-size: 26px; font-weight: 800; letter-spacing: -0.02em; line-height: 1; }
-.alarm-sum-card .alarm-sum-lbl { font-size: 12.5px; color: var(--text-secondary); font-weight: 600; margin-top: 3px; }
-.alarm-sum-card.lv-critical .alarm-sum-ico { background: var(--red-light); color: var(--red); }
-.alarm-sum-card.lv-warning .alarm-sum-ico { background: var(--amber-light); color: var(--amber); }
-.alarm-sum-card.lv-normal .alarm-sum-ico { background: var(--green-light); color: var(--green); }
-.alarm-sum-card.active { outline: 2px solid var(--primary-500); outline-offset: -1px; }
-.alarm-toolbar { gap: 12px; min-height: 64px; }
-.alarm-list-title { display: flex; align-items: center; gap: 2px; }
-.alarm-list-title .muted { margin-left: 8px; font-size: 12px; font-weight: 500; }
-.alarm-filters { flex-wrap: wrap; justify-content: flex-end; }
-.alarm-list-card table th { white-space: nowrap; }
-
-.alarm-row-dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.alarm-row-dot.lv-critical { background: var(--red); }
-.alarm-row-dot.lv-warning { background: var(--amber); }
-.alarm-row-dot.lv-normal { background: var(--green); }
-tbody tr.alarm-tr-critical td:first-child { border-left: 4px solid var(--red); }
-tbody tr.alarm-tr-warning td:first-child { border-left: 4px solid var(--amber); }
-tbody tr.alarm-tr-normal td:first-child { border-left: 4px solid var(--green); }
-
-@media (max-width: 720px) {
-  .alarm-summary { grid-template-columns: 1fr; }
-  .alarm-header-actions { width: 100%; justify-content: space-between; }
-  .alarm-toolbar { align-items: flex-start; }
-  .alarm-filters { margin-left: 0 !important; justify-content: flex-start; }
 }
 
 /* Bakımlar: filtreleri ve iş akışı sekmelerini daha okunur tek bir hiyerarşide tut. */
@@ -1748,4 +1782,160 @@ tbody tr.alarm-tr-normal td:first-child { border-left: 4px solid var(--green); }
 
 @media (max-width: 520px) {
   .tour-tooltip { padding: 14px 16px 12px; }
+}
+
+/* ============================================================================
+ * Bakım Bilgi Bankası (Faz 27) — KnowledgeBasePage
+ * Sol: bakım ağacı, sağ: seçili maddenin video/talimat/açıklama kartı.
+ * ========================================================================= */
+.kb-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.kb-tree-pane { max-height: calc(100vh - 260px); overflow: auto; }
+.kb-detail-pane { min-height: 320px; }
+
+.kb-tree { display: flex; flex-direction: column; gap: 1px; }
+.kb-tree-row {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-radius: 7px; cursor: pointer;
+  font-size: 13.5px; color: var(--text-secondary);
+}
+.kb-tree-row:hover { background: var(--surface-sunken); color: var(--text); }
+.kb-tree-row.active { background: var(--primary-50, var(--surface-alt)); color: var(--primary-600); font-weight: 700; }
+.kb-tree-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-tree-caret {
+  background: none; border: none; padding: 0; width: 16px; height: 16px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center; color: var(--text-tertiary);
+}
+.kb-tree-caret:disabled { opacity: 0; cursor: default; }
+
+/* Maddede bilgi/video olduğunu gösteren küçük işaretler. */
+.kb-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--primary-500); flex-shrink: 0;
+}
+.kb-dot-video {
+  width: auto; height: auto; border-radius: var(--radius-pill); background: var(--red-light, #fee2e2);
+  color: var(--red, #dc2626); display: inline-flex; align-items: center; padding: 2px 5px;
+}
+
+/* Arama sonuçları */
+.kb-hits { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; max-height: 320px; overflow: auto; }
+.kb-hit {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+  padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+  background: var(--surface); text-align: left; width: 100%;
+}
+.kb-hit:hover { border-color: var(--primary-500); background: var(--surface-alt); }
+.kb-hit-name { display: inline-flex; align-items: center; gap: 6px; font-size: 13.5px; font-weight: 700; color: var(--text); }
+.kb-hit-path { font-size: 11.5px; color: var(--text-tertiary); }
+
+/* Detay panelindeki bölümler */
+.kb-section { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.kb-section:first-of-type { border-top: none; padding-top: 0; }
+.kb-section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.kb-section-head h4 { margin: 0; font-size: 13.5px; font-weight: 800; color: var(--text); }
+.kb-note { font-size: 13.5px; line-height: 1.6; color: var(--text-secondary); white-space: pre-wrap; margin: 0; }
+
+.kb-att-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.kb-att { border: 1px solid var(--border); border-radius: 10px; padding: 10px; background: var(--surface-alt); }
+.kb-att-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.kb-att-title {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 700; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.kb-att-kind { font-size: 11px; color: var(--text-tertiary); white-space: nowrap; }
+.kb-editor { background: var(--surface-sunken); border-radius: 10px; padding: 12px; }
+
+/* Mobil: iki panel yan yana sığmaz — liste ⇄ detay olarak geçiş yapılır. */
+.kb-back { display: none; }
+@media (max-width: 900px) {
+  .kb-layout { grid-template-columns: 1fr; }
+  .kb-tree-pane { max-height: none; }
+  .kb-layout.show-detail .kb-tree-pane { display: none; }
+  .kb-layout:not(.show-detail) .kb-detail-pane { display: none; }
+  .kb-back { display: inline-flex; margin-bottom: 10px; }
+}
+
+/* ============================================================================
+ * Usta Bakım Takvimi (Faz 27) — MaintenanceCalendar
+ * Bakımlar sayfasında listeli görünümün üstünde duran aylık takvim.
+ * "Bana atanan" ve "Başlatılan" iki ayrı renkle ayrılır.
+ * ========================================================================= */
+.mnt-cal { margin-bottom: 18px; }
+.mnt-cal-month { font-size: 13.5px; font-weight: 800; color: var(--text); min-width: 110px; text-align: center; }
+
+/* Takvimin iki sekmesi: "Bana Atanan Bakımlar" / "Genel Bakımlar". */
+.mnt-cal-tabs { margin: 4px 0 12px; }
+.mnt-cal-tab-count {
+  margin-left: 8px; border-radius: 999px; padding: 1px 8px;
+  font-size: 12px; font-weight: 700;
+  background: var(--amber-light); color: var(--amber);
+}
+.mnt-cal-tabs .primary .mnt-cal-tab-count { background: rgba(255, 255, 255, 0.28); color: #fff; }
+
+.mnt-cal-legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 0 0 12px; }
+.mnt-cal-key { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.mnt-chip-swatch { width: 12px; height: 12px; border-radius: 4px; display: inline-block; }
+.mnt-chip-swatch.mine { background: var(--primary-500); }
+.mnt-chip-swatch.open { background: var(--amber, #f59e0b); }
+.mnt-chip-swatch.done { background: var(--green); }
+
+.mnt-cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
+.mnt-cal-dayname {
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--text-tertiary); text-align: center; padding-bottom: 4px;
+}
+.mnt-cal-cell {
+  display: flex; flex-direction: column; align-items: stretch; gap: 3px;
+  min-height: 72px; padding: 5px; border-radius: 8px; text-align: left;
+  border: 1px solid var(--border); background: var(--surface);
+}
+.mnt-cal-cell:hover { border-color: var(--primary-500); }
+.mnt-cal-cell.outside { opacity: 0.45; }
+.mnt-cal-cell.today { border-color: var(--primary-500); }
+.mnt-cal-cell.selected { background: var(--surface-alt); border-color: var(--primary-500); box-shadow: inset 0 0 0 1px var(--primary-500); }
+.mnt-cal-daynum { font-size: 12px; font-weight: 700; color: var(--text-secondary); }
+.mnt-cal-cell.today .mnt-cal-daynum { color: var(--primary-600); }
+.mnt-cal-chips { display: flex; flex-direction: column; gap: 2px; overflow: hidden; }
+.mnt-cal-chip {
+  font-size: 10.5px; font-weight: 700; border-radius: 4px; padding: 1px 4px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #fff;
+}
+.mnt-cal-chip.mine { background: var(--primary-500); }
+.mnt-cal-chip.open { background: var(--amber, #f59e0b); }
+.mnt-cal-chip.done { background: var(--green); }
+.mnt-cal-more { font-size: 10px; color: var(--text-tertiary); font-weight: 700; }
+
+.mnt-cal-day { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.mnt-cal-day-head { font-size: 13px; font-weight: 800; color: var(--text); margin-bottom: 8px; }
+.mnt-cal-day-list { display: flex; flex-direction: column; gap: 6px; }
+.mnt-cal-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--surface);
+  border-left-width: 3px;
+}
+.mnt-cal-item.mine { border-left-color: var(--primary-500); }
+.mnt-cal-item.open { border-left-color: var(--amber, #f59e0b); }
+/* Tamamlanmış bakımlar geçmiş günlerde de yeşil olarak görünür. */
+.mnt-cal-item.done { border-left-color: var(--green); background: var(--green-light); }
+.mnt-cal-item.done:hover { background: color-mix(in srgb, var(--green) 12%, transparent); }
+.mnt-cal-item.done .mnt-cal-item-icon { color: var(--green); }
+.mnt-cal-item:hover { background: var(--surface-alt); }
+.mnt-cal-item-icon { display: inline-flex; color: var(--text-tertiary); flex-shrink: 0; }
+.mnt-cal-item.mine .mnt-cal-item-icon { color: var(--primary-600); }
+.mnt-cal-item-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.mnt-cal-item-title { font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Atanan kişi / vardiya, araç-periyot satırının altında ikinci satırda. */
+.mnt-cal-item-sub { font-size: 11.5px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mnt-cal-item.mine .mnt-cal-item-sub { color: var(--primary-600); font-weight: 600; }
+.mnt-cal-item.done .mnt-cal-item-sub { color: var(--green); }
+.mnt-cal-item-id { font-size: 11.5px; font-weight: 700; color: var(--text-tertiary); }
+
+@media (max-width: 640px) {
+  .mnt-cal-cell { min-height: 56px; padding: 4px 3px; }
+  .mnt-cal-chip { font-size: 9.5px; }
+  .mnt-cal-item-sub { font-size: 11px; }
 }

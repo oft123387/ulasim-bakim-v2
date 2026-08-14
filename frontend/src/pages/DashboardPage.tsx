@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import type { Dashboard, UpcomingItem, User } from '../types'
+import type { Dashboard, Maintenance, Shift, UpcomingItem, User } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, StatCard, CircularProgress, Badge, EmptyState, Skeleton } from '../components/ui'
 import ParticleNetwork from '../components/ParticleNetwork'
 import { useLiveEvent } from '../liveEvents'
-import { targetLabel, rawTargetLabel, mergedPeriodLabel } from '../format'
+import { rawTargetLabel, mergedPeriodLabel } from '../format'
 import {
   Truck,
   Clock,
@@ -14,6 +14,8 @@ import {
   UserCheck,
   ArrowRight,
   AlertTriangle,
+  ClipboardList,
+  Users,
 } from 'lucide-react'
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
@@ -43,7 +45,9 @@ const remainingDisplay = (u: UpcomingItem) =>
       ? `${Math.abs(u.remaining_km)} gün geçti`
       : `${u.remaining_km} gün kaldı`
     : kmDisplay(u.remaining_km)
-const hedefDisplay = (u: UpcomingItem) => targetLabel(u.target_km, u.target_date, u.vehicle.model)
+// Kullanıcı isteği: hedef km HER ZAMAN tam km olarak yazılsın (Sirio kısa
+// M/Y kodu KULLANILMASIN — ör. "1.500.000 km", asla "150M").
+const hedefDisplay = (u: UpcomingItem) => rawTargetLabel(u.target_km, u.target_date)
 
 type NavTarget = 'vehicles' | 'plans' | 'tree' | 'users' | 'history'
 
@@ -60,6 +64,8 @@ export default function DashboardPage({
   onGoToMaintenances,
   onFilterMaintenances,
   onNavigate,
+  onGoToHistoryThisMonth,
+  onGoToHistoryForPlan,
 }: {
   user: User
   // Yetki Yönetimi sayfasındaki "Dashboard Görünürlüğü" kategorisi altındaki
@@ -70,6 +76,14 @@ export default function DashboardPage({
   onGoToMaintenances: () => void
   onFilterMaintenances?: (filter: { status?: string; planName?: string }) => void
   onNavigate?: (page: NavTarget) => void
+  // "Tamamlanan (Bu Ay)" kartına tıklayınca Bakım Geçmişi'ne kartla BİREBİR
+  // aynı (bu ayın başından bugüne) tarih filtresiyle gider — verilmezse
+  // (geriye dönük uyumluluk) filtresiz onNavigate('history')'e düşer.
+  onGoToHistoryThisMonth?: () => void
+  // Periyoda göre dağılım grafiğindeki "Tamamlandı" barına tıklayınca (ör.
+  // "50.000 km") Bakım Geçmişi'ne o periyoda göre filtrelenmiş gider —
+  // verilmezse (geriye dönük uyumluluk) filtresiz onNavigate('history')'e düşer.
+  onGoToHistoryForPlan?: (planName: string) => void
 }) {
   const [data, setData] = useState<Dashboard | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
@@ -86,7 +100,7 @@ export default function DashboardPage({
 
   // Canlı Güncelleme (SSE) — bir başkası bakım tamamlayınca/km güncelleyince
   // vb. 30 saniyelik polling'i beklemeden anında yenile.
-  useLiveEvent(['maintenance', 'vehicle', 'part', 'tree_node', 'alarm'], load)
+  useLiveEvent(['maintenance', 'vehicle', 'part', 'tree_node'], load)
 
   useEffect(() => {
     load()
@@ -107,8 +121,57 @@ export default function DashboardPage({
     }
   }, [])
 
+  // Kullanıcı isteği: "usta ekranında dashboardda [filo geneli KPI/analiz]
+  // gözükmesin, onun yerine bakımlar, kendine atanan bakımlar ve vardiya
+  // bilgileri gözüksün, usta için gereksiz şeyleri kaldırmış olalım." —
+  // Usta girişinde filo geneli istatistik/analiz yerine kendisiyle ilgili
+  // veriler gösterilir. /maintenances zaten usta oturumunda sunucu
+  // tarafında "bana atanan VEYA henüz kimseye atanmamış" ile daraltılmış
+  // döner (bkz. backend _filtered_maintenance_query) — bu yüzden ek bir
+  // filtre parametresi gerekmez.
+  const isTechnician = user.role === 'technician'
+  const [myMaintenances, setMyMaintenances] = useState<Maintenance[] | null>(null)
+  const [shifts, setShifts] = useState<Shift[]>([])
+  const [shiftmates, setShiftmates] = useState<User[]>([])
+
+  const loadTechnicianExtras = () => {
+    if (user.role !== 'technician') return
+    Promise.all([
+      api<Maintenance[]>('/maintenances?status=pending'),
+      api<Maintenance[]>('/maintenances?status=in_progress'),
+    ])
+      .then(([pending, inProgress]) => setMyMaintenances([...pending, ...inProgress]))
+      .catch(() => setMyMaintenances([]))
+  }
+
+  useEffect(() => {
+    if (!isTechnician) return
+    loadTechnicianExtras()
+    api<Shift[]>('/shifts').then(setShifts).catch(() => setShifts([]))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isTechnician])
+
+  useEffect(() => {
+    if (!isTechnician || user.shift_id == null) {
+      setShiftmates([])
+      return
+    }
+    api<User[]>(`/users/assignable?shift_id=${user.shift_id}`).then(setShiftmates).catch(() => setShiftmates([]))
+  }, [isTechnician, user.shift_id])
+
+  useLiveEvent(['maintenance'], loadTechnicianExtras)
+
   const isAdmin = user.role === 'admin'
   const isStaff = isAdmin || user.role === 'engineer' || user.role === 'amir'
+  const myShift = shifts.find((s) => s.id === user.shift_id) ?? null
+  // Kullanıcı isteği: "vardiyaya atanan bakım o vardiyada olan herkeste
+  // gözükmeli" — kişiye atama (assigned_to) ile vardiyaya atama
+  // (assigned_shift) birbirinden bağımsız iki ayrı alan (bkz. Bakımlar
+  // sayfasındaki "Atanan" ve "Vardiya" satırları); "bana ait" sayılması
+  // için ya doğrudan kendisine ya da kendi vardiyasına atanmış olması yeterli.
+  const myAssigned = (myMaintenances ?? []).filter(
+    (m) => m.assigned_to?.id === user.id || (user.shift_id != null && m.assigned_shift?.id === user.shift_id),
+  )
 
   if (!data) {
     return (
@@ -141,9 +204,12 @@ export default function DashboardPage({
     const planName = barData?.payload?.fullName
     const status = STATUS_BY_BAR_KEY[barKey]
     // Tamamlanan bakımlar artık Bakımlar sekmesinde değil, yalnızca Bakım
-    // Geçmişi'nde gösteriliyor — o duruma tıklanınca doğrudan oraya gidilir.
+    // Geçmişi'nde gösteriliyor — o duruma tıklanınca doğrudan oraya gidilir,
+    // barın kendi periyoduna (plan) göre filtrelenmiş halde ki "50.000 km'de
+    // 7 tamamlanan" derken Geçmiş'te gerçekten yalnızca o 7 kayıt görünsün.
     if (status === 'completed') {
-      onNavigate?.('history')
+      if (onGoToHistoryForPlan && planName) onGoToHistoryForPlan(planName)
+      else onNavigate?.('history')
       return
     }
     onFilterMaintenances?.({ status, planName })
@@ -181,6 +247,113 @@ export default function DashboardPage({
         }
       />
 
+      {isTechnician && (
+        <>
+          <div className="grid stagger dashboard-kpis stat-grid-4" style={{ marginBottom: 16 }}>
+            <StatCard
+              label="Bana Atanan (Aktif)"
+              value={myAssigned.length}
+              icon={<ClipboardList size={18} />}
+              onClick={onGoToMaintenances}
+            />
+            <StatCard
+              label="Bekleyen"
+              value={(myMaintenances ?? []).filter((m) => m.status === 'pending').length}
+              tone="pending"
+              icon={<Clock size={18} />}
+              onClick={() => onFilterMaintenances?.({ status: 'pending' })}
+            />
+            <StatCard
+              label="Devam Eden"
+              value={(myMaintenances ?? []).filter((m) => m.status === 'in_progress').length}
+              tone="in_progress"
+              icon={<Loader2 size={18} />}
+              onClick={() => onFilterMaintenances?.({ status: 'in_progress' })}
+            />
+            <StatCard
+              label="Tamamlanan (Bu Ay)"
+              value={data.completed_this_month}
+              tone="completed"
+              icon={<CheckCircle2 size={18} />}
+              onClick={() => (onGoToHistoryThisMonth ? onGoToHistoryThisMonth() : onNavigate?.('history'))}
+            />
+          </div>
+
+          <div className="grid grid-2" style={{ alignItems: 'start', marginBottom: 16 }}>
+            <div className="table-card slide-up">
+              <div className="table-toolbar">
+                <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <ClipboardList size={14} /> Bana Atanan Bakımlar
+                </div>
+              </div>
+              {myMaintenances === null ? (
+                <div style={{ padding: 16 }}><Skeleton height={120} /></div>
+              ) : myAssigned.length === 0 ? (
+                <EmptyState
+                  title="Şu anda size atanmış bir bakım yok"
+                  description="Bekleyen bakımlardan birini üstlenerek başlayabilirsiniz."
+                />
+              ) : (
+                <div className="table-scroll">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Araç</th>
+                        <th>Bakım</th>
+                        <th>Hedef</th>
+                        <th>Durum</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {myAssigned.map((m) => (
+                        <tr key={m.id} className="clickable-row" onClick={() => onOpenMaintenance(m.id)}>
+                          <td className="vehicle-code">{m.vehicle.code}</td>
+                          <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
+                          <td>{rawTargetLabel(m.target_km, m.target_date)}</td>
+                          <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            <div className="card slide-up">
+              <div className="card-head">
+                <div className="card-title" style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                  <Users size={14} /> Vardiyam
+                </div>
+              </div>
+              {myShift ? (
+                <>
+                  <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>{myShift.name}</div>
+                  <div className="muted" style={{ fontSize: 12.5, marginBottom: 12 }}>
+                    {shiftmates.length > 0
+                      ? `Bu vardiyada sizinle birlikte ${shiftmates.length} kişi var`
+                      : 'Bu vardiyada başka kimse yok'}
+                  </div>
+                  {shiftmates.length > 0 && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                      {shiftmates.map((u) => (
+                        <Badge key={u.id} tone="neutral">{u.full_name}</Badge>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <EmptyState
+                  title="Bir vardiyaya atanmamışsınız"
+                  description="Vardiya ataması amiriniz/yöneticiniz tarafından yapılır."
+                />
+              )}
+            </div>
+          </div>
+        </>
+      )}
+
+      {!isTechnician && (
+        <>
       <div className={`grid stagger dashboard-kpis ${isAdmin ? 'stat-grid-5' : 'stat-grid-4'}`} style={{ marginBottom: 16 }}>
         <StatCard
           label="Toplam Araç"
@@ -207,7 +380,7 @@ export default function DashboardPage({
           value={data.completed_this_month}
           tone="completed"
           icon={<CheckCircle2 size={18} />}
-          onClick={() => onNavigate?.('history')}
+          onClick={() => (onGoToHistoryThisMonth ? onGoToHistoryThisMonth() : onNavigate?.('history'))}
         />
         {criticalCount > 0 && (
           <StatCard
@@ -281,6 +454,8 @@ export default function DashboardPage({
             </div>
           </div>
         </div>
+      )}
+        </>
       )}
 
       <div className="grid grid-2 dashboard-activity" style={{ alignItems: 'start' }}>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api, apiUploadWithFields } from '../api'
 import { PageHeader, EmptyState } from '../components/ui'
+import { pushDetail, useDetailPopState } from '../useDetailHistory'
 import type { PartCatalogAttachment, PartCatalogItem, PartRepairMaterial, PartRepairResult } from '../types'
 import {
   ArrowLeft,
@@ -1032,6 +1033,14 @@ export default function PartsCatalogPage({
   const [parts, setParts] = useState<PartCatalogItem[] | null>(null)
   const [error, setError] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(initialSelectedId ?? null)
+  // Bir parça (ya da alt parça) açıldığında tarayıcı geçmişine bir adım
+  // eklenir ki geri tuşuna basınca (ya da "Geri" düğmesine basınca — o da
+  // history.back() çağırır) ağaçta bir üst seviyeye/listeye düzgünce dönülsün.
+  useDetailPopState<number>('parts', setSelectedId)
+  function openPart(id: number) {
+    pushDetail('parts', id)
+    setSelectedId(id)
+  }
   const [showNew, setShowNew] = useState(false)
   const [search, setSearch] = useState('')
 
@@ -1064,11 +1073,11 @@ export default function PartsCatalogPage({
           part={selected}
           canEdit={canEdit}
           parentName={parent?.name ?? null}
-          onBack={() => setSelectedId(selected.parent_id)}
-          onOpenPart={(id) => setSelectedId(id)}
+          onBack={() => window.history.back()}
+          onOpenPart={(id) => openPart(id)}
           onChanged={load}
           onDeleted={() => {
-            setSelectedId(selected.parent_id)
+            window.history.back()
             load()
           }}
           onAddSubPart={() => setShowNew(true)}
@@ -1124,7 +1133,7 @@ export default function PartsCatalogPage({
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 14 }}>
           {filtered.map((p) => (
-            <PartCard key={p.id} part={p} onOpen={() => setSelectedId(p.id)} />
+            <PartCard key={p.id} part={p} onOpen={() => openPart(p.id)} />
           ))}
         </div>
       )}

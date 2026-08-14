@@ -21,6 +21,7 @@ import {
   Radio,
   UserCircle2,
   HelpCircle,
+  BookOpen,
 } from 'lucide-react'
 
 type Role = 'all' | 'staff' | 'admin'
@@ -77,7 +78,26 @@ const SECTIONS: HelpSection[] = [
           açabilir — madde ve altındaki her şey sıfırlanır.
         </p>
         <p>
-          <strong>Başlatılmayı Bekleyenler</strong> (yetkili roller): otomatik tespit edilen aday
+          <strong>Bakım Takvimi</strong> (usta ekranı): listenin üstünde aylık bir takvim
+          bulunur ve iki sekmesi vardır — <strong>Bana Atanan Bakımlar</strong> (yalnızca size
+          atanmış işler ve tarihleri) ve <strong>Genel Bakımlar</strong> (görebildiğiniz tüm
+          işler). Her bakımın altında atanan kişi ve varsa vardiyası yazar. Yalnızca gerçekten
+          başlatılmış iş emirleri görünür, üç renkte:
+          <strong> mavi</strong> size atananlar, <strong>turuncu</strong> diğer açık iş emirleri,
+          <strong> yeşil</strong> tamamlananlar. Tamamlanan bir bakım, gerçekte tamamlandığı
+          güne oturur — yönetici "Tamamlandı" dediği anda takvimde o günde yeşil görünür,
+          geçmiş aylara gidildiğinde de orada kalır (son 12 ay yüklenir; daha eskisi için
+          Bakım Geçmişi sayfasını kullanın). Bir güne tıklayınca o günün bakımları altta
+          listelenir, satıra tıklayınca iş emri açılır.
+        </p>
+        <p>
+          <strong>Bilgi düğmesi</strong>: bir maddeyi tiklerken yanındaki "Bilgi" düğmesi o
+          maddeyi <strong>Bakım Bilgi Bankası</strong>'nda açar — eğitim videosu, talimat PDF'i
+          ve açıklama orada durur. Tikleme akışı aynen eskisi gibi çalışmaya devam eder.
+        </p>
+        <p>
+          <strong>Başlatılmayı Bekleyenler</strong> (yalnızca yetkili roller — usta ekranında
+          hiç görünmez): otomatik tespit edilen aday
           iş emirleri burada listelenir; yetkili biri "Başlat" demeden usta ekranında görünmez.
           Liste en kritik adayları (1M periyodu, toleransı aşmak üzere olanlar) en üstte gösterecek
           şekilde otomatik sıralanır. "Başlat" derken bugün yerine ileri bir tarih de seçilebilir —
@@ -172,6 +192,33 @@ const SECTIONS: HelpSection[] = [
     ),
   },
   {
+    id: 'knowledge',
+    title: 'Bakım Bilgi Bankası',
+    icon: <BookOpen size={16} />,
+    role: 'all',
+    body: (
+      <>
+        <p>
+          Bakım ağacının "bunu nasıl yaparım" odaklı, salt-okunur görünümüdür — usta dahil
+          herkese açıktır. Soldaki ağaçtan bir maddeye tıklayınca sağda o maddenin
+          <strong> açıklaması</strong>, <strong>eğitim videoları</strong> ve
+          <strong> talimat/görsel</strong> materyalleri açılır. Videolar sayfadan çıkmadan
+          doğrudan izlenir (YouTube bağlantıları gömülü oynatıcıda açılır).
+        </p>
+        <p>
+          Üstteki arama kutusu madde adı, kart kodu ve açıklama metni içinde arar; sonuçta
+          maddenin ağaçtaki yolu ("Fren Grubu › Fren Balatası Değişimi") ve videosu olup
+          olmadığı gösterilir.
+        </p>
+        <p>
+          <strong>İçerik ekleme</strong> (admin / mühendis / amir): seçili maddede "Düzenle" ile
+          açıklama yazılır, "Dosya Ekle" ile video/PDF/görsel yüklenir, "Video Bağlantısı Ekle"
+          ile YouTube bağlantısı eklenir. Usta bu içerikleri yalnızca görüntüler.
+        </p>
+      </>
+    ),
+  },
+  {
     id: 'parts',
     title: 'Parça Bilgi Bankası',
     icon: <PackageSearch size={16} />,
@@ -201,21 +248,26 @@ const SECTIONS: HelpSection[] = [
   },
   {
     id: 'suggestions',
-    title: 'Öneriler',
+    title: 'İyileştirme Talepleri',
     icon: <Lightbulb size={16} />,
     role: 'all',
     body: (
       <>
         <p>
           Herhangi bir rol, bir araç modeli (ör. Bozankaya/Sirio) + isteğe bağlı periyot/plan
-          seçerek bakım ağacına eklenmesini önerdiği bir maddeyi metin olarak girer. Öneriler
+          seçerek bakım ağacına eklenmesini istediği bir maddeyi metin olarak girer. Talepler
           yalnızca kendini oluşturana değil, <strong>herkese</strong> görünür.
         </p>
         <p>
-          Onay <strong>iki aşamalıdır</strong>: önce <strong>amir</strong> değerlendirir. Amir
-          onaylarsa öneri <strong>mühendis</strong>e düşer ve mühendisin kararı (onay/red/"Ağaca
-          Eklendi") nihaidir. Amir reddederse öneri mühendise hiç düşmez, orada sonuçlanmış
-          sayılır. Her aşamanın kararı, kim verdiği ve notu ekranda ayrı ayrı görünür.
+          Onay <strong>tek aşamalıdır</strong>: <strong>mühendis, amir veya admin</strong>
+          {' '}talebi doğrudan <strong>onaylar</strong> ya da <strong>reddeder</strong>; verilen
+          ilk karar nihaidir, talep ikinci bir aşamaya düşmez. Kararı kimin, ne zaman ve hangi
+          notla verdiği "Değerlendirme" sütununda görünür.
+        </p>
+        <p>
+          Bir talebi onaylamak bakım ağacını <strong>kendiliğinden değiştirmez</strong> — ağaç
+          düzenlemesi ayrı ve bilinçli bir işlemdir (Bakım Ağacı sayfası). Bu yüzden eski "Ağaca
+          Eklendi olarak işaretle" düğmesi kaldırılmıştır.
         </p>
       </>
     ),
@@ -264,7 +316,7 @@ const SECTIONS: HelpSection[] = [
     role: 'all',
     body: (
       <p>
-        Yeni iş emri, tamamlanan bakım, kilit açma, yeni kullanıcı, yeni öneri, geciken bakım ve
+        Yeni iş emri, tamamlanan bakım, kilit açma, yeni kullanıcı, yeni iyileştirme talebi, geciken bakım ve
         düşük stok gibi olayları akış halinde gösterir. Bir olay olunca (bkz. Canlı Güncelleme)
         zil anında güncellenir, 60 saniyede bir de kendiliğinden tazelenir.
       </p>

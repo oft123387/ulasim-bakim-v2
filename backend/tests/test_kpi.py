@@ -214,12 +214,16 @@ def test_kpi_export_requires_export_excel_permission_for_non_technician(client, 
 
 
 def test_kpi_on_time_rate_km_based(client, admin_token, usta_token):
-    """Zamanında bakım yapılan araç oranı KPI'si: km bazlı bir bakım,
-    km_at_open planın KENDİ tolerans penceresi (varsayılan -%5/+%10,
+    """Zamanında bakım oranı KPI'si: km bazlı bir bakım, GERÇEKTEN YAPILDIĞI
+    km (completed_km) planın KENDİ tolerans penceresi (varsayılan -%5/+%10,
     interval_km=10.000 için hedef ± [500, 1000]) İÇİNDEYSE "zamanında"
-    sayılır; pencerenin DIŞINDA (ör. çok geç, hedef+1000'i aşmış) açılmışsa
-    sayılmaz — ama her iki durumda da "değerlendirilen" (payda) sayısına
-    dahildir."""
+    sayılır; pencerenin DIŞINDAysa sayılmaz — ama her iki durumda da
+    "değerlendirilen" (payda) sayısına dahildir.
+
+    Burada araç km'si iş emri açıldıktan sonra değişmediği için completed_km
+    otomatik olarak km_at_open'a eşit yazılır; ikisinin AYRIŞTIĞI durum
+    aşağıdaki test_kpi_on_time_uses_completion_km_not_open_km ile ayrıca
+    doğrulanır."""
     admin = admin_token
     usta_id = _get_usta_id(client, admin)
     today = date.today()
@@ -269,6 +273,49 @@ def test_kpi_on_time_rate_km_based(client, admin_token, usta_token):
             _cleanup(client, admin, v2, plan2)
     finally:
         _cleanup(client, admin, v1, plan1)
+
+
+def test_kpi_on_time_uses_completion_km_not_open_km(client, admin_token, usta_token):
+    """Ölçüt, iş emrinin AÇILDIĞI km değil bakımın YAPILDIĞI km'dir.
+
+    Senaryo: iş emri tam zamanında (pencere içinde) açılıyor, ama araç
+    bakım yapılmadan çok yol alıyor ve bakım tolerans penceresinin epey
+    dışında tamamlanıyor. Eski kural (km_at_open) bunu "zamanında" sayardı;
+    yeni kural (completed_km sapması) saymamalı."""
+    admin = admin_token
+    usta_id = _get_usta_id(client, admin)
+    today = date.today()
+    wide_from = (today - timedelta(days=1)).isoformat()
+    wide_to = (today + timedelta(days=1)).isoformat()
+
+    before = client.get(
+        "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+    ).json()["completion"]
+
+    # Açılış km'si 9.800 -> pencere [9.500, 11.000] İÇİNDE (zamanında açıldı).
+    v, plan, m, item = _make_maintenance_with_item(
+        client, admin, "KPIDoneKm", current_km=9_800, target_km=10_000,
+    )
+    try:
+        client.patch(f"/api/maintenances/{m['id']}/assign", headers=auth(admin), json={"assigned_to_id": usta_id})
+        # Bakım gerçekte 25.000 km'de yapılmış — pencerenin çok dışında.
+        r = client.patch(
+            f"/api/maintenances/{m['id']}/completed-km",
+            headers=auth(admin), json={"completed_km": 25_000},
+        )
+        assert r.status_code == 200, r.text
+
+        rc = client.post(f"/api/items/{item['id']}/complete", headers=auth(usta_token))
+        assert rc.status_code == 200, rc.text
+
+        after = client.get(
+            "/api/kpi", headers=auth(admin), params={"date_from": wide_from, "date_to": wide_to},
+        ).json()["completion"]
+        # Paydaya girer ama "zamanında" sayılmaz.
+        assert after["on_time_evaluated"] == before["on_time_evaluated"] + 1
+        assert after["on_time_count"] == before["on_time_count"]
+    finally:
+        _cleanup(client, admin, v, plan)
 
 
 def test_kpi_on_time_rate_time_based(client, admin_token, usta_token):

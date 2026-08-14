@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, apiUploadWithFields } from '../api'
+import { api, apiUploadWithFields, apiDownload } from '../api'
 import { PageHeader } from '../components/ui'
 import { ChevronRight, Paperclip, FileText, ImageIcon, LinkIcon, Download, Trash2, UploadCloud, ShieldAlert } from 'lucide-react'
 import Tram3D from '../components/Tram3D'
@@ -906,9 +906,20 @@ function BulkCatalogImportSection({
           <UploadCloud size={15} style={{ marginRight: 6, verticalAlign: -3 }} />
           Toplu Bakım Kataloğu İçe Aktar (KB Toplu Liste)
         </strong>
-        <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
-          {open ? 'Gizle' : 'Göster'}
-        </button>
+        <div className="row" style={{ gap: 8 }}>
+          <button
+            className="small"
+            type="button"
+            title="Mevcut bakım ağacını, yüklendiği KB Toplu Liste formatında (açıklamalar dahil) Excel olarak indirir — yedek olarak saklanabilir, tekrar yüklenebilir."
+            onClick={(e) => { e.stopPropagation(); apiDownload('/tree/export-bulk-catalog', 'bakim_agaci_kb_toplu_liste.xlsx') }}
+          >
+            <Download size={13} style={{ marginRight: 5, verticalAlign: -2 }} />
+            Excel'e Aktar (Yedek)
+          </button>
+          <button className="small" type="button" onClick={(e) => { e.stopPropagation(); setOpen(!open) }}>
+            {open ? 'Gizle' : 'Göster'}
+          </button>
+        </div>
       </div>
       {open && (
         <>

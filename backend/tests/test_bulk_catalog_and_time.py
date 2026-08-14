@@ -35,17 +35,24 @@ def test_bulk_catalog_import_km_codes_and_model_matching(client, admin_token):
     # küçük harf farkıyla) BİREBİR aynı değil — "SİRİO" (Excel) vs "Sirio"
     # (gerçek araç modeli). Eşleştirmenin normalize edilerek (case/Türkçe
     # karakter duyarsız, alt dize) çalıştığı doğrulanır.
-    # Not: km TAM olarak 200.000 seçildi (bir tolerans aralığının ortası
-    # yerine) — gerçek/seed veritabanındaki "Genel" (vehicle_model="") km
-    # planları da bu araca uygulandığından (25.000/50.000/... gibi daha ince
-    # taneli periyotlar), aday hedef hesaplaması TÜM uygulanabilir planların
-    # ortak bölenini kullanır; hedefin TAM 200.000 olması, hangi plan
-    # penceresi kullanılırsa kullanılsın güvenle içine düşer.
+    # Not: km 200.000'e ÇOK YAKIN (199.500) ama BİREBİR AYNI değil seçildi.
+    # Gerçek/seed veritabanındaki "Genel" (vehicle_model="") km planları da
+    # bu araca uygulandığından (25.000/50.000/... gibi daha ince taneli
+    # periyotlar), aday hedef hesaplaması TÜM uygulanabilir planların ortak
+    # bölenini kullanır; 200.000'e bu kadar yakın olması, hangi plan
+    # penceresi kullanılırsa kullanılsın güvenle içine düşmesini sağlar.
+    # BİREBİR 200.000 KULLANILMAZ: araç oluşturulunca current_km, o aracın
+    # "baseline_km"sine (sisteme giriş kilometresi) eşitlenir ve
+    # check_and_open_maintenances/check_and_open_time_maintenances,
+    # target <= baseline_km olan hedefleri kasıtlı olarak ASLA açmaz (bkz.
+    # services.py — "aracın sisteme girmeden önce zaten yapılmış sayılan
+    # bakımlar" kuralı). km TAM 200.000 olsaydı, target_km=200.000 ==
+    # baseline_km=200.000 olur ve bu test hiçbir zaman bir aday görmezdi.
     model_real = "Sirio Test"
     r = client.post(
         "/api/vehicles",
         headers=auth(admin),
-        json={"code": "9003", "name": "Test Tramvay 3", "current_km": 200_000, "model": model_real},
+        json={"code": "9003", "name": "Test Tramvay 3", "current_km": 199_500, "model": model_real},
     )
     assert r.status_code == 200, r.text
     vehicle = r.json()
@@ -143,9 +150,10 @@ def test_bulk_catalog_import_km_codes_and_model_matching(client, admin_token):
     assert "SKA-TST-05" not in merged_leaves
 
     # ================================================================ Anında yeniden değerlendirme
-    # Araç zaten tam 200.000 km'de duruyordu — ne km güncellemesi ne başka
-    # bir tetikleyici çağrıldı, sadece ağaç içe aktarıldı. Bakım HEMEN aday
-    # olarak açılmış olmalı.
+    # Araç zaten 200.000 km'nin hemen altında (199.500) duruyordu — ne km
+    # güncellemesi ne başka bir tetikleyici çağrıldı, sadece ağaç içe
+    # aktarıldı. Bakım HEMEN aday (is_activated=False, "Başlatılmayı
+    # Bekleyenler"de) olarak açılmış olmalı.
     # Not: seed veritabanındaki gerçek "Genel" (vehicle_model="") bakım
     # ağacında da tesadüfen 200.000 km'lik bir plan var; hedef km'de birden
     # fazla plan (Genel + bu modele özel) çakışınca kademeli birleştirme

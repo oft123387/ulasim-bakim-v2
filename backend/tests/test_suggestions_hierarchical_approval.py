@@ -1,11 +1,13 @@
-"""Faz 30 — Öneriler sayfası: araç modeli (Bozankaya/Sirio) seçimi ve İKİ
-AŞAMALI hiyerarşik onay testleri.
+"""Öneriler sayfası: araç modeli (Bozankaya/Sirio) seçimi ve TEK AŞAMALI onay.
 
-Akış: usta (veya herhangi bir rol) bir öneri oluşturur -> önce AMİR karar
-verir -> amir onaylarsa MÜHENDİS'e düşer ve mühendisin kararı nihaidir ->
-amir reddederse öneri mühendise HİÇ DÜŞMEZ (o an itibarıyla sonuçlanmış
-sayılır). Ayrıca herkesin TÜM önerileri görebildiği (yalnızca kendi
-önerileriyle sınırlı olmadığı) doğrulanır."""
+Faz 31'de Faz 30'un iki aşamalı (amir -> mühendis) hiyerarşik zinciri
+kaldırıldı. Akış artık düz: herhangi bir rol öneri oluşturur; mühendis,
+amir ya da admin öneriyi doğrudan onaylar veya reddeder ve bu karar
+NİHAİDİR — ikinci bir aşama, "Ağaca Eklendi" kararı ve rol sırası yoktur.
+Herkesin TÜM önerileri görebildiği de burada doğrulanır.
+
+Dosya adı, geçmiş kayıtların (ve migration testinin) izlenebilirliği için
+korunmuştur."""
 
 import pytest
 
@@ -76,16 +78,21 @@ def test_everyone_sees_all_suggestions(client, usta_token, amir_token, engineer_
         assert any(s["id"] == sug["id"] for s in r.json())
 
 
-def test_engineer_cannot_act_before_amir(client, usta_token, engineer_token):
+def test_engineer_can_decide_directly_without_amir(client, usta_token, engineer_token):
+    """Zincir kalktı: mühendis, amir kararını beklemeden doğrudan karar verir."""
     sug = _create(client, usta_token)
     r = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(engineer_token),
-        json={"status": "approved"},
+        json={"status": "approved", "admin_note": "uygun"},
     )
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "approved"
+    assert body["reviewed_by"]["full_name"] == "Test Mühendis"
+    assert body["admin_note"] == "uygun"
 
 
-def test_technician_cannot_act_as_amir(client, usta_token):
+def test_technician_cannot_review(client, usta_token):
     sug = _create(client, usta_token)
     r = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(usta_token),
@@ -94,7 +101,8 @@ def test_technician_cannot_act_as_amir(client, usta_token):
     assert r.status_code == 403
 
 
-def test_amir_reject_stops_chain_before_engineer(client, usta_token, amir_token, engineer_token):
+def test_amir_decision_is_final_no_second_stage(client, usta_token, amir_token, engineer_token):
+    """Amirin kararı da nihaidir — öneri artık mühendise DÜŞMEZ."""
     sug = _create(client, usta_token)
     r = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(amir_token),
@@ -103,11 +111,9 @@ def test_amir_reject_stops_chain_before_engineer(client, usta_token, amir_token,
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "rejected"
-    assert body["amir_status"] == "rejected"
-    assert body["engineer_status"] == "pending"
-    assert body["amir_note"] == "gerekli değil"
+    assert body["admin_note"] == "gerekli değil"
 
-    # Mühendis artık hiç karar veremez — zincir amir'de bitti.
+    # Sonuçlanmış öneri yeniden değerlendirilemez (kim olursa olsun).
     r2 = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(engineer_token),
         json={"status": "approved"},
@@ -115,60 +121,73 @@ def test_amir_reject_stops_chain_before_engineer(client, usta_token, amir_token,
     assert r2.status_code == 400
 
 
-def test_amir_approve_forwards_to_engineer_whose_decision_is_final(client, usta_token, amir_token, engineer_token):
+def test_amir_approval_does_not_create_pending_engineer(client, usta_token, amir_token):
+    """Amir onayı doğrudan 'approved' olur — eski 'pending_engineer' ara
+    durumu artık hiç üretilmez."""
     sug = _create(client, usta_token)
     r = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(amir_token),
-        json={"status": "approved", "admin_note": "uygun"},
+        json={"status": "approved"},
     )
     assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["status"] == "pending_engineer"
-    assert body["amir_status"] == "approved"
-    assert body["engineer_status"] == "pending"
-
-    # Amir aynı öneriyi ikinci kez değerlendiremez (sıra artık mühendiste).
-    r_again = client.patch(
-        f"/api/suggestions/{sug['id']}", headers=auth(amir_token),
-        json={"status": "rejected"},
-    )
-    assert r_again.status_code == 403
-
-    r2 = client.patch(
-        f"/api/suggestions/{sug['id']}", headers=auth(engineer_token),
-        json={"status": "added", "admin_note": "ağaca eklendi"},
-    )
-    assert r2.status_code == 200, r2.text
-    body2 = r2.json()
-    assert body2["status"] == "added"
-    assert body2["engineer_status"] == "added"
-    assert body2["engineer_note"] == "ağaca eklendi"
+    assert r.json()["status"] == "approved"
 
 
-def test_added_status_rejected_at_amir_stage(client, usta_token, amir_token):
+def test_added_status_is_no_longer_accepted(client, usta_token, engineer_token):
+    """'Bakım ağacına ekle' kaldırıldı: 'added' kararı artık şemadan geçmez.
+    Bir öneriyi onaylamak, ağacın kendiliğinden değişmesi anlamına gelmez."""
     sug = _create(client, usta_token)
     r = client.patch(
-        f"/api/suggestions/{sug['id']}", headers=auth(amir_token),
+        f"/api/suggestions/{sug['id']}", headers=auth(engineer_token),
         json={"status": "added"},
     )
-    assert r.status_code == 400
+    assert r.status_code == 422
 
 
-def test_admin_can_substitute_at_either_stage(client, usta_token, admin_token):
+def test_admin_can_review_too(client, usta_token, admin_token):
     sug = _create(client, usta_token)
     r = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(admin_token),
         json={"status": "approved"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["status"] == "pending_engineer"
+    assert r.json()["status"] == "approved"
 
+    # Tek karar nihai — admin bile ikinci kez değerlendiremez.
     r2 = client.patch(
         f"/api/suggestions/{sug['id']}", headers=auth(admin_token),
-        json={"status": "approved"},
+        json={"status": "rejected"},
     )
-    assert r2.status_code == 200, r2.text
-    assert r2.json()["status"] == "approved"
+    assert r2.status_code == 400
+
+
+def test_legacy_pending_engineer_row_is_flattened_to_pending(tmp_path):
+    """Zincirin ORTASINDA kalmış eski kayıtlar ('pending_engineer' — amir
+    onaylamış, mühendis bekleniyor) migration ile normal 'pending'e döner ki
+    yetkili biri tek kararla sonuçlandırabilsin. Sonuçlanmış kayıtlara
+    dokunulmaz."""
+    import sqlalchemy as sa
+
+    from app import migrate
+    from app.database import Base
+
+    db_path = tmp_path / "midchain.db"
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        for sid, status in ((1, "pending_engineer"), (2, "pending"), (3, "approved"), (4, "rejected")):
+            conn.execute(sa.text(
+                "INSERT INTO suggestions (id, text, status, vehicle_model, admin_note, "
+                "amir_status, amir_note, engineer_status, engineer_note, created_at) "
+                "VALUES (:i, 'x', :s, 'Sirio', '', 'pending', '', 'pending', '', '2026-01-01 09:00:00')"
+            ), {"i": sid, "s": status})
+
+    migrate.run_light_migrations(engine)
+
+    with engine.begin() as conn:
+        rows = dict(conn.execute(sa.text("SELECT id, status FROM suggestions")).all())
+    assert rows == {1: "pending", 2: "pending", 3: "approved", 4: "rejected"}
+    engine.dispose()
 
 
 def test_finalized_suggestion_cannot_be_reviewed_again(client, usta_token, amir_token):

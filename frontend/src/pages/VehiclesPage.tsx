@@ -5,7 +5,8 @@ import { STATUS_TR } from '../types'
 import { PageHeader, Badge, SearchInput, EmptyState, SkeletonTableRows, StatCard } from '../components/ui'
 import { showToast } from '../components/toast'
 import { useLiveEvent } from '../liveEvents'
-import { targetLabel } from '../format'
+import { targetLabel, mergedPeriodLabel } from '../format'
+import { pushDetail, useDetailPopState } from '../useDetailHistory'
 import {
   ArrowLeft,
   Truck,
@@ -447,6 +448,41 @@ function VehicleDetail({
         />
       </div>
 
+      {/* Sıradaki (yaklaşan) bakım — hangi bakım + ne kadar kaldı */}
+      {profile?.next_upcoming && (() => {
+        const nu = profile.next_upcoming
+        const toneMap: Record<string, 'danger' | 'pending' | 'in_progress' | 'neutral'> = { gecikti: 'danger', planlanacak: 'pending', planlandi: 'in_progress', yaklasiyor: 'neutral' }
+        const labelMap: Record<string, string> = { gecikti: 'Bakım Gecikti', planlanacak: 'Planlanmayı Bekleyen', planlandi: 'Planlandı', yaklasiyor: 'Yaklaşıyor' }
+        const st = nu.status ?? undefined
+        return (
+          <div className="card fade-in" style={{ marginBottom: 12 }}>
+            <div className="card-title" style={{ marginBottom: 8 }}>
+              <AlertTriangle size={15} style={{ verticalAlign: -2, marginRight: 6 }} /> Sıradaki Bakım
+            </div>
+            <div
+              className={nu.maintenance_id ? 'clickable-row' : ''}
+              style={{ padding: 8, borderRadius: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}
+              onClick={() => nu.maintenance_id && onOpenMaintenance(nu.maintenance_id)}
+              title={nu.maintenance_id ? `İş emri #${nu.maintenance_id} detayını aç` : undefined}
+            >
+              <div>
+                <div style={{ fontWeight: 600 }}>
+                  {mergedPeriodLabel(nu.covered_tiers ?? [], nu.target_date ? 'time' : 'km', nu.vehicle.model, nu.plan_name)}
+                </div>
+                <div className="muted" style={{ fontSize: 12.5 }}>
+                  Hedef: {targetLabel(nu.target_km, nu.target_date, nu.vehicle.model)}
+                  {nu.maintenance_id ? ` · İş Emri #${nu.maintenance_id}` : ' · Henüz iş emri açılmadı'}
+                </div>
+              </div>
+              <div className="row" style={{ gap: 10, alignItems: 'center' }}>
+                {st && <Badge tone={toneMap[st]}>{labelMap[st]}</Badge>}
+                <strong style={{ fontSize: 16 }}>{remainingDisplayV(nu)}</strong>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
       {/* Son bakım / son not (arıza) özet kartları */}
       <div className="grid grid-2">
         <div className="card">
@@ -598,7 +634,7 @@ function VehicleDetail({
   )
 }
 
-// ---------------------------------------------------------- Araç listesi
+//  Araç listesi
 export default function VehiclesPage({
   user,
   perms,
@@ -629,6 +665,14 @@ export default function VehiclesPage({
   const [search, setSearch] = useState('')
   const [modelFilter, setModelFilter] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
+  // Bir araç profiline girildiğinde tarayıcı geçmişine bir adım eklenir ki
+  // geri tuşuna basınca (ya da profildeki "Araç Listesi" düğmesine basınca
+  // — o da history.back() çağırır) düzgünce listeye dönülsün.
+  useDetailPopState<number>('vehicles', setSelectedId)
+  function openVehicle(id: number) {
+    pushDetail('vehicles', id)
+    setSelectedId(id)
+  }
   const [knownModels, setKnownModels] = useState<string[]>([])
   const [favIds, setFavIds] = useState<number[]>(() => readIdList(FAV_VEHICLES_KEY))
   const [recentIds, setRecentIds] = useState<number[]>(() => readIdList(RECENT_VEHICLES_KEY))
@@ -837,7 +881,7 @@ export default function VehiclesPage({
     return (
       <VehicleDetail
         vehicle={selected}
-        onBack={() => setSelectedId(null)}
+        onBack={() => window.history.back()}
         onOpenMaintenance={onOpenMaintenance}
         onChanged={load}
       />
@@ -937,7 +981,7 @@ export default function VehiclesPage({
         <div className="recent-vehicles-row fade-in">
           <span className="label">Son Açılanlar:</span>
           {recentVehicles.map((v) => (
-            <button key={v.id} className="recent-vehicle-chip" onClick={() => setSelectedId(v.id)}>
+            <button key={v.id} className="recent-vehicle-chip" onClick={() => openVehicle(v.id)}>
               {v.code}
             </button>
           ))}
@@ -1028,7 +1072,7 @@ export default function VehiclesPage({
                         <Star size={16} />
                       </button>
                     </td>
-                    <td className="clickable-row" onClick={() => setSelectedId(v.id)}>
+                    <td className="clickable-row" onClick={() => openVehicle(v.id)}>
                       <span className="vehicle-code">{v.code}</span>
                     </td>
                     <td>{fmtKm(v.current_km)}</td>
@@ -1083,7 +1127,7 @@ export default function VehiclesPage({
                     </td>
                     <td>
                       <div className="row">
-                        <button className="small" onClick={() => setSelectedId(v.id)}>Detaylar</button>
+                        <button className="small" onClick={() => openVehicle(v.id)}>Detaylar</button>
                         <button className="small danger" onClick={() => removeVehicle(v)}>Sil</button>
                       </div>
                     </td>

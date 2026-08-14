@@ -86,8 +86,8 @@ export const ONBOARDING_STEPS: TourStep[] = [
   {
     page: 'suggestions',
     selector: '.page-header',
-    title: 'Öneriler',
-    text: 'Bakım ağacına eklenmesini istediğiniz bir maddeyi buradan önerebilirsiniz — önce amir, sonra (onaylarsa) mühendis değerlendirir. Öneriler herkese açık şekilde görünür.',
+    title: 'İyileştirme Talepleri',
+    text: 'Bakım ağacına eklenmesini istediğiniz bir maddeyi buradan talep edebilirsiniz — mühendis, amir veya admin doğrudan onaylar ya da reddeder. Talepler herkese açık şekilde görünür.',
   },
   {
     page: 'kpi',
@@ -104,11 +104,29 @@ interface Rect {
   height: number
 }
 
+// Uygulama genelinde <html> öğesine "zoom: 0.85" uygulanıyor (bkz.
+// index.css) — daha fazla içeriği ekrana sığdırmak için. Sorun şu: bu
+// zoom, getBoundingClientRect()'in döndürdüğü değerlere ZATEN uygulanmış
+// durumda (tarayıcı ölçümü küçültülmüş/zoom'lu koordinatlarda verir), ama
+// bu turun position:fixed öğeleri de AYNI zoom'lu <html> içinde
+// render edildiği için, bu (zaten küçültülmüş) sayıları doğrudan
+// top/left/width/height olarak kullanınca tarayıcı bunları BİR KEZ DAHA
+// küçültüyor — vurgu kutusu hedeften daha küçük/kaymış görünmesinin asıl
+// sebebi bu (tek seferlik yeniden ölçüm ya da her karede ölçüm bunu
+// düzeltmiyordu, çünkü hata zamanla değil matematikle ilgiliydi). Çözüm:
+// ölçülen değerleri zoom'a bölerek bu "iki kez küçültme"yi baştan iptal
+// etmek — tarayıcı tekrar zoom uygulayınca sonuç gerçek/doğru boyuta döner.
+function currentZoom(): number {
+  const z = parseFloat(getComputedStyle(document.documentElement).zoom || '1')
+  return Number.isFinite(z) && z > 0 ? z : 1
+}
+
 function measure(selector: string): Rect | null {
   const el = document.querySelector(selector) as HTMLElement | null
   if (!el) return null
   const r = el.getBoundingClientRect()
-  return { top: r.top, left: r.left, width: r.width, height: r.height }
+  const z = currentZoom()
+  return { top: r.top / z, left: r.left / z, width: r.width / z, height: r.height / z }
 }
 
 export function OnboardingTour({
@@ -177,26 +195,45 @@ export function OnboardingTour({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [idx, currentPage])
 
-  // Pencere yeniden boyutlanınca / sayfa kaydırılınca vurgu kutusunu güncel tutar.
+  // Vurgu kutusunun hedeften "kayması" (yanlış konumda görünmesi) daha
+  // önce yalnızca resize/scroll olaylarında yeniden ölçülmesinden
+  // kaynaklanıyordu — ama gerçek düzen kayması genelde BAŞKA sebeplerden
+  // olur: Inter yazı tipi geç yüklenip metin genişliği değişir, dashboard
+  // kartları veri gelince boy değiştirir, kenar çubuğu daralma/genişleme
+  // animasyonu sürerken ölçüm alınır vb. — bunların hiçbiri resize/scroll
+  // tetiklemez. Bunun yerine adım aktif olduğu sürece her animasyon
+  // karesinde yeniden ölçülüp yalnızca değer gerçekten değiştiyse state
+  // güncellenir; böylece kutu her zaman hedefin GERÇEK/güncel konumunu
+  // takip eder, sebebi ne olursa olsun.
   useEffect(() => {
     if (!step) return
-    function reposition() {
-      setRect(measure(step.selector))
+    let raf: number
+    let lastKey = ''
+    function loop() {
+      const r = measure(step.selector)
+      const key = r ? `${r.top}|${r.left}|${r.width}|${r.height}` : ''
+      if (key !== lastKey) {
+        lastKey = key
+        setRect(r)
+      }
+      raf = requestAnimationFrame(loop)
     }
-    window.addEventListener('resize', reposition)
-    window.addEventListener('scroll', reposition, true)
-    return () => {
-      window.removeEventListener('resize', reposition)
-      window.removeEventListener('scroll', reposition, true)
-    }
+    raf = requestAnimationFrame(loop)
+    return () => cancelAnimationFrame(raf)
   }, [step])
 
   if (!step) return null
 
   const PAD = 6
   const hasRect = !!rect
-  const viewportW = window.innerWidth
-  const viewportH = window.innerHeight
+  // window.innerWidth/innerHeight zoom'lu görünür alanı verir (tarayıcının
+  // kendisinden gelir, ikinci kez küçültülmez); ama bu turun öğeleri AYNI
+  // zoom'lu <html> içinde render edildiği için, measure()'daki aynı sebeple
+  // bu ikisi de zoom'a bölünmeli — aksi halde ekran kenarına "sığdırma"
+  // hesapları (tooltip/maske konumu) rect ile tutarsız kalır.
+  const z = currentZoom()
+  const viewportW = window.innerWidth / z
+  const viewportH = window.innerHeight / z
 
   // Ham rect, sayfa kaydırıldığında (özellikle ekrandan uzun bölümlerde,
   // ör. Dashboard'daki aktivite kartları) görünür alanın tamamen dışına

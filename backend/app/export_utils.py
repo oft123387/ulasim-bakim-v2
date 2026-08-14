@@ -80,8 +80,12 @@ def _dt(v) -> str:
 
 # ================================================================= Satır çıkarma (Bakımlar / Audit)
 def maintenance_rows(maintenances: list) -> tuple[list[str], list[list[str]]]:
+    # döngüsel importu önlemek için burada
+    from . import services
+
     headers = [
         "İş Emri", "Araç Kodu", "Araç Adı", "Periyot", "Hedef", "Açılış KM",
+        "Tamamlanan KM", "Sapma %",
         "Durum", "İlerleme", "Atanan", "Oluşturma", "Başlangıç", "Bitiş",
     ]
     rows = []
@@ -91,6 +95,12 @@ def maintenance_rows(maintenances: list) -> tuple[list[str], list[list[str]]]:
         # models.Maintenance) — dışa aktarımda her zaman gerçek hedefi (km ya
         # da tarih) gösterilir.
         hedef = m.target_date.strftime("%d.%m.%Y") if m.target_date else str(m.target_km)
+        deviation_pct = services.compute_km_deviation_pct(
+            m.completed_km,
+            m.target_km,
+            m.plan.interval_km if m.plan else None,
+            m.plan.plan_type if m.plan else None,
+        )
         rows.append([
             str(m.id),
             m.vehicle.code if m.vehicle else "",
@@ -98,6 +108,8 @@ def maintenance_rows(maintenances: list) -> tuple[list[str], list[list[str]]]:
             m.plan.name if m.plan else "",
             hedef,
             str(m.km_at_open),
+            str(m.completed_km) if m.completed_km is not None else "",
+            f"%{deviation_pct:g}" if deviation_pct is not None else "",
             _STATUS_TR.get(m.status, m.status),
             f"{done}/{total}",
             m.assigned_to.full_name if m.assigned_to else "",
@@ -392,9 +404,9 @@ def build_kpi_workbook(report: dict, title: str = "KPI Raporu") -> bytes:
     ws.append(["Tamamlanma Oranı (%)", c["completion_rate_pct"]])
     ws.append(["Aralıkta Tamamlanan (toplam)", c["completed_in_range"]])
     ws.append(["Ortalama Tamamlanma Süresi (gün)", c["avg_completion_days"] if c["avg_completion_days"] is not None else "-"])
-    ws.append(["Zamanında Tamamlanan Bakım", c["on_time_count"]])
-    ws.append(["Değerlendirilen Bakım (periyodu belirsiz olanlar hariç)", c["on_time_evaluated"]])
-    ws.append(["Zamanında Bakım Yapılan Araç Oranı (%)", c["on_time_rate_pct"] if c["on_time_rate_pct"] is not None else "-"])
+    ws.append(["Toleransta Tamamlanan Bakım", c["on_time_count"]])
+    ws.append(["Değerlendirilen Tamamlanan Bakım (periyodu belirsiz olanlar hariç)", c["on_time_evaluated"]])
+    ws.append(["Zamanında Bakım Oranı (%)", c["on_time_rate_pct"] if c["on_time_rate_pct"] is not None else "-"])
     ws.append([])
     cr = report["critical"]
     ws.append(["Geciken/Kritik Bakımlar (güncel durum, tarih aralığından bağımsız)"])
@@ -446,6 +458,89 @@ def build_kpi_workbook(report: dict, title: str = "KPI Raporu") -> bytes:
     for row in report["by_shift"]:
         ws5.append([row["shift_name"], row["items_completed_in_range"]])
     _widths(ws5, [20, 20])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ================================================================= Bakım Akışı (Bakımlar sayfası) — çok sayfalı Excel
+# Durum -> sekme adı ve öncelik sırası (en acil önce) — Bakımlar sayfasındaki
+# MaintenancesPage.tsx FLOW_STATUS_PRIORITY ile birebir aynı sıra.
+_FLOW_STATUS_TR = {
+    "gecikti": "Bakım Gecikti",
+    "planlandi": "Planlandı",
+    "yaklasiyor": "Yaklaşıyor",
+    "planlanacak": "Planlanmayı Bekleyen",
+}
+_FLOW_STATUS_ORDER = ["gecikti", "planlandi", "yaklasiyor", "planlanacak"]
+
+
+def build_flow_export(items: list[dict], title: str = "Bakım Akışı") -> bytes:
+    """Bakımlar sayfasındaki 'Bakım Akışı' listesini (bkz. main.py
+    _compute_upcoming_merged / GET /vehicles/alerts — Başlatılanlar VE
+    Başlatılmayı Bekleyenler sekmelerinin ortak veri kaynağı) çok sayfalı
+    bir Excel dosyasına aktarır. Kullanıcı isteği: "önemli olanları da
+    sheet sheet ayır" — her durum kategorisi (Bakım Gecikti/Planlandı/
+    Yaklaşıyor/Planlanmayı Bekleyen) KENDİ sayfasında, en acil olan en
+    önce; boş kategoriler için sayfa oluşturulmaz. `items` çağıran tarafça
+    (bkz. main.py export_vehicle_alerts) sayfadaki aktif periyot/araç
+    tipi/sekme filtreleriyle ÖNCEDEN filtrelenmiş olarak gelir."""
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    headers = ["Araç Kodu", "Araç Adı", "Model", "Periyot", "Hedef", "Kalan", "İş Emri", "Vardiya"]
+
+    def _fmt_target(item: dict) -> str:
+        if item.get("target_date"):
+            d = item["target_date"]
+            return d.strftime("%d.%m.%Y") if hasattr(d, "strftime") else str(d)
+        km = item.get("target_km") or 0
+        return f"{km:,}".replace(",", ".") + " km"
+
+    def _fmt_remaining(item: dict) -> str:
+        r = item.get("remaining_km") or 0
+        unit = "gün" if item.get("target_date") else "km"
+        abs_r = f"{abs(r):,}".replace(",", ".") if unit == "km" else str(abs(r))
+        return f"{abs_r} {unit} geçti" if r < 0 else f"{abs_r} {unit} kaldı"
+
+    grouped: dict[str, list[dict]] = {}
+    for it in items:
+        key = it.get("status") or "diger"
+        grouped.setdefault(key, []).append(it)
+
+    sheet_keys = [k for k in _FLOW_STATUS_ORDER if grouped.get(k)]
+    if grouped.get("diger"):
+        sheet_keys.append("diger")
+    if not sheet_keys:
+        sheet_keys = [_FLOW_STATUS_ORDER[0]]  # hiç kayıt yoksa bile en az bir (boş) sayfa gerekir
+
+    first = True
+    for key in sheet_keys:
+        sheet_title = _FLOW_STATUS_TR.get(key, "Diğer")
+        if first:
+            ws = wb.active
+            ws.title = sheet_title
+            first = False
+        else:
+            ws = wb.create_sheet(sheet_title)
+        ws.append(headers)
+        for c in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=c)
+            cell.font = excel_utils._HEADER_FONT
+            cell.fill = excel_utils._HEADER_FILL
+        ws.freeze_panes = "A2"
+        for it in grouped.get(key, []):
+            v = it["vehicle"]
+            ws.append([
+                v.code, v.name, v.model or "-",
+                it.get("plan_name", ""), _fmt_target(it), _fmt_remaining(it),
+                f"#{it['maintenance_id']}" if it.get("maintenance_id") else "Henüz yok",
+                it.get("assigned_shift_name") or "-",
+            ])
+        for i, w in enumerate([12, 22, 18, 22, 16, 16, 12, 16], start=1):
+            ws.column_dimensions[get_column_letter(i)].width = w
 
     buf = io.BytesIO()
     wb.save(buf)

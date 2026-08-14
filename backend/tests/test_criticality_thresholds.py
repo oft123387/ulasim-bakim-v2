@@ -28,6 +28,18 @@ from app import models
 from .conftest import auth
 
 
+def _clear_baseline(vid):
+    """Bu testler sınıflandırma/kritiklik mantığını izole doğrular; başlangıç
+    (baseline) km kuralı devrede olsaydı hedefi güncel km'nin altında kalan
+    (gecikti/aşılmış) senaryolar gizlenirdi. Baseline sıfırlanır."""
+    db = SessionLocal()
+    try:
+        db.query(models.Vehicle).filter_by(id=vid).update({models.Vehicle.baseline_km: None})
+        db.commit()
+    finally:
+        db.close()
+
+
 def _open_maintenance(client, admin, code, model, interval_km, current_km):
     r = client.post(
         "/api/vehicles", headers=auth(admin),
@@ -35,6 +47,7 @@ def _open_maintenance(client, admin, code, model, interval_km, current_km):
     )
     assert r.status_code == 200, r.text
     vehicle = r.json()
+    _clear_baseline(vehicle["id"])
 
     r = client.post(
         "/api/plans", headers=auth(admin),
@@ -147,6 +160,7 @@ def test_not_yet_started_candidate_never_shows_critical_or_urgent(client, admin_
     )
     assert r.status_code == 200, r.text
     vehicle = r.json()
+    _clear_baseline(vehicle["id"])
 
     r = client.post(
         "/api/plans", headers=auth(admin),
@@ -209,6 +223,7 @@ def test_overdue_not_started_candidate_excluded_from_dashboard_upcoming(client, 
     )
     assert r.status_code == 200, r.text
     vehicle = r.json()
+    _clear_baseline(vehicle["id"])
 
     r = client.post(
         "/api/plans", headers=auth(admin),

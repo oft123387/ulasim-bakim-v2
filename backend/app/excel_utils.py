@@ -622,6 +622,8 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
         "Periyot",
         "Hedef KM",
         "Açılış KM",
+        "Tamamlanan KM",
+        "Sapma %",
         "Durum",
         "İlerleme",
         "Atanan",
@@ -629,10 +631,13 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
         "Başlangıç",
         "Bitiş",
     ]
-    widths = [10, 12, 22, 18, 12, 12, 14, 12, 20, 18, 18, 18]
+    widths = [10, 12, 22, 18, 12, 12, 14, 10, 14, 12, 20, 18, 18, 18]
 
     def dt(v):
         return v.strftime("%d.%m.%Y %H:%M") if v else ""
+
+    # döngüsel importu önlemek için burada
+    from . import services
 
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
@@ -654,6 +659,12 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
         _style_header_row(ws, len(headers))
         for m in rows:
             done, total = _count_leaves(list(m.items))
+            deviation_pct = services.compute_km_deviation_pct(
+                m.completed_km,
+                m.target_km,
+                m.plan.interval_km if m.plan else None,
+                m.plan.plan_type if m.plan else None,
+            )
             ws.append(
                 [
                     m.id,
@@ -662,6 +673,8 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
                     m.plan.name if m.plan else "",
                     m.target_km,
                     m.km_at_open,
+                    m.completed_km if m.completed_km is not None else "",
+                    f"%{deviation_pct:g}" if deviation_pct is not None else "",
                     _STATUS_TR.get(m.status, m.status),
                     f"{done}/{total}",
                     m.assigned_to.full_name if m.assigned_to else "",
@@ -671,7 +684,7 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
                 ]
             )
             r = ws.max_row
-            status_cell = ws.cell(row=r, column=7)
+            status_cell = ws.cell(row=r, column=9)
             fill = _STATUS_FILLS.get(m.status)
             font = _STATUS_FONTS.get(m.status)
             if fill:
@@ -972,6 +985,79 @@ def _parse_bakim_value(raw) -> tuple[str, int, int | None] | None:
     return None
 
 
+def _collect_catalog_rows(node, ancestors, children, vehicle_model, label, rows):
+    """Bir kök (BÖLGE) düğümünden başlayıp yaprak (BAKIM KALEMİ) düğümlerine
+    kadar DFS yapar; her yaprak için KB TOPLU LİSTE satırını `rows`e ekler.
+    Ata zinciri: [BÖLGE, SİSTEM, EKİPMAN, ...] — ilk üç seviye ilgili sütunlara,
+    daha derin seviyeler (varsa) EKİPMAN'a ' / ' ile birleştirilir."""
+    kids = children.get(node.id)
+    if not kids:  # yaprak (madde)
+        bolge = ancestors[0] if len(ancestors) > 0 else ""
+        sistem = ancestors[1] if len(ancestors) > 1 else ""
+        ekipman = " / ".join(a for a in ancestors[2:] if a) if len(ancestors) > 2 else ""
+        rows.append([
+            vehicle_model, bolge, sistem, ekipman, label,
+            node.name or "", node.card_code or "", node.note or "",
+        ])
+        return
+    for k in kids:
+        _collect_catalog_rows(k, ancestors + [node.name or ""], children, vehicle_model, label, rows)
+
+
+def build_bulk_catalog_workbook(db) -> bytes:
+    """Bakım ağacını, YÜKLENDİĞİ KB TOPLU LİSTE formatında (ARAÇ | BÖLGE |
+    SİSTEM | EKİPMAN | BAKIM | BAKIM KALEMİ | KART KODU) dışa aktarır; ek
+    olarak programda düğümlere eklenen açıklamaları taşıyan bir AÇIKLAMALAR
+    sütunu ekler. Böylece ağaç aynı formatta yedeklenebilir ve bu dosya tekrar
+    'Toplu Katalog Yükle' ile içe aktarılabilir — AÇIKLAMALAR sütunu da geri
+    okunur (tam round-trip; bkz. import_bulk_catalog)."""
+    from . import services  # döngüsel importu önlemek için burada
+    headers = ["ARAÇ", "BÖLGE", "SİSTEM", "EKİPMAN", "BAKIM", "BAKIM KALEMİ", "KART KODU", "AÇIKLAMALAR"]
+
+    plans = db.query(models.MaintenancePlan).all()
+    nodes = db.query(models.TreeNode).all()
+    children: dict = {}
+    for n in nodes:
+        children.setdefault(n.parent_id, []).append(n)
+    for lst in children.values():
+        lst.sort(key=lambda x: (x.order_index, x.id))
+
+    def bakim_label(plan) -> str:
+        # Süre bazlı plan (nadir; KB katalog km bazlıdır) — yaklaşık gösterim.
+        if plan.plan_type == "time":
+            return f"{plan.interval_months} Ay" if plan.interval_months else ""
+        # Sirio periyotları yüklenirken "3M"/"1Y" gibi km-kod olarak gelmişti;
+        # aynı kodla geri yaz ki round-trip birebir olsun. Diğer modeller
+        # (Bozankaya vb.) düz km değeriyle yazılır.
+        code = services.sirio_period_label(plan.interval_km) if services._is_sirio_model(plan.vehicle_model) else None
+        return code or str(plan.interval_km)
+
+    rows: list = []
+    for plan in plans:
+        label = bakim_label(plan)
+        vm = plan.vehicle_model or ""
+        for root in children.get(None, []):
+            if root.plan_id != plan.id:
+                continue
+            _collect_catalog_rows(root, [], children, vm, label, rows)
+
+    rows.sort(key=lambda r: (r[0], r[1], r[2], r[3], r[4], r[5]))
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "KB TOPLU LİSTE"
+    ws.append(headers)
+    _style_header_row(ws, len(headers))
+    for r in rows:
+        ws.append(r)
+    for i, w in enumerate([14, 16, 22, 26, 10, 48, 16, 40], start=1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+    _autofilter(ws, len(headers), len(rows))
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def import_bulk_catalog(
     db, workbook_source: str | bytes, vehicle_model_override: str = "", dry_run: bool = False,
 ) -> dict:
@@ -1062,6 +1148,10 @@ def import_bulk_catalog(
     _H_EKIPMAN = {_norm(x) for x in ("EKİPMAN", "EKIPMAN")}
     _H_ALT_EKIPMAN = {_norm(x) for x in ("ALT EKİPMAN", "ALT EKIPMAN")}
     _H_KART = {_norm(x) for x in ("KART KODU", "KART", "KARTKODU", "KART NO")}
+    # AÇIKLAMALAR: dışa aktarımda (build_bulk_catalog_workbook) eklenen ve
+    # düğüm notlarını (programda eklenen açıklamalar) taşıyan sütun. İçe
+    # aktarmada yaprağın note alanına yazılır (tam round-trip). Yoksa boş kalır.
+    _H_ACIKLAMA = {_norm(x) for x in ("AÇIKLAMALAR", "ACIKLAMALAR", "AÇIKLAMA", "ACIKLAMA", "NOT", "NOTLAR")}
     _ITEM_PREFIX = _norm("BAKIM KALEMİ")  # "bakimkalemi" -> "BAKIM KALEMİ", "BAKIM KALEMİ 1"..
 
     def _build_catalog_map(header_row: list) -> tuple[dict, list[int]] | None:
@@ -1086,6 +1176,8 @@ def import_bulk_catalog(
                 idx["bolge"] = c
             elif h in _H_KART and "kart" not in idx:
                 idx["kart"] = c
+            elif h in _H_ACIKLAMA and "aciklama" not in idx:
+                idx["aciklama"] = c
             elif has_alt:  # Format B: EKİPMAN=2.seviye, ALT EKİPMAN=3.seviye
                 if h in _H_EKIPMAN and "sistem" not in idx:
                     idx["sistem"] = c
@@ -1133,7 +1225,7 @@ def import_bulk_catalog(
         matches = sorted({m for m in _real_models_cache if tok in _norm(m) or _norm(m) in tok})
         return matches or [arac_token.strip()]
 
-    def _emit(vehicle_model, bakim, bolge, sistem, ekipman, kalem, kart, sheet, row_no):
+    def _emit(vehicle_model, bakim, bolge, sistem, ekipman, kalem, kart, sheet, row_no, note=""):
         """Tek bir (madde) satırını rows_by_plan'a ekler.
 
         NOT: bir periyot (ör. 800.000 km) bir temel periyodun (ör. 200.000
@@ -1168,7 +1260,7 @@ def import_bulk_catalog(
             "ekipman": ekipman,
             "kalem": kalem,
             "kart": kart,
-            "note": "",
+            "note": note or "",
         })
 
     processed_any = False
@@ -1206,6 +1298,7 @@ def import_bulk_catalog(
             arac = get("arac"); bakim = get("bakim")
             bolge = get("bolge"); sistem = get("sistem"); ekipman = get("ekipman")
             kart = get("kart")
+            aciklama = get("aciklama")  # yalnızca yedek/round-trip dosyalarında olur
             items = [norm_cell(row[c]) for c in item_cols if c < len(row)]
             items = [i for i in items if i not in (None, "")]
 
@@ -1248,6 +1341,7 @@ def import_bulk_catalog(
                         vehicle_model, bakim,
                         str(bolge).strip(), str(sistem).strip(), str(ekipman).strip(),
                         str(kalem).strip(), kart_str, ws.title, r,
+                        note=(str(aciklama).strip() if aciklama else ""),
                     )
 
     # Hiçbir sayfada başlık bulunamadıysa (başlıksız/eski konumsal dosya):

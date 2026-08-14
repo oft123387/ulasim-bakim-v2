@@ -176,7 +176,21 @@ def _classify_upcoming_status(
     `approaching_offset`: pencerenin dışında ama hâlâ "Yaklaşıyor"
     sayılacağı üst sınır (km: APPROACHING_WITHIN_KM, süre: URGENT_WITHIN_DAYS).
     `is_started`: gerçekten açılıp başlatılmış (is_activated=True) bir iş
-    emri var mı — pencere içindeyken Planlandı/Planlanacak ayrımını belirler.
+    emri var mı — YALNIZCA pencere içindeyken (lower_offset) Planlandı/
+    Planlanacak ayrımını belirler. Kullanıcının onayladığı kesin tanım:
+      Yaklaşıyor    : hedefe kalan <= approaching_offset (ör. 5.000 km),
+                      pencerenin (lower_offset) DIŞINDA — başlatılmış olsun
+                      ya da olmasın, pencere dışındaysa etiket hep budur.
+      Planlanacak   : pencere içinde VE henüz başlatılmamış.
+      Planlandı     : pencere içinde VE başlatılmış.
+      Bakım gecikti : pencerenin (upper_offset) ötesine geçilmiş.
+    Bu ayrım yalnızca ETİKETLEME içindir — bir iş emrinin Bakımlar
+    sayfasında "Başlatılanlar" ya da "Başlatılmayı Bekleyenler" sekmesinde
+    görünmesi bu status alanına göre DEĞİL, doğrudan maintenance_id'nin
+    (yani gerçekten başlatılmış olup olmadığının) dolu olup olmamasına göre
+    belirlenir (bkz. MaintenancesPage.tsx flowTabItems) — böylece pencere
+    dışında ama başlatılmış bir iş emri "Yaklaşıyor" etiketiyle birlikte
+    yine de Başlatılanlar'da görünür.
 
     Döner: "gecikti" | "planlandi" | "planlanacak" | "yaklasiyor" | None
     (None: henüz hiçbir uyarı gösterilecek kadar yakın değil)."""
@@ -273,8 +287,16 @@ def check_and_open_maintenances(
     candidates.add(((km // base_unit) + 1) * base_unit)
     candidates.discard(0)
 
+    # Başlangıç (baseline) km'sinin ALTINDA/eşitinde kalan hedefler asla açılmaz
+    # — araç sisteme girmeden ÖNCE yapılmış sayılan bakımlar (ör. 200.000 km
+    # bakımı) hiçbir zaman "eksik/geciken" olarak görünmez; yalnızca baseline'ın
+    # ÜSTÜNE gelen yeni bakımlar açılır (kullanıcı isteği). baseline None ise
+    # (henüz backfill edilmemiş) bu kural uygulanmaz.
+    baseline = vehicle.baseline_km
     for target in sorted(candidates):
         if skip_passed_targets and target <= km:
+            continue
+        if baseline is not None and target <= baseline:
             continue
         applicable = [p for p in active_plans if target % p.interval_km == 0]
         if not applicable:
@@ -299,8 +321,18 @@ def check_and_open_maintenances(
             target_km=target,
             km_at_open=km,
             status="pending",
-            # Faz 26: otomatik açılan aday, admin/mühendis "Başlat" demeden
-            # hiçbir listede (Bakımlar/Takvim/Dashboard/Alarm Merkezi) görünmez.
+            # DÜZELTME: bu satır önceden ("Item 5 — 'Başlat yok' tam otomatik
+            # model" — Faz 26'dan ÖNCEKİ, artık geçersiz bir tasarımın kalıntısı)
+            # is_activated=True idi. Bu, models.Maintenance.is_activated alanının
+            # kendi belgelenmiş sözleşmesiyle (bkz. models.py: "Faz 26 — Bakım
+            # başlatma onayı: otomatik-açma (check_and_open_maintenances) bir iş
+            # emrini artık DOĞRUDAN görünür/çalışılabilir yapmaz; yalnızca bir
+            # 'aday' olarak oluşturur (is_activated=False)") DOĞRUDAN çelişiyordu
+            # — sonuç olarak "Başlatılmayı Bekleyenler" listesi otomatik açılan
+            # adaylar için HİÇBİR ZAMAN dolmuyordu (adaylar zaten doğrudan aktif
+            # doğuyordu) ve zamanlanmış başlatma (scheduled_start_at) mekanizması
+            # otomatik tespit için işlevsiz kalıyordu. False olması belgelenen
+            # sözleşmeyi ve testleri (test_scheduled_maintenance_start.py) karşılar.
             is_activated=False,
         )
         db.add(m)
@@ -543,6 +575,9 @@ def check_and_open_time_maintenances(
             target_date=target_date,
             km_at_open=vehicle.current_km,
             status="pending",
+            # DÜZELTME: km-bazlı check_and_open_maintenances ile AYNI hata
+            # (bkz. yukarıdaki açıklama) — süre bazlı otomatik-açma da Faz 26
+            # sözleşmesine uyması için is_activated=False olmalı.
             is_activated=False,
         )
         db.add(m)
@@ -750,6 +785,60 @@ def create_manual_maintenance(
     applicable = [p for p in active_plans if target_km % p.interval_km == 0]
     if plan.id not in {p.id for p in applicable}:
         applicable.append(plan)
+    _copy_tree_snapshot(db, m, applicable)
+    db.commit()
+    return m
+
+
+def queue_upcoming_maintenance(
+    db: Session, vehicle: "models.Vehicle", target_km: int
+) -> models.Maintenance:
+    """Bir yaklaşan km bakımını başlatma onayı kuyruğuna alır.
+
+    Bu, elle bakım eklemekten farklıdır: iş emri ``is_activated=False`` olarak
+    oluşturulur; yetkili daha sonra Bakımlar ekranından hemen başlatabilir ya
+    da ileri bir tarihe zamanlayabilir. Aynı araç/hedef için tekrar çağrılırsa
+    mevcut kaydı döndürür. Böylece 3M, 6M, 9M ve 15M gibi ortak katlarda 3M
+    ağacı da aynı birleşik checklist'e dahil edilir.
+    """
+    active_plans = [
+        p for p in db.query(models.MaintenancePlan).filter_by(is_active=True).all()
+        if p.plan_type == "km" and p.interval_km > 0 and not p.is_catalog_only
+        and _model_matches(p.vehicle_model, vehicle.model)
+    ]
+    applicable = [p for p in active_plans if target_km % p.interval_km == 0]
+    if not applicable:
+        raise ValueError("Bu araç ve hedef km için uygulanabilir aktif bakım planı yok")
+    governing = max(applicable, key=lambda p: p.interval_km)
+    existing = (
+        db.query(models.Maintenance)
+        .filter_by(vehicle_id=vehicle.id, plan_id=governing.id, target_km=target_km)
+        .first()
+    )
+    if existing:
+        return existing
+    m = models.Maintenance(
+        vehicle_id=vehicle.id,
+        plan_id=governing.id,
+        target_km=target_km,
+        km_at_open=vehicle.current_km,
+        status="pending",
+        # DÜZELTME: bu satır önceden (eski, tek adımlı "Planlamaya Al" akışından
+        # kalma) is_activated=True idi — ama yukarıdaki docstring ve ÇAĞRAN
+        # taraf (main.py plan_upcoming_maintenance, frontend planUpcoming/
+        # startUpcoming) her zaman bunu ÇAĞIRDIKTAN HEMEN SONRA ayrıca
+        # POST /maintenances/{id}/start çağırıyor. is_activated burada zaten
+        # True verilince /start "Bu bakım zaten başlatılmış" (400) hatası
+        # atıyordu — kullanıcıya yanlışlıkla hata gösteriliyordu VE asıl
+        # activate_maintenance() hiç çalışmadığı için activated_at/
+        # activated_by_id boş kalıp "start" denetim kaydı hiç yazılmıyordu
+        # (iş emri görünürde başlamış gibi dursa da gerçek aktivasyon
+        # bilgisi eksik kalıyordu). False olması, ardından gelen /start
+        # çağrısının işini gerçekten yapmasını sağlar.
+        is_activated=False,
+    )
+    db.add(m)
+    db.flush()
     _copy_tree_snapshot(db, m, applicable)
     db.commit()
     return m
@@ -1063,6 +1152,7 @@ def compute_upcoming_maintenances(
         vehicles = db.query(models.Vehicle).all()
     if plans is None:
         plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
+    today = date.today()
 
     upcoming: list[dict] = []
     for v in vehicles:
@@ -1108,11 +1198,24 @@ def compute_upcoming_maintenances(
                 .filter_by(vehicle_id=v.id, plan_id=governing.id, target_km=target)
                 .first()
             )
+            pending_scheduled_start_at = None
             if exists is not None and not exists.is_activated:
                 # Faz 26: admin/mühendis henüz "Başlat" demediyse, bu iş emri
                 # HENÜZ açılmamış gibi davranılır (yalnızca önizleme
                 # penceresine girdiğinde "yaklaşıyor" olarak gösterilir).
+                # scheduled_start_at'i (varsa) exists=None yapmadan ÖNCE
+                # kaydediyoruz ki arayüz "Zamanlandı: X" rozetini gösterebilsin.
+                pending_scheduled_start_at = exists.scheduled_start_at
                 exists = None
+            # Başlangıç (baseline) km'sinin ALTINDA/eşitinde kalan hedefler,
+            # GERÇEK bir iş emri YOKKEN (yalnızca otomatik önizleme adayı iken)
+            # hiç gösterilmez — araç sisteme girmeden önce yapılmış sayılan
+            # bakımlar (ör. 200.000 km) "geciken/yaklaşan" olarak asla
+            # listelenmez. Elle açılmış gerçek bir iş emri varsa (admin bilinçli
+            # eklemiş) baseline'dan bağımsız her zaman görünür. baseline None ise
+            # kural uygulanmaz (check_and_open ile birebir aynı mantık).
+            if exists is None and v.baseline_km is not None and target <= v.baseline_km:
+                continue
             if exists is not None:
                 # Tamamlanmış bakım her zaman listeden düşer. Açık (Bekliyor/
                 # Devam Ediyor) iş emri ise include_open=True çağrılarında
@@ -1191,6 +1294,29 @@ def compute_upcoming_maintenances(
             # başlatılmayı bekleyen bir aday, sanki az önce tamamlanan bir
             # bakımla ilgiliymiş gibi yanlışlıkla "hâlâ kritik" izlenimi verir.
             is_started = exists is not None
+            # Takvim sayfasındaki sürükle-bırak yeniden zamanlama için: bu
+            # hedefin GERÇEK tolerans penceresi (planın kendi threshold_type
+            # ayarına göre — yukarıdaki dar PREVIEW_* önizleme penceresinden
+            # FARKLI, "bakım ne zamana kadar ertelenebilir/öne alınabilir"
+            # sorusunun asıl cevabı) km cinsinden hesaplanır, sonra günlük
+            # ortalama km varsayımıyla takvim tarihine çevrilir. Aktif
+            # (is_activated=True) bir kayıt varsa arayüz zaten kendi
+            # plan nesnesinden (m.plan) aynı hesaplamayı birebir yapabildiği
+            # için bu alanlar esas olarak HENÜZ başlatılmamış (gri) adaylar
+            # içindir.
+            plan_lower_km, plan_upper_km = plan_window(governing, target)
+            # ÖNEMLİ yuvarlama kuralı: (plan_lower_km - km) normalde NEGATİFTİR
+            # (alt sınır km'si zaten geçilmiş) — math.floor (sıfırdan uzağa,
+            # daha NEGATİFE yuvarlar) kullanılır ki alt sınır tarihi olması
+            # gerekenden GEÇ değil, en az olması gerektiği kadar ERKEN çıksın.
+            # math.ceil kullanılsaydı pencere ~1 gün daha DAR olurdu — Takvim
+            # sayfasında "tolerans içindeyken bile sürükleyemiyorum" şikâyetinin
+            # kök nedeni buydu. Üst sınırda ise math.ceil (yukarı, daha CÖMERT)
+            # doğru yöndür.
+            days_to_lower = math.floor((plan_lower_km - km) / DEFAULT_CALENDAR_DAILY_KM)
+            days_to_upper = math.ceil((plan_upper_km - km) / DEFAULT_CALENDAR_DAILY_KM)
+            window_lower_date = today + timedelta(days=days_to_lower)
+            window_upper_date = today + timedelta(days=max(days_to_lower, days_to_upper))
             upcoming.append(
                 {
                     "vehicle": v,
@@ -1211,6 +1337,17 @@ def compute_upcoming_maintenances(
                     # emrine karşılık geliyorsa o kaydın id'si; henüz
                     # açılmamış (yalnızca yaklaşan önizleme) bir aday ise None.
                     "maintenance_id": exists.id if exists is not None else None,
+                    "assigned_shift_id": exists.assigned_shift_id if exists is not None else None,
+                    "assigned_shift_name": (
+                        exists.assigned_shift.name if exists is not None and exists.assigned_shift else None
+                    ),
+                    # Bkz. compute_upcoming_time_maintenances — km sürümünde
+                    # önceden eksikti (aday henüz başlatılmamışken "İleri
+                    # Tarihe Al" ile zamanlanmışsa Takvim/Bakımlar sayfası
+                    # bunu göremiyordu), burada da aynı alan eklendi.
+                    "scheduled_start_at": pending_scheduled_start_at,
+                    "window_lower_date": window_lower_date,
+                    "window_upper_date": window_upper_date,
                 }
             )
 
@@ -1257,8 +1394,8 @@ def compute_upcoming_time_maintenances(
     `_compute_upcoming_merged`) iki listeyi birleştirip tek bir sırada
     gösterebilsin:
       - target_km: gerçek Maintenance satırındaki NEGATİF sentinel
-        (-hedef ay sayısı) — alarm/AlarmState gibi target_km'ye göre
-        eşleşen mevcut genel kodun değişiklik yapılmadan çalışmasını sağlar.
+        (-hedef ay sayısı) — target_km'ye göre eşleşen mevcut genel kodun
+        değişiklik yapılmadan çalışmasını sağlar.
       - remaining_km: burada KM değil, İMZALI kalan gün sayısıdır (negatifse
         gecikmiş demektir) — km tarafındaki "remaining_km <= 0 → gecikti"
         kuralıyla birebir uyumlu kalır.
@@ -1304,7 +1441,9 @@ def compute_upcoming_time_maintenances(
                 .filter_by(vehicle_id=v.id, plan_id=governing.id, target_km=sentinel_km)
                 .first()
             )
+            pending_scheduled_start_at = None
             if exists is not None and not exists.is_activated:
+                pending_scheduled_start_at = exists.scheduled_start_at
                 exists = None
             target_date = add_months(v.commissioning_date, target)
             signed_days = (target_date - today).days
@@ -1336,6 +1475,24 @@ def compute_upcoming_time_maintenances(
             # "Başlat" denmemiş bir aday hiçbir zaman kritik/çok kritik
             # rozetiyle gösterilmez, yalnızca nötr "yaklaşıyor" olarak görünür.
             is_started = exists is not None
+            # Bkz. compute_upcoming_maintenances'daki AYNI ekleme — Takvim'in
+            # tek-takvim sürükle-bırak kısıtlaması için gerçek (planın kendi
+            # threshold_type ayarına göre) tolerans penceresi burada da
+            # takvim tarihine çevrilip döndürülür.
+            lower_months, upper_months = time_plan_window(governing, target)
+            # ÖNEMLİ yuvarlama kuralı: pencere GENİŞLİĞİ (gün cinsine çevrilen
+            # ay farkı) burada da her zaman math.ceil ile yukarı yuvarlanır —
+            # round() kullanılsaydı bazı durumlarda ~0.5 gün aşağı yuvarlayıp
+            # penceremiz gerçek tolerans olduğundan DAR görünürdü (bkz.
+            # compute_upcoming_maintenances'daki AYNI düzeltme).
+            window_lower_date = target_date - timedelta(
+                days=math.ceil((target - lower_months) * _AVG_DAYS_PER_MONTH)
+            )
+            window_upper_date = target_date + timedelta(
+                days=math.ceil((upper_months - target) * _AVG_DAYS_PER_MONTH)
+            )
+            if window_upper_date < window_lower_date:
+                window_upper_date = window_lower_date
             upcoming.append(
                 {
                     "vehicle": v,
@@ -1356,6 +1513,13 @@ def compute_upcoming_time_maintenances(
                         URGENT_WITHIN_DAYS, is_started,
                     ),
                     "maintenance_id": exists.id if exists is not None else None,
+                    "assigned_shift_id": exists.assigned_shift_id if exists is not None else None,
+                    "assigned_shift_name": (
+                        exists.assigned_shift.name if exists is not None and exists.assigned_shift else None
+                    ),
+                    "scheduled_start_at": pending_scheduled_start_at,
+                    "window_lower_date": window_lower_date,
+                    "window_upper_date": window_upper_date,
                 }
             )
 
@@ -1473,8 +1637,119 @@ def compute_maintenance_calendar_projections(
                     "vehicle": v,
                     "plan_name": governing.name,
                     "target_km": target,
+                    "target_date": None,
                     "remaining_km": target - km,
                     "covered_tiers": sorted(p.interval_km for p in applicable),
+                    "window_start": window_start.isoformat(),
+                    "window_end": window_end.isoformat(),
+                    "status": existing.status if existing else None,
+                    "maintenance_id": existing.id if existing else None,
+                }
+            )
+
+    out.sort(key=lambda d: d["window_start"])
+    return out
+
+
+# Ay -> gün yaklaşık dönüşümü, yalnızca Takvim'deki süre bazlı önizleme
+# penceresinin (ay cinsinden lower/upper toleransı) takvim gününe
+# çevrilmesi için kullanılır — gerçek hedef tarih (target_date) her zaman
+# add_months ile TAKVİM-DOĞRU hesaplanır, bu sabit yalnızca pencere
+# GENİŞLİĞİ (±tolerans) için kabaca kullanılır.
+_AVG_DAYS_PER_MONTH = 30.44
+
+
+def compute_time_maintenance_calendar_projections(
+    db: Session,
+    vehicles: list[models.Vehicle] | None = None,
+    plans: list[models.MaintenancePlan] | None = None,
+) -> list[dict]:
+    """compute_maintenance_calendar_projections'ın süre bazlı (aylık/yıllık)
+    planlar için karşılığı — compute_upcoming_time_maintenances'ın km bazlı
+    compute_upcoming_maintenances'a karşılığı olmasıyla AYNI ilişki.
+
+    DÜZELTME: Takvim (GET /maintenances/projections) önceden YALNIZCA km
+    bazlı planları hesaplıyordu (compute_maintenance_calendar_projections,
+    yalnızca interval_km>0 filtreler) — süre bazlı bir planı olan araçlar
+    Takvim'de HİÇBİR ZAMAN görünmüyordu, oysa Dashboard/Bakım Akışı
+    (_compute_upcoming_merged) ikisini de birleştiriyordu. Bu fonksiyon o
+    eksikliği kapatır; main.py get_maintenance_projections ikisini birleştirir.
+
+    Dönüş, km sürümüyle AYNI anahtarları taşır (target_km burada dahili
+    negatif sentineldir, target_date gerçek hedeftir — bkz.
+    compute_upcoming_time_maintenances docstring'i) ki çağıran taraf iki
+    listeyi doğrudan birleştirip tek takvimde gösterebilsin."""
+    if vehicles is None:
+        vehicles = db.query(models.Vehicle).all()
+    if plans is None:
+        plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
+
+    today = date.today()
+    out: list[dict] = []
+
+    for v in vehicles:
+        if not v.commissioning_date:
+            continue
+        elapsed = elapsed_months(v.commissioning_date, today)
+        active_plans = [
+            p for p in plans
+            if p.plan_type == "time" and p.interval_months
+            and _model_matches(p.vehicle_model, v.model)
+        ]
+        if not active_plans:
+            continue
+
+        base_unit = active_plans[0].interval_months
+        for p in active_plans[1:]:
+            base_unit = math.gcd(base_unit, p.interval_months)
+        if base_unit <= 0:
+            continue
+
+        targets: set[int] = set()
+        targets.add((elapsed // base_unit) * base_unit)
+        targets.add(((elapsed // base_unit) + 1) * base_unit)
+        targets.discard(0)
+
+        for target in sorted(targets):
+            applicable = [p for p in active_plans if target % p.interval_months == 0]
+            if not applicable:
+                continue
+            governing = max(applicable, key=lambda p: p.interval_months)
+            sentinel_km = -target
+
+            existing = (
+                db.query(models.Maintenance)
+                .filter_by(vehicle_id=v.id, plan_id=governing.id, target_km=sentinel_km)
+                .first()
+            )
+            if existing is not None and existing.status == "completed":
+                continue  # tamamlanmış periyot — bir daha gösterilmez
+            if existing is not None and not existing.is_activated:
+                # Faz 26 — km sürümüyle AYNI kural: henüz "Başlat" denmediyse
+                # Takvim'de de henüz açılmamış gibi davranılır.
+                existing = None
+
+            lower_months, upper_months = time_plan_window(governing, target)
+
+            if existing is None and not (lower_months <= elapsed <= upper_months):
+                # Km sürümüyle AYNI kural: henüz iş emri açılmamışsa yalnızca
+                # önizleme penceresine girildiğinde takvimde gösterilir.
+                continue
+
+            target_date = add_months(v.commissioning_date, target)
+            window_start = target_date - timedelta(days=round((target - lower_months) * _AVG_DAYS_PER_MONTH))
+            window_end = target_date + timedelta(days=round((upper_months - target) * _AVG_DAYS_PER_MONTH))
+            if window_end < window_start:
+                window_end = window_start
+
+            out.append(
+                {
+                    "vehicle": v,
+                    "plan_name": governing.name,
+                    "target_km": sentinel_km,
+                    "target_date": target_date,
+                    "remaining_km": (target_date - today).days,
+                    "covered_tiers": sorted(p.interval_months for p in applicable),
                     "window_start": window_start.isoformat(),
                     "window_end": window_end.isoformat(),
                     "status": existing.status if existing else None,
@@ -1575,6 +1850,108 @@ def compute_covered_tiers(m: "models.Maintenance") -> list[int]:
                 if part.strip().isdigit():
                     covered.add(int(part))
     return sorted(covered)
+
+
+def compute_km_deviation_pct(
+    completed_km: int | None,
+    target_km: int | None,
+    interval_km: int | None,
+    plan_type: str | None,
+) -> float | None:
+    """Bakımın GERÇEK yapıldığı km'nin (usta/teknisyenin bakım sırasında
+    girdiği completed_km — bkz. models.Maintenance.completed_km), hedef
+    km'den (target_km) sapmasını, planın periyoduna (interval_km) ORANLI
+    yüzde olarak hesaplar. Negatif: hedeften ÖNCE (erken) yapılmış; pozitif:
+    hedeften SONRA (geç) yapılmış.
+
+    Neden interval_km (target_km değil): sistemin açılma/tolerans penceresi
+    de (-%5/+%10 vb., bkz. plan_window) periyoda ORANLI tanımlıdır — aynı
+    birimde olduğu için bu sapma yüzdesi doğrudan o pencereyle karşılaştırı-
+    labilir (ör. "-%0,41 sapma, -%5/+%10 penceresinin çok içinde").
+
+    Yalnızca km bazlı planlarda VE completed_km girilmişse bir değer döner;
+    aksi halde (süre bazlı plan, henüz girilmemiş, ya da interval_km=0/None)
+    None döner — çağıran taraf (schemas.py MaintenanceOut, excel_utils/
+    export_utils dışa aktarımları) bunu "—" ya da boş olarak göstermeli.
+    Pydantic modelleri (PlanOut) İLE SQLAlchemy ORM (models.MaintenancePlan)
+    nesneleri ARASINDA ortak kullanılabilsin diye kasıtlı olarak ilkel
+    (primitive) parametreler alır, bir ORM/şema nesnesi DEĞİL."""
+    if completed_km is None or target_km is None or plan_type != "km" or not interval_km:
+        return None
+    return round((completed_km - target_km) / interval_km * 100, 2)
+
+
+def _auto_capture_completed_km(m: models.Maintenance) -> None:
+    """Kullanıcı isteği: "şuan tamamlananlar için de tamamlandığı km
+    üzerinden yine hesapla ve yaz" — bir iş emri checklist (tüm maddeler
+    tiklenir) veya "Doğrudan Tamamlandı Yap" (force-complete) ile
+    tamamlanınca, usta/teknisyen PATCH completed-km ile bakım sırasında
+    ELLE bir değer GİRMEDİYSE (m.completed_km hâlâ None — girilmişse asla
+    ezilmez, tıpkı completed_by_id gibi "gerçek bir teknisyen girişi"
+    kuralına uyar), aracın o an takip edilen km'si otomatik olarak
+    "tamamlandığı km" sayılır. Böylece Bakım Geçmişi/Excel'deki "Sapma %"
+    sütunu yalnızca elle km girilen iş emirlerinde değil, TÜM tamamlanan km
+    bazlı iş emirlerinde dolu görünür. Yalnızca km bazlı planlarda anlamlı
+    (süre bazlı planlarda dokunulmaz)."""
+    if m.completed_km is not None:
+        return
+    if m.plan and m.plan.plan_type == "km" and m.vehicle:
+        m.completed_km = m.vehicle.current_km
+
+
+def backfill_completed_km_for_finished_maintenances(db: Session) -> int:
+    """Açılışta BİR KEZ çalışan, idempotent geriye dönük doldurma: bu
+    özellik eklenmeden ÖNCE tamamlanmış km bazlı iş emirlerinde
+    completed_km hâlâ boştur (yalnızca completed_km IS NULL satırlar
+    işlenir — zaten dolu olanlara asla dokunulmaz).
+
+    Tamamlandığı andaki gerçek km için en iyi bilgi kaynağı sırasıyla:
+      1) audit_logs'ta o aracın tamamlanma anına (completed_at) kadarki EN
+         SON "KM güncellendi" kaydı (PUT /vehicles/{id}/km veya PATCH
+         completed-km ile elle yapılmış güncellemeler burada iz bırakır;
+         günlük toplu KM simülasyonu araç bazında ayrı log TUTMADIĞI için
+         bu kayıt sıkça bulunamayabilir — o durumda 2'ye düşülür).
+      2) İş emrinin açılış km'si (km_at_open) — kesin olmasa da elimizdeki
+         en yakın bilinen değerdir."""
+    q = (
+        db.query(models.Maintenance)
+        .join(models.MaintenancePlan, models.Maintenance.plan_id == models.MaintenancePlan.id)
+        .filter(
+            models.Maintenance.status == "completed",
+            models.Maintenance.completed_km.is_(None),
+            models.MaintenancePlan.plan_type == "km",
+        )
+    )
+    updated = 0
+    for m in q.all():
+        km = None
+        if m.completed_at is not None:
+            row = (
+                db.query(models.AuditLog)
+                .filter(
+                    models.AuditLog.entity_type == "vehicle",
+                    models.AuditLog.entity_id == m.vehicle_id,
+                    models.AuditLog.action == "update",
+                    models.AuditLog.new_value != "",
+                    models.AuditLog.created_at <= m.completed_at,
+                )
+                .order_by(models.AuditLog.created_at.desc())
+                .first()
+            )
+            if row:
+                try:
+                    km = int(row.new_value)
+                except (TypeError, ValueError):
+                    km = None
+        if km is None:
+            km = m.km_at_open
+        if km is None:
+            continue
+        m.completed_km = km
+        updated += 1
+    if updated:
+        db.commit()
+    return updated
 
 
 def _has_children(db: Session, item: models.MaintenanceItem) -> bool:
@@ -1707,6 +2084,7 @@ def _check_maintenance_done(db: Session, m: models.Maintenance) -> None:
     if roots and all(r.is_completed for r in roots):
         m.status = "completed"
         m.completed_at = datetime.now()
+        _auto_capture_completed_km(m)
 
 
 def unlock_item(db: Session, item: models.MaintenanceItem) -> None:
@@ -1760,6 +2138,7 @@ def force_complete_maintenance(
     m.status = "completed"
     m.started_at = m.started_at or now
     m.completed_at = now
+    _auto_capture_completed_km(m)
     db.commit()
 
 
@@ -2140,56 +2519,56 @@ def has_permission(db: Session, user: "models.User", key: str) -> bool:
     return get_role_permissions(db, user.role).get(key, False)
 
 
-# ---------------------------------------------------------------- Öneriler — hiyerarşik onay (Faz 30)
-def suggestion_pending_stage(s: "models.Suggestion") -> str | None:
-    """Bir önerinin şu an HANGİ aşamanın kararını beklediğini döner:
-    'amir' (henüz hiçbir karar verilmemiş), 'engineer' (amir onayladı,
-    mühendis bekleniyor), ya da None (öneri zaten sonuçlanmış — amir
-    reddetti veya mühendis karar verdi, artık değerlendirilemez)."""
-    if s.status == "pending":
-        return "amir"
-    if s.status == "pending_engineer":
-        return "engineer"
-    return None
+# ---------------------------------------------------------------- İyileştirme Talepleri — tek aşamalı onay
+# Faz 30'daki iki aşamalı (amir -> mühendis) hiyerarşik zincir KALDIRILDI:
+# öneriyi yetkili rollerden (mühendis / amir / admin) HERHANGİ BİRİ doğrudan
+# onaylar ya da reddeder ve bu karar nihaidir. Eski kayıtların amir_*/
+# engineer_* alanları geçmiş görünürlüğü için yerinde duruyor ama yeni
+# kararlarda kullanılmıyor.
+
+# Talebi değerlendirebilecek roller — bkz. main.review_suggestion.
+SUGGESTION_REVIEWER_ROLES = ("admin", "engineer", "amir")
+
+
+def can_review_suggestion(user: "models.User") -> bool:
+    return user.role in SUGGESTION_REVIEWER_ROLES
+
+
+def suggestion_is_open(s: "models.Suggestion") -> bool:
+    """Talep hâlâ karar bekliyor mu? Zincir kalktığı için tek bir bekleme
+    durumu var; 'pending_engineer' yalnızca eski kayıtlarda görülebilir ve
+    o da normal bir bekleyen öneri gibi ele alınır (bkz. migrate.py — yeni
+    kayıtlarda hiç üretilmez)."""
+    return s.status in ("pending", "pending_engineer")
 
 
 def apply_suggestion_review(
     db: Session,
     s: "models.Suggestion",
     actor: "models.User",
-    stage: str,
     decision: str,
     note: str,
 ) -> None:
-    """Faz 30 — hiyerarşik onayın tek karar noktası. `stage` çağıran tarafta
-    (main.py) suggestion_pending_stage(s) ile belirlenmiş ve actor'ün rolüyle
-    eşleştiği zaten doğrulanmış olmalı (yetki kontrolü burada TEKRARLANMAZ,
-    main.py'de HTTP 403 olarak ele alınır — bu fonksiyon yalnızca durumu
-    tutarlı biçimde günceller).
-
-    amir aşamasında: onaylarsa -> 'pending_engineer'e geçer (mühendise
-    düşer); reddederse -> doğrudan 'rejected' olur, mühendise HİÇ DÜŞMEZ.
-    engineer aşamasında: kararı (approved/rejected/added) doğrudan nihai
-    `status` olur."""
+    """Talebi tek kararda sonuçlandırır (approved | rejected). Yetki
+    kontrolü çağıran tarafta (main.py) yapılır ve burada TEKRARLANMAZ."""
     now = datetime.now()
     note = (note or "").strip()
-    if stage == "amir":
+    s.status = decision
+    s.reviewed_by_id = actor.id
+    s.reviewed_at = now
+    s.admin_note = note
+    # Değerlendiren rolün aşama alanı da doldurulur ki eski kayıtlarla aynı
+    # ekranda tutarlı görünsün ("kim karar verdi" bilgisi kaybolmasın).
+    if actor.role == "amir":
         s.amir_status = decision
         s.amir_reviewed_by_id = actor.id
         s.amir_reviewed_at = now
         s.amir_note = note
-        s.status = "pending_engineer" if decision == "approved" else "rejected"
-    else:  # "engineer"
+    else:
         s.engineer_status = decision
         s.engineer_reviewed_by_id = actor.id
         s.engineer_reviewed_at = now
         s.engineer_note = note
-        s.status = decision
-
-    # Geriye dönük uyumlu "son işlem" özeti (eski tek-aşamalı alanlar).
-    s.reviewed_by_id = actor.id
-    s.reviewed_at = now
-    s.admin_note = note
     db.commit()
 
 
@@ -2242,12 +2621,6 @@ def delete_user_permanently(db: Session, target: "models.User") -> None:
     )
     db.query(models.Suggestion).filter_by(engineer_reviewed_by_id=uid).update(
         {"engineer_reviewed_by_id": None}, synchronize_session=False
-    )
-    db.query(models.AlarmState).filter_by(acknowledged_by_id=uid).update(
-        {"acknowledged_by_id": None}, synchronize_session=False
-    )
-    db.query(models.AlarmState).filter_by(assigned_to_id=uid).update(
-        {"assigned_to_id": None}, synchronize_session=False
     )
     # Bu kullanıcıyı vardiya sorumlusu/üyesi olarak gösteren başka
     # kullanıcı kaydı yok (shift_id kendi satırında) — ayrı bir işlem
@@ -2391,7 +2764,11 @@ def compute_kpi_report(
       1) Tamamlanma oranı/süresi: created_at aralığa giren iş emirlerinin
          kaçının şu an tamamlanmış olduğu (oran) + completed_at aralığa giren
          iş emirlerinin ortalama tamamlanma süresi (gün, completed_at -
-         created_at).
+         created_at). Ayrıca ZAMANINDA BAKIM ORANI: yalnızca TAMAMLANMIŞ
+         iş emirleri üzerinden, bakımın gerçekten yapıldığı km'nin
+         (completed_km) hedeften sapmasının planın tolerans penceresinde
+         kalıp kalmadığına göre (süre bazlı planlarda completed_at <=
+         target_date) — ayrıntı için aşağıdaki "1b" bloğuna bakın.
       2) Geciken/kritik bakım sayıları: bunlar doğası gereği "şu anki durum"
          göstergesidir (geçmişte hangi gün kaç kritik iş emri vardı diye bir
          kayıt tutulmuyor) — bu yüzden tarih aralığından BAĞIMSIZ, her zaman
@@ -2437,17 +2814,31 @@ def compute_kpi_report(
     )
 
     # ---- 1b) Zamanında tamamlanan bakım oranı ----
+    # Yalnızca TAMAMLANMIŞ iş emirleri üzerinden hesaplanır (payda =
+    # seçilen aralıkta tamamlananlar; açılıp bitmemiş olanlar sayılmaz).
+    #
     # "Zamanında" tanımı (kullanıcının onayladığı, güncellenmiş kural):
-    #   - Km bazlı planlarda: iş emrinin AÇILDIĞI andaki km (km_at_open),
-    #     planın KENDİ tolerans penceresi (plan_window — lower_pct/upper_pct,
-    #     varsayılan -%5/+%10, ör. hedef 200.000 için [190.000, 220.000])
-    #     İÇİNDE ise zamanında sayılır. Km geçmişi (aracın hangi km'de
-    #     olduğu, gün gün) tutulmadığından tamamlanma anındaki gerçek km
-    #     bilinemez; bunun yerine açılış anındaki km kullanılır — zaten
-    #     check_and_open_maintenances de bir iş emrini ancak bu pencereye
-    #     girildiğinde otomatik açar, dolayısıyla pencere dışında açılmış
-    #     (ör. çok geç fark edilip elle/geç açılmış) bir iş emri zamanında
-    #     sayılmaz.
+    #   - Km bazlı planlarda: bakımın GERÇEKTEN YAPILDIĞI km (completed_km —
+    #     usta bakım sırasında girer, girmezse tamamlanma anındaki araç km'si
+    #     otomatik yazılır; bkz. _auto_capture_completed_km / backfill_
+    #     completed_km_for_finished_maintenances) planın KENDİ tolerans
+    #     penceresi İÇİNDE ise zamanında sayılır. Pencere plan_window ile
+    #     hesaplanır (varsayılan -%5/+%10, ör. hedef 200.000 için
+    #     [190.000, 220.000]) — yani ölçüt, tamamlananın hedeften SAPMASININ
+    #     tolerans aralığında kalıp kalmadığıdır (bkz. compute_km_deviation_
+    #     pct, aynı pencereyle karşılaştırılabilir yüzde).
+    #
+    #     ÖNCEKİ kural iş emrinin AÇILDIĞI andaki km'ye (km_at_open) bakıyordu;
+    #     bu, "bakım vaktinde fark edildi mi" sorusunu ölçüyordu, "bakım
+    #     vaktinde YAPILDI mı" sorusunu değil. Zamanında iş emri açılıp çok
+    #     geç tamamlanan (ör. araç 30.000 km daha yol yaptıktan sonra
+    #     bitirilen) bir bakım eskiden "zamanında" görünüyordu. Artık gerçek
+    #     yapılma km'si esas alınır.
+    #
+    #     completed_km hâlâ boşsa (çok eski, geriye dönük doldurmanın da bir
+    #     kaynak bulamadığı kayıtlar) elimizdeki en iyi bilgi olan km_at_open'a
+    #     düşülür — bu satırlar paydadan DÜŞÜRÜLMEZ, aksi halde oran birkaç
+    #     kayıt üzerinden hesaplanıp yanıltıcı olurdu.
     #   - Süre bazlı planlarda: tamamlanma tarihi hedef tarihte veya
     #     ÖNCESİNDE ise zamanında sayılır (completed_at.date() <= target_date).
     #   - Periyodu belirsiz ("unknown") planlar değerlendirmeye alınmaz
@@ -2462,9 +2853,12 @@ def compute_kpi_report(
             if m.completed_at.date() <= m.target_date:
                 on_time_count += 1
         elif m.plan.plan_type == "km":
+            if m.target_km is None:
+                continue
             on_time_evaluated += 1
             window_lower, window_upper = plan_window(m.plan, m.target_km)
-            if window_lower <= m.km_at_open <= window_upper:
+            actual_km = m.completed_km if m.completed_km is not None else m.km_at_open
+            if window_lower <= actual_km <= window_upper:
                 on_time_count += 1
         # plan_type == "unknown": payda dışında bırakılır
     on_time_rate_pct = (

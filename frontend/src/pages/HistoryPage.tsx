@@ -4,13 +4,16 @@ import type { Maintenance, Plan, User, Vehicle } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Badge, EmptyState, SkeletonTableRows } from '../components/ui'
 import { ChevronRight, Download, ListFilter, History as HistoryIcon, Truck } from 'lucide-react'
-import { targetLabel, mergedPeriodLabel } from '../format'
+import { rawTargetLabel } from '../format'
 
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
-// Süre bazlı iş emirlerinde gerçek hedef target_date'dedir (target_km gizli/null).
-const hedefLabel = (m: Maintenance) => targetLabel(m.target_km, m.target_date, m.vehicle.model)
+// Kullanıcı isteği: Bakım Geçmişi tablosunda hedef HER ZAMAN tam km olarak
+// gösterilsin (Sirio kısa M/Y kodu KULLANILMASIN — ör. "1.500.000 km",
+// asla "150M"). Süre bazlı iş emirlerinde gerçek hedef target_date'dedir
+// (target_km gizli/null) — rawTargetLabel bunu zaten tarih olarak döner.
+const hedefLabel = (m: Maintenance) => rawTargetLabel(m.target_km, m.target_date)
 
-interface Filters {
+export interface HistoryFilters {
   status: string
   vehicle_id: string
   plan_id: string
@@ -19,9 +22,11 @@ interface Filters {
   date_to: string
   km_min: string
   km_max: string
+  // Araç tipi (Sirio / Bozankaya Tip-1 / Tip-2 vb.) — seçenekler /vehicle-models'den gelir.
+  vehicle_model: string
 }
 
-const EMPTY: Filters = {
+const EMPTY: HistoryFilters = {
   status: 'completed',
   vehicle_id: '',
   plan_id: '',
@@ -30,6 +35,7 @@ const EMPTY: Filters = {
   date_to: '',
   km_min: '',
   km_max: '',
+  vehicle_model: '',
 }
 
 /** Bakım Geçmişi (Faz 13-14): tamamlanan (veya seçilen durumdaki) bakımları
@@ -40,16 +46,30 @@ export default function HistoryPage({
   user,
   perms,
   onOpenMaintenance,
+  initialFilter,
+  initialPlanName,
 }: {
   user: User
   perms: Record<string, boolean>
   onOpenMaintenance: (id: number) => void
+  // Dashboard'daki "Tamamlanan (Bu Ay)" kartı gibi, bu sayfaya ÖNCEDEN
+  // filtrelenmiş (ör. bu ayın tarih aralığıyla) gelinmesi gerektiğinde
+  // kullanılır — aksi halde kart "3" gösterirken buraya girince filtresiz
+  // TÜM zamanların tamamlananları (çok daha fazla sayı) görünür ve iki
+  // sayı birbiriyle senkron olmazdı.
+  initialFilter?: Partial<HistoryFilters>
+  // Dashboard'daki periyot grafiğinin "Tamamlandı" barına tıklanınca —
+  // grafik yalnızca PLAN ADINI (plan_id değil) bilir, o yüzden isim burada
+  // plans listesi gelince plan_id'ye çevrilip filtreye uygulanır (bkz.
+  // MaintenancesPage.tsx'teki aynı desen).
+  initialPlanName?: string
 }) {
-  const [f, setF] = useState<Filters>(EMPTY)
+  const [f, setF] = useState<HistoryFilters>(() => ({ ...EMPTY, ...initialFilter }))
   const [list, setList] = useState<Maintenance[] | null>(null)
   const [vehicles, setVehicles] = useState<Vehicle[]>([])
   const [plans, setPlans] = useState<Plan[]>([])
   const [users, setUsers] = useState<User[]>([])
+  const [vehicleModels, setVehicleModels] = useState<string[]>([])
   const [exportError, setExportError] = useState('')
 
   const isAdmin = user.role === 'admin'
@@ -57,14 +77,23 @@ export default function HistoryPage({
   useEffect(() => {
     api<Vehicle[]>('/vehicles').then(setVehicles).catch(() => setVehicles([]))
     api<Plan[]>('/plans').then(setPlans).catch(() => setPlans([]))
+    api<string[]>('/vehicle-models').then(setVehicleModels).catch(() => setVehicleModels([]))
     if (isAdmin) api<User[]>('/users').then(setUsers).catch(() => setUsers([]))
   }, [isAdmin])
+
+  useEffect(() => {
+    if (!initialPlanName || plans.length === 0) return
+    const match = plans.find((p) => p.name === initialPlanName)
+    if (match) setF((prev) => ({ ...prev, plan_id: String(match.id) }))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plans, initialPlanName])
 
   const query = useMemo(() => {
     const p = new URLSearchParams()
     if (f.status) p.set('status', f.status)
     if (f.vehicle_id) p.set('vehicle_id', f.vehicle_id)
     if (f.plan_id) p.set('plan_id', f.plan_id)
+    if (f.vehicle_model) p.set('vehicle_model', f.vehicle_model)
     if (f.worked_by_id) p.set('worked_by_id', f.worked_by_id)
     if (f.km_min) p.set('km_min', f.km_min)
     if (f.km_max) p.set('km_max', f.km_max)
@@ -82,7 +111,7 @@ export default function HistoryPage({
 
   const rows = list ?? []
 
-  function set<K extends keyof Filters>(k: K, v: string) {
+  function set<K extends keyof HistoryFilters>(k: K, v: string) {
     setF((prev) => ({ ...prev, [k]: v }))
   }
 
@@ -97,7 +126,7 @@ export default function HistoryPage({
 
   const hasFilter =
     f.vehicle_id || f.plan_id || f.worked_by_id || f.date_from || f.date_to || f.km_min || f.km_max ||
-    f.status !== 'completed'
+    f.vehicle_model || f.status !== 'completed'
 
   return (
     <>
@@ -124,6 +153,12 @@ export default function HistoryPage({
             <option value="">Tüm Periyotlar</option>
             {plans.map((p) => (
               <option key={p.id} value={p.id}>{p.name}</option>
+            ))}
+          </select>
+          <select value={f.vehicle_model} onChange={(e) => set('vehicle_model', e.target.value)}>
+            <option value="">Tüm Araç Tipleri</option>
+            {vehicleModels.map((m) => (
+              <option key={m} value={m}>{m}</option>
             ))}
           </select>
           {isAdmin && (
@@ -173,7 +208,7 @@ export default function HistoryPage({
 
         {list === null && (
           <div className="table-scroll">
-            <table><tbody><SkeletonTableRows columns={6} /></tbody></table>
+            <table><tbody><SkeletonTableRows columns={7} /></tbody></table>
           </div>
         )}
 
@@ -196,6 +231,7 @@ export default function HistoryPage({
                   <th>Hedef</th>
                   <th>Durum</th>
                   <th>Bitiş</th>
+                  <th>Sapma %</th>
                   <th></th>
                 </tr>
               </thead>
@@ -206,10 +242,25 @@ export default function HistoryPage({
                       <span className="vehicle-code"><Truck size={13} style={{ verticalAlign: -2, marginRight: 4 }} />{m.vehicle.code}</span>
                     </td>
                     <td style={{ fontWeight: 600 }}>#{m.id}</td>
-                    <td>{mergedPeriodLabel(m.covered_tiers, m.plan.plan_type, m.vehicle.model, m.plan.name)}</td>
+                    {/* Kullanıcı isteği: tabloda TEK (yöneten) plan adı gösterilsin
+                        (ör. "800.000 km" ya da Sirio'da "6Y") — kademeli/kümülatif
+                        "+" listesi ("25.000 km + 50.000 km + ...") burada KARIŞIK
+                        görünüyordu; bu tam liste yalnızca Detay'a girince (iş emri
+                        detay sayfasındaki "Bu bakım şu periyotları birleştirir"
+                        bölümünde) gösterilir. */}
+                    <td>{m.plan.name}</td>
                     <td>{hedefLabel(m)}</td>
                     <td><Badge tone={m.status}>{STATUS_TR[m.status]}</Badge></td>
                     <td>{fmt(m.completed_at)}</td>
+                    <td>
+                      {m.km_deviation_pct != null ? (
+                        <Badge tone={m.km_deviation_pct >= -5 && m.km_deviation_pct <= 10 ? 'completed' : 'danger'}>
+                          {m.km_deviation_pct > 0 ? '+' : ''}{m.km_deviation_pct}%
+                        </Badge>
+                      ) : (
+                        <span className="muted">—</span>
+                      )}
+                    </td>
                     <td>
                       <button className="small primary" onClick={(e) => { e.stopPropagation(); onOpenMaintenance(m.id) }}>
                         Detay <ChevronRight size={12} style={{ verticalAlign: -1, marginLeft: 2 }} />

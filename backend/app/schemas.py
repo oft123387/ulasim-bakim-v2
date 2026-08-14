@@ -58,6 +58,14 @@ class ShiftOut(ORM):
     order_index: int
 
 
+class ShiftCreate(BaseModel):
+    name: str
+
+
+class ShiftUpdate(BaseModel):
+    name: str
+
+
 class ShiftModeConfig(BaseModel):
     enabled: bool
 
@@ -305,6 +313,29 @@ class AttachmentLinkBody(BaseModel):
     url: str = Field(min_length=1, max_length=600)
 
 
+# ---------- Bakım Bilgi Bankası (Faz 27) ----------
+class NodeKbNoteBody(BaseModel):
+    """Bir bakım ağacı maddesinin bilgi/talimat metni (yalnızca açıklama —
+    maddenin adı/konumu bu uçtan değiştirilemez)."""
+
+    note: str = Field(default="", max_length=20000)
+
+
+class KnowledgeHitOut(BaseModel):
+    """Bilgi bankası arama sonucu — maddenin kendisi + ağaçtaki yolu."""
+
+    id: int
+    name: str
+    card_code: str = ""
+    note: str = ""
+    # Kökten maddeye kadar isim listesi, ör. ["Gövde", "Fren", "Balata"].
+    path: list[str] = []
+    plan_id: int | None = None
+    plan_name: str = ""
+    attachment_count: int = 0
+    has_video: bool = False
+
+
 # ---------- Parça Bilgi Bankası ----------
 class PartCatalogAttachmentOut(ORM):
     id: int
@@ -533,6 +564,9 @@ class ItemOut(ORM):
     completed_by: UserOut | None
     note: str = ""  # Faz 10: bağlı şablon maddesinin açıklaması
     card_code: str = ""  # bağlı şablon maddesinin "KART KODU"su (varsa)
+    # Faz 27: bu maddenin kopyalandığı şablon düğümü (TreeNode) — bakım
+    # sırasındaki "Bilgi" düğmesi Bakım Bilgi Bankası'nda bu düğümü açar.
+    source_node_id: int | None = None
     attachments: list[NodeAttachmentOut] = []  # Faz 10: bağlı ekler
     # Faz 21 — usta/mühendis/amirin bakım SIRASINDA bu maddeye eklediği
     # fotoğraflar (şablon ekinden bağımsız, bkz. models.ItemExecAttachment).
@@ -561,6 +595,9 @@ class MaintenanceOut(ORM):
     vehicle: VehicleOut
     plan: PlanOut
     assigned_to: UserOut | None
+    # İş emrinin atandığı vardiya (kişiden bağımsız) — bkz. models.Maintenance
+    # assigned_shift_id yorumu.
+    assigned_shift: ShiftOut | None = None
     # Faz 26 — Bakım başlatma onayı
     is_activated: bool = True
     activated_at: datetime | None = None
@@ -568,6 +605,9 @@ class MaintenanceOut(ORM):
     # "Başlat" derken ileri bir tarih seçildiyse dolu — o tarihte otomatik
     # başlatılır (bkz. services.run_scheduled_maintenance_starts).
     scheduled_start_at: date | None = None
+    # Kullanıcı Takvim'de iş emrini elle bir güne sürüklediyse o gün; boşsa
+    # takvim aracın hedef km'ye ulaşacağı tahmini günü kullanır.
+    planned_date: date | None = None
     # Bu bakımın kapsadığı tüm periyotlar (km planlarında interval_km, süre
     # planlarında interval_months), artan sıralı. Kademeli/kümülatif bir
     # bakımda birden fazla eleman olur (ör. [10000, 30000] — 1M+3M birleşik);
@@ -577,6 +617,15 @@ class MaintenanceOut(ORM):
     # daha küçük periyotları da kapsadığını gizlediği bir hatayı düzeltmek
     # için bunu kullanır (frontend format.ts:mergedPeriodLabel).
     covered_tiers: list[int] = []
+    # Bakım yapılırken usta/teknisyenin girdiği GÜNCEL km — bkz.
+    # models.Maintenance.completed_km yorumu ve PATCH
+    # /maintenances/{id}/completed-km.
+    completed_km: int | None = None
+    # completed_km'nin target_km'den, planın periyoduna oranlı sapma yüzdesi
+    # (bkz. services.compute_km_deviation_pct) — Bakım Geçmişi sayfası ve
+    # Excel/CSV/PDF/Word dışa aktarımlarında "Sapma %" olarak gösterilir.
+    # Yalnızca km bazlı planlarda VE completed_km girilmişse doludur.
+    km_deviation_pct: float | None = None
 
     @model_validator(mode="after")
     def _hide_time_sentinel(self):
@@ -588,6 +637,24 @@ class MaintenanceOut(ORM):
             self.target_km = None
         return self
 
+    @model_validator(mode="after")
+    def _compute_km_deviation(self):
+        """Yukarıdaki _hide_time_sentinel'den SONRA çalışır ama bu, km bazlı
+        planlar için sonucu etkilemez (target_km yalnızca süre bazlı
+        planlarda temizlenir, orada zaten plan.plan_type != "km" olduğu için
+        services.compute_km_deviation_pct erkenden None döner)."""
+        # Döngüsel import'u önlemek için burada import edilir (bkz.
+        # excel_utils.py'deki aynı desen — services modülü şemaları import
+        # etmez ama main.py hem services hem schemas'ı içe aktardığından
+        # modül seviyesinde import etmek yerine burada, ihtiyaç anında
+        # yapılır).
+        from . import services
+
+        self.km_deviation_pct = services.compute_km_deviation_pct(
+            self.completed_km, self.target_km, self.plan.interval_km, self.plan.plan_type,
+        )
+        return self
+
 
 class MaintenanceStartIn(BaseModel):
     """POST /api/maintenances/{id}/start gövdesi. scheduled_start_at boş
@@ -595,6 +662,24 @@ class MaintenanceStartIn(BaseModel):
     başlatmadır; bugünden ileri bir tarihse iş emri o tarihe kadar
     zamanlanır, otomatik olarak o gün başlatılır."""
     scheduled_start_at: date | None = None
+
+
+class MaintenancePlannedDateIn(BaseModel):
+    """PATCH /api/maintenances/{id}/planned-date gövdesi. Takvim'de iş emri
+    elle bir güne sürüklendiğinde o gün gönderilir; null gönderilirse elle
+    planlama kaldırılır ve iş emri yeniden tahmini (hedef km) gününe döner."""
+    planned_date: date | None = None
+
+
+class MaintenancePlanUpcomingIn(BaseModel):
+    """Araçlar/Bakımlar akışındaki bir yaklaşan bakımı planlama kuyruğuna alır.
+
+    İstemci yalnızca araç ve hedef kilometreyi gönderir. Sunucu, o hedefe
+    bölünen planlar arasından yönetici periyodu seçerek kademeli checklist'i
+    tek iş emrinde oluşturur.
+    """
+    vehicle_id: int
+    target_km: int = Field(gt=0)
 
 
 class NoteOut(ORM):
@@ -629,6 +714,19 @@ class MaintenanceManualCreate(BaseModel):
 
 class AssignBody(BaseModel):
     assigned_to_id: int | None
+
+
+class AssignShiftBody(BaseModel):
+    """PATCH /api/maintenances/{id}/assign-shift gövdesi — Atanan (kişi)
+    dropdown'undan bağımsız, iş emrini bir vardiyaya atar/vardiyadan çıkarır."""
+    assigned_shift_id: int | None
+
+
+class MaintenanceCompletedKmIn(BaseModel):
+    """PATCH /api/maintenances/{id}/completed-km gövdesi — bakım yapılırken
+    usta/teknisyenin girdiği GÜNCEL km (bkz. models.Maintenance.completed_km
+    yorumu)."""
+    completed_km: int = Field(gt=0)
 
 
 class ItemNoteBody(BaseModel):
@@ -673,16 +771,45 @@ class UpcomingItem(BaseModel):
     # services._classify_upcoming_status): "yaklasiyor" | "planlanacak" |
     # "planlandi" | "gecikti" | None (henüz hiçbir uyarı yok).
     status: str | None = None
+    # Yalnızca maintenance_id doluysa (gerçekten açılmış bir iş emri) anlamlı
+    # — Bakımlar sayfasının Bakım Akışı tablosunda vardiyaya göre filtreleme/
+    # gösterim için (bkz. models.Maintenance.assigned_shift_id).
+    assigned_shift_id: int | None = None
+    assigned_shift_name: str | None = None
+    # Henüz başlatılmamış (is_activated=False) ama admin/mühendis "Başlat"
+    # derken ileri bir tarih seçtiyse dolu — o tarihte arka plan
+    # zamanlayıcısı tarafından otomatik başlatılır (bkz.
+    # services.schedule_maintenance_start/run_scheduled_maintenance_starts).
+    # maintenance_id bu durumda hâlâ None'dır (bkz. yukarıdaki alan
+    # açıklaması — henüz açılmamış gibi davranılır) ama arayüz bu alanla
+    # "Zamanlandı: X" rozetini gösterip "Zamanlamayı İptal Et" seçeneği
+    # sunabilir (POST /maintenances/plan-upcoming aynı adaya idempotent
+    # şekilde döner, ardından POST /maintenances/{id}/cancel-schedule
+    # çağrılabilir).
+    scheduled_start_at: date | None = None
+    # Takvim sayfasındaki tek-takvim sürükle-bırak yeniden zamanlama için:
+    # bu hedefin planın kendi threshold_type ayarına göre GERÇEK tolerans
+    # penceresi (günlük ortalama km/aylık takvim varsayımıyla takvim
+    # tarihine çevrilmiş) — bkz. services.compute_upcoming_maintenances /
+    # compute_upcoming_time_maintenances. Bir öğe bu iki tarihin DIŞINA
+    # sürüklenemez.
+    window_lower_date: date | None = None
+    window_upper_date: date | None = None
 
 
 class CalendarProjectionItem(BaseModel):
     """Takvim görünümü — bir aracın bir sonraki bakım hedefine ait -%5/+%10
     önizleme penceresinin, günlük ortalama km varsayımıyla hesaplanmış
-    takvim tarihi aralığı."""
+    takvim tarihi aralığı. Süre bazlı (aylık/yıllık) planlarda target_km
+    dahili bir sentinel değerdir (bkz. models.Maintenance yorumu) — gerçek
+    hedef her zaman target_date'tedir, arayüz target_date doluysa onu
+    kullanmalıdır (UpcomingItem ile aynı sözleşme, bkz. format.ts targetLabel)."""
 
     vehicle: VehicleOut
     plan_name: str
     target_km: int
+    # Yalnızca süre bazlı (plan.plan_type=="time") projeksiyonlarda dolu.
+    target_date: date | None = None
     remaining_km: int
     covered_tiers: list[int] = []
     window_start: str
@@ -919,60 +1046,6 @@ class SearchResults(BaseModel):
     documents: list[SearchHit] = []
 
 
-# ---------- Canlı Alarm Merkezi ----------
-class AlarmStateOut(ORM):
-    id: int
-    priority: str
-    acknowledged: bool = False
-    acknowledged_by: UserOut | None = None
-    acknowledged_at: datetime | None = None
-    assigned_to: UserOut | None = None
-    resolved: bool = False
-    resolved_at: datetime | None = None
-    closed: bool = False
-    closed_at: datetime | None = None
-
-
-class AlarmStateUpdate(BaseModel):
-    """Kısmi güncelleme — yalnızca gönderilen alanlar değiştirilir."""
-
-    priority: str | None = None  # low | normal | high | critical
-    assigned_to_id: int | None = None
-    acknowledged: bool | None = None
-    resolved: bool | None = None
-    closed: bool | None = None
-
-
-class AlarmItem(BaseModel):
-    """Bir aracın yaklaşan/geciken bakımı. level:
-    * 'critical' (Kritik/Kırmızı) — hedef km geçilmiş (bakım gecikti) veya
-      kalan km/gün çok kritik eşiğin altında.
-    * 'warning' (Uyarı/Turuncu) — ~14 günden az kaldı.
-    * 'normal' (Normal/Yeşil) — bakım önizleme penceresinde, yaklaşıyor."""
-
-    level: str
-    vehicle: VehicleOut
-    plan_name: str
-    target_km: int = 0
-    remaining_km: int = 0
-    target_date: date | None = None
-    estimated_days: int | None = None
-    overdue: bool = False
-    # İş emri zaten açıldıysa: bakım id'si ve açılışından bu yana geçen gün.
-    maintenance_id: int | None = None
-    age_days: int | None = None
-    message: str = ""
-    # Faz 22 — Kritiklik/Severity/Priority + Acknowledged/Assigned/Resolved/Closed
-    state: AlarmStateOut | None = None
-
-
-class AlarmCenter(BaseModel):
-    critical: int
-    warning: int
-    normal: int
-    items: list[AlarmItem] = []
-
-
 # ---------- Bildirim Merkezi ----------
 class NotificationOut(BaseModel):
     """Bildirim akışı öğesi. Çoğu, değiştirilemez işlem kaydından (AuditLog)
@@ -997,20 +1070,22 @@ class SuggestionOut(ORM):
     vehicle_model: str = ""
     plan: PlanOut | None = None
     text: str
-    # pending | pending_engineer | rejected | approved | added — bkz.
-    # models.Suggestion docstring'i.
+    # pending | rejected | approved. ('pending_engineer' ve 'added' yalnızca
+    # Faz 30'daki iki aşamalı zincirden kalan ESKİ kayıtlarda görülebilir —
+    # yeni önerilerde üretilmez, bkz. migrate.py.)
     status: str
     admin_note: str = ""
     created_by: UserOut | None = None
     created_at: datetime
     reviewed_by: UserOut | None = None
     reviewed_at: datetime | None = None
-    # 1. aşama — amir
+    # Faz 30'un iki aşamalı zincirinden kalan alanlar. Zincir kaldırıldı;
+    # bunlar artık yalnızca "kim karar verdi" bilgisini ve eski kayıtların
+    # geçmişini taşır (bkz. services.apply_suggestion_review).
     amir_status: str = "pending"
     amir_reviewed_by: UserOut | None = None
     amir_reviewed_at: datetime | None = None
     amir_note: str = ""
-    # 2. aşama — mühendis
     engineer_status: str = "pending"
     engineer_reviewed_by: UserOut | None = None
     engineer_reviewed_at: datetime | None = None
@@ -1026,8 +1101,10 @@ class SuggestionCreate(BaseModel):
 
 
 class SuggestionReviewBody(BaseModel):
-    # 'added' yalnızca mühendis aşamasında geçerlidir (uç noktada denetlenir).
-    status: str = Field(pattern="^(approved|rejected|added)$")
+    # Faz 31: onay tek aşamalı — yalnızca onayla/reddet. Eski 'added'
+    # ("Bakım ağacına eklendi") kararı kaldırıldı; ağaç düzenlemesi
+    # önerinin onaylanmasından ayrı, bilinçli bir işlemdir.
+    status: str = Field(pattern="^(approved|rejected)$")
     admin_note: str = Field(default="", max_length=2000)
 
 
@@ -1053,10 +1130,12 @@ class KPICompletionOut(BaseModel):
     completion_rate_pct: float
     completed_in_range: int
     avg_completion_days: float | None = None
-    # Zamanında tamamlanan bakım oranı — bkz. services.compute_kpi_report
-    # docstring'i (km bazlı planlarda km_at_open<=target_km, süre bazlı
-    # planlarda completed_at<=target_date ölçütü kullanılır; periyodu
-    # belirsiz planlar payda dışında bırakılır).
+    # Zamanında tamamlanan bakım oranı — yalnızca TAMAMLANMIŞ iş emirleri
+    # üzerinden. Km bazlı planlarda bakımın gerçekten yapıldığı km
+    # (completed_km) planın tolerans penceresi içinde mi, süre bazlı
+    # planlarda completed_at <= target_date mi diye bakılır; periyodu
+    # belirsiz planlar payda dışında bırakılır (bkz. services.
+    # compute_kpi_report).
     on_time_count: int = 0
     on_time_evaluated: int = 0
     on_time_rate_pct: float | None = None
