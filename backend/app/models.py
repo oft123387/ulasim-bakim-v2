@@ -2,12 +2,14 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Column,
     Date,
     DateTime,
     Float,
     ForeignKey,
     Integer,
     String,
+    Table,
     Text,
     UniqueConstraint,
 )
@@ -423,6 +425,33 @@ class Maintenance(Base):
     )
 
 
+# Bir bakım maddesini FİİLEN yapan kişiler (çoklu). completed_by_id "tikleyen
+# / kayda geçiren" tek kişiyi tutar (geriye dönük uyumluluk ve mevcut KPI
+# hesapları bunu kullanır); bu tablo ise "bu maddede kimler çalıştı"
+# sorusunun cevabıdır — vardiyada birden fazla kişi aynı maddede çalışabildiği
+# için tikleme sırasında hepsi işaretlenebilir. Kullanıcı isteği: "vardiyaya
+# kişi ekleyince tiklerken vardiyadaki kişilerden hangilerinin yaptığı
+# seçilebilsin."
+#
+# Madde silinince (bakım silinince CASCADE ile) ve kullanıcı silinince satır
+# otomatik düşer — SQLite'ta bunun çalışması için PRAGMA foreign_keys=ON
+# gerekir, database.py her bağlantıda bunu açıyor.
+maintenance_item_workers = Table(
+    "maintenance_item_workers",
+    Base.metadata,
+    Column(
+        "item_id",
+        ForeignKey("maintenance_items.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "user_id",
+        ForeignKey("users.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
 class MaintenanceItem(Base):
     """Bakım açıldığında şablondan kopyalanan ağaç (snapshot).
 
@@ -466,6 +495,15 @@ class MaintenanceItem(Base):
     maintenance = relationship("Maintenance", back_populates="items")
     completed_by = relationship("User", foreign_keys=[completed_by_id])
     exec_note_by = relationship("User", foreign_keys=[exec_note_by_id])
+    # Bu maddede fiilen çalışan kişiler (bkz. maintenance_item_workers).
+    # Boş olması eski kayıtlar için normaldir — o durumda completed_by tek
+    # başına "yapan kişi" olarak gösterilir.
+    workers = relationship(
+        "User",
+        secondary=maintenance_item_workers,
+        lazy="selectin",
+        order_by="User.full_name",
+    )
 
 
 class ItemExecAttachment(Base):

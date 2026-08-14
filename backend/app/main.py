@@ -3890,15 +3890,31 @@ def complete_item(
         if not completed_by or not completed_by.is_active:
             raise HTTPException(400, "Geçersiz kullanıcı seçimi")
 
+    # Maddede fiilen çalışan kişiler (çoklu seçim). Aynı kişi iki kez
+    # gönderilirse tekilleştirilir; sıra kullanıcının seçtiği sırayla korunur
+    # (ilk seçilen, completed_by verilmediğinde "tikleyen" olur).
+    workers: list[models.User] = []
+    if body and body.worker_ids:
+        seen: set[int] = set()
+        for uid in body.worker_ids:
+            if uid in seen:
+                continue
+            seen.add(uid)
+            u = db.get(models.User, uid)
+            if not u or not u.is_active:
+                raise HTTPException(400, "Geçersiz kullanıcı seçimi")
+            workers.append(u)
+
     item_name = item.name
     try:
-        services.complete_item(db, item, user, completed_by=completed_by)
+        services.complete_item(db, item, user, completed_by=completed_by, workers=workers)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    attributed_to = completed_by or user
+    attributed_to = completed_by or (workers[0] if workers else None) or user
+    who = ", ".join(w.full_name for w in workers) if workers else attributed_to.full_name
     services.log_action(
         db, user, "complete", "item", item_id,
-        f"Madde tamamlandı: {item_name} — {attributed_to.full_name}",
+        f"Madde tamamlandı: {item_name} — {who}",
         detail=f"İş Emri #{m.id} ({m.vehicle.code} — {m.plan.name})",
     )
     if m.status == "completed":

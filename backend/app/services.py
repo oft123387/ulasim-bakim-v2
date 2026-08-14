@@ -1767,13 +1767,20 @@ def complete_item(
     item: models.MaintenanceItem,
     user: models.User,
     completed_by: models.User | None = None,
+    workers: list[models.User] | None = None,
 ) -> None:
     """En alt seviye maddeyi işaretler; üst düğümleri otomatik tamamlar.
 
     Paylaşılan tablet senaryosunda (tek oturum, çoklu usta) `completed_by`
     verilirse tamamlama bu kullanıcıya atfedilir; verilmezse oturum sahibi
     (`user`) kullanılır. Madde tamamlanınca kilitlendiği için bu atıf
-    sonradan değiştirilemez."""
+    sonradan değiştirilemez.
+
+    `workers` verilirse (vardiyada bu maddede fiilen çalışan kişiler, çoklu)
+    madde-kişi ilişkisi de kaydedilir. `completed_by` ayrıca belirtilmemişse
+    listedeki ilk kişi tikleyen olarak yazılır; böylece completed_by_id
+    üzerinden çalışan mevcut KPI/rapor hesapları bozulmadan çalışmaya devam
+    eder."""
     if item.is_locked:
         raise ValueError("Bu madde kilitli, değiştirilemez")
     if _has_children(db, item):
@@ -1781,7 +1788,8 @@ def complete_item(
 
     item.is_completed = True
     item.is_locked = True
-    item.completed_by_id = (completed_by or user).id
+    item.completed_by_id = (completed_by or (workers[0] if workers else None) or user).id
+    item.workers = list(workers or [])
     item.completed_at = datetime.now()
     _adjust_stock_for_node(db, item.source_node_id, -1)
 
@@ -2098,6 +2106,7 @@ def unlock_item(db: Session, item: models.MaintenanceItem) -> None:
         parent.is_locked = False
         parent.completed_at = None
         parent.completed_by_id = None
+        parent.workers = []
         parent_id = parent.parent_id
     m = item.maintenance
     if m.status == "completed":
@@ -2116,6 +2125,9 @@ def _reset_subtree(db: Session, item: models.MaintenanceItem) -> None:
     item.is_locked = False
     item.completed_at = None
     item.completed_by_id = None
+    # Madde sıfırlanınca "kimler yaptı" kaydı da düşer; yeniden tiklendiğinde
+    # kişiler baştan seçilir.
+    item.workers = []
     for child in db.query(models.MaintenanceItem).filter_by(parent_id=item.id).all():
         _reset_subtree(db, child)
 

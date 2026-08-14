@@ -147,6 +147,9 @@ export interface Item {
   is_locked: boolean
   completed_at: string | null
   completed_by: User | null
+  // Maddede fiilen çalışan kişiler (çoklu). Eski kayıtlarda boş dizidir; o
+  // durumda arayüz completed_by'ı tek başına gösterir.
+  workers: User[]
   note: string
   card_code: string
   // Faz 27: bu maddenin kopyalandığı bakım ağacı düğümü — "Bilgi" düğmesi

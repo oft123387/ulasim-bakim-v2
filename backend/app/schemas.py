@@ -562,6 +562,9 @@ class ItemOut(ORM):
     is_locked: bool
     completed_at: datetime | None
     completed_by: UserOut | None
+    # Maddede FİİLEN çalışan kişiler (çoklu, bkz. models.maintenance_item_workers).
+    # Eski kayıtlarda boştur; o durumda arayüz completed_by'ı tek başına gösterir.
+    workers: list[UserOut] = []
     note: str = ""  # Faz 10: bağlı şablon maddesinin açıklaması
     card_code: str = ""  # bağlı şablon maddesinin "KART KODU"su (varsa)
     # Faz 27: bu maddenin kopyalandığı şablon düğümü (TreeNode) — bakım
@@ -743,6 +746,13 @@ class CompleteItemBody(BaseModel):
     # değiştirilemez (yalnızca yetkili biri kilidi açıp sıfırlarsa yeniden
     # seçilebilir).
     completed_by_id: int | None = None
+    # Maddede fiilen çalışan kişiler (çoklu seçim). Vardiyada birden fazla
+    # kişi aynı maddede çalışabildiği için tikleme sırasında hepsi
+    # işaretlenebilir. Boş bırakılırsa yalnızca completed_by kaydedilir
+    # (eski davranış). Liste verilirse ve completed_by_id boşsa, listedeki
+    # ilk kişi "tikleyen" olarak da yazılır — mevcut KPI/rapor hesapları
+    # completed_by_id üzerinden çalıştığı için bu alan hiç boş kalmaz.
+    worker_ids: list[int] = Field(default_factory=list, max_length=50)
 
 
 # ---------- Dashboard ----------

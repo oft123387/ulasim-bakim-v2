@@ -325,12 +325,24 @@ function TreeItem({
             <AlertTriangle size={12} /> Not var
           </span>
         )}
-        {item.completed_by && (
+        {/* Maddede birden fazla kişi çalıştıysa hepsi gösterilir; eski
+            kayıtlarda workers boş olduğu için completed_by'a düşülür. */}
+        {item.workers && item.workers.length > 0 ? (
+          <span className="who" title={`${item.workers.map((w) => w.full_name).join(', ')} · ${fmt(item.completed_at)}`}>
+            {item.workers.slice(0, 3).map((w) => (
+              <Avatar key={w.id} name={w.full_name} size={20} />
+            ))}
+            {item.workers.length === 1
+              ? item.workers[0].full_name
+              : `${item.workers[0].full_name} +${item.workers.length - 1}`}
+            {' · '}{fmt(item.completed_at)}
+          </span>
+        ) : item.completed_by ? (
           <span className="who">
             <Avatar name={item.completed_by.full_name} size={20} />
             {item.completed_by.full_name} · {fmt(item.completed_at)}
           </span>
-        )}
+        ) : null}
         {isLeaf && item.is_completed && !item.completed_by && (
           <span className="who muted" title="Bu madde zorunlu değil işaretlendiği için bakım açılırken otomatik tiklendi">
             Otomatik (zorunlu değil)
@@ -647,6 +659,14 @@ function MaintenanceDetail({
   // ayrı tutulur — "Atanan" (iş emri sorumlusu) dropdown'u vardiyadan
   // bağımsız olarak her zaman herkesi gösterir).
   const [pickerUsers, setPickerUsers] = useState<User[]>([])
+  // Madde tiklenirken açılan "bu maddede kimler çalıştı?" penceresi.
+  // workerPickItemId null ise pencere kapalıdır.
+  const [workerPickItemId, setWorkerPickItemId] = useState<number | null>(null)
+  const [workerPickIds, setWorkerPickIds] = useState<number[]>([])
+  const [workerPickBusy, setWorkerPickBusy] = useState(false)
+  // Arka arkaya tiklerken genelde aynı ekip çalışır — son seçim hatırlanır ve
+  // bir sonraki pencerede ön işaretli gelir (kullanıcı değiştirebilir).
+  const [lastWorkerIds, setLastWorkerIds] = useState<number[]>([])
   const [noteText, setNoteText] = useState('')
   const [noteAuthorId, setNoteAuthorId] = useState<number | ''>('')
   const [noteBusy, setNoteBusy] = useState(false)
@@ -746,19 +766,53 @@ function MaintenanceDetail({
     }
   }
 
-  // Kullanıcı isteği: vardiya atandıktan sonra da madde tamamlama "kim
-  // tikledi" seçicisi göstermesin — artık herkes kendi hesabıyla giriş
-  // yaptığı için doğrudan oturum sahibine (user) atfedilir, tıpkı vardiyalı
-  // çalışma kapalıyken olduğu gibi (backend zaten completed_by_id
-  // verilmezse oturum sahibini kullanır).
-  async function requestComplete(itemId: number) {
+  // Kullanıcı isteği: "vardiyaya kişi ekleyince, tiklerken vardiyadaki
+  // kişilerden hangilerinin yaptığı seçilebilsin." Vardiyalı çalışma AÇIK ve
+  // seçilebilecek kişi varsa tik doğrudan kaydedilmez; önce çoklu seçim
+  // penceresi açılır (her madde için ayrı ayrı — aynı maddede birden fazla
+  // kişi çalışmış olabilir). Vardiyalı çalışma kapalıyken eski davranış
+  // korunur: doğrudan oturum sahibine atfedilir.
+  const workerPickerEnabled = shiftModeEnabled && pickerUsers.length > 0
+
+  function requestComplete(itemId: number) {
     setError('')
+    if (!workerPickerEnabled) {
+      void submitComplete(itemId, [])
+      return
+    }
+    // Aynı vardiyada arka arkaya tiklerken çoğunlukla aynı ekip çalışır —
+    // son seçim ön işaretli gelir, kullanıcı gerekirse değiştirir.
+    setWorkerPickIds(lastWorkerIds.filter((wid) => pickerUsers.some((u) => u.id === wid)))
+    setWorkerPickItemId(itemId)
+  }
+
+  async function submitComplete(itemId: number, workerIds: number[]) {
     try {
-      await api(`/items/${itemId}/complete`, { method: 'POST' })
+      await api(`/items/${itemId}/complete`, {
+        method: 'POST',
+        body: workerIds.length ? { worker_ids: workerIds } : {},
+      })
       load()
       showToast('✓ Kaydedildi')
     } catch (e) {
       setError((e as Error).message)
+    }
+  }
+
+  async function confirmWorkerPick() {
+    if (workerPickItemId === null) return
+    if (workerPickIds.length === 0) {
+      setError('En az bir kişi seçin')
+      return
+    }
+    setWorkerPickBusy(true)
+    setError('')
+    try {
+      await submitComplete(workerPickItemId, workerPickIds)
+      setLastWorkerIds(workerPickIds)
+      setWorkerPickItemId(null)
+    } finally {
+      setWorkerPickBusy(false)
     }
   }
 
@@ -1421,6 +1475,80 @@ function MaintenanceDetail({
                 onClick={saveItemNote}
               >
                 Kaydet
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Madde tiklenirken "bu maddede kimler çalıştı?" — vardiyadaki
+          kişilerden bir veya birkaçı işaretlenir. Yalnızca vardiyalı çalışma
+          açıkken ve vardiyada kişi varken görünür. */}
+      {workerPickItemId !== null && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
+          }}
+          onClick={() => !workerPickBusy && setWorkerPickItemId(null)}
+        >
+          <div
+            className="card"
+            style={{ width: 380, maxWidth: '90vw' }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Users size={15} /> Bu maddeyi kimler yaptı?
+            </h3>
+            <div className="muted" style={{ fontSize: 12.5, marginBottom: 10 }}>
+              {(() => {
+                const it = m ? findItemById(m.items ?? [], workerPickItemId) : null
+                return it ? it.name : 'Madde'
+              })()}
+              {' — '}vardiyada çalışan kişilerden bu maddede görev alanları işaretleyin.
+              Birden fazla kişi seçebilirsiniz.
+            </div>
+            <div style={{ maxHeight: '45vh', overflowY: 'auto', marginBottom: 4 }}>
+              {pickerUsers.map((u) => {
+                const checked = workerPickIds.includes(u.id)
+                return (
+                  <label
+                    key={u.id}
+                    className="row"
+                    style={{
+                      gap: 8, alignItems: 'center', padding: '7px 6px', cursor: 'pointer',
+                      borderRadius: 6, background: checked ? 'rgba(37, 99, 235, 0.08)' : 'transparent',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={workerPickBusy}
+                      onChange={() =>
+                        setWorkerPickIds((prev) =>
+                          prev.includes(u.id) ? prev.filter((x) => x !== u.id) : [...prev, u.id],
+                        )
+                      }
+                    />
+                    <Avatar name={u.full_name} size={22} />
+                    <span style={{ fontSize: 13 }}>{u.full_name}</span>
+                  </label>
+                )
+              })}
+            </div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              {workerPickIds.length} kişi seçildi
+            </div>
+            <div className="row" style={{ marginTop: 14, gap: 8, justifyContent: 'flex-end' }}>
+              <button className="ghost" disabled={workerPickBusy} onClick={() => setWorkerPickItemId(null)}>
+                Vazgeç
+              </button>
+              <button
+                className="primary"
+                disabled={workerPickBusy || workerPickIds.length === 0}
+                onClick={confirmWorkerPick}
+              >
+                Tamamla
               </button>
             </div>
           </div>
