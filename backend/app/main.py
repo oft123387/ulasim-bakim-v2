@@ -886,6 +886,13 @@ def merge_vehicle_models(
     return schemas.VehicleModelMergeResult(**result)
 
 
+# Dashboard'daki "Zamanı Gelen ve Yaklaşan Bakımlar" tablosuna gönderilen en
+# fazla satır sayısı (hem açık iş emirleri hem yaklaşanlar için ayrı ayrı).
+# Arayüz bunun ilk 10'unu gösterir, gerisini "Daha fazlasını gör" ile açar
+# (bkz. DashboardPage.tsx → DUE_TABLE_LIMIT).
+DASHBOARD_DUE_MAX = 50
+
+
 def _compute_upcoming_merged(
     db: Session,
     vehicles: list[models.Vehicle] | None = None,
@@ -4902,11 +4909,15 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     # için kullanılan sabit bir önizleme aralığıdır. Mantık services.py'de
     # tek yerde tutulur (Araçlar sayfasındaki kırmızı vurgulama da aynı
     # fonksiyonu kullanır).
+    # Arayüz bu listeyi ilk bakışta 10 satırla sınırlar ve gerisini "Daha
+    # fazlasını gör" ile açar (bkz. DashboardPage.tsx → DUE_TABLE_LIMIT), bu
+    # yüzden burada 8 değil daha geniş bir üst sınır gönderilir. Sınır tamamen
+    # kaldırılmaz — çok araçlı kurulumlarda dashboard yanıtı gereksiz büyümesin.
     vehicles = db.query(models.Vehicle).all()
     plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
     upcoming = [
         schemas.UpcomingItem(**item)
-        for item in _compute_upcoming_merged(db, vehicles, plans, limit=8)
+        for item in _compute_upcoming_merged(db, vehicles, plans, limit=DASHBOARD_DUE_MAX)
     ]
 
     # Zamanı gelmiş (açılmış ama henüz başlanmamış = Bekliyor) bakımlar.
@@ -4975,7 +4986,7 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
             return (0, u.remaining_km)  # en negatif (en çok geciken) başa
         return (1, u.estimated_days if u.estimated_days is not None else u.remaining_km)
 
-    due_now = sorted((_due_item(dm) for dm in due_rows), key=_due_priority)[:8]
+    due_now = sorted((_due_item(dm) for dm in due_rows), key=_due_priority)[:DASHBOARD_DUE_MAX]
 
     # Yalnızca Bakım Planları sayfasında (GET /api/plans, varsayılan) GERÇEKTEN
     # görünen bir plana bağlı tamamlanan bakımlar gösterilir — o sayfa hem

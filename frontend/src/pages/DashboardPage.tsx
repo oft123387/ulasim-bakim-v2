@@ -57,6 +57,10 @@ const STATUS_BY_BAR_KEY: Record<string, string> = {
   'Tamamlandı': 'completed',
 }
 
+// "Zamanı Gelen ve Yaklaşan Bakımlar" tablosunda ilk bakışta gösterilen en
+// fazla satır (araç) sayısı — fazlası "Daha fazlasını gör" ile açılır.
+const DUE_TABLE_LIMIT = 10
+
 export default function DashboardPage({
   user,
   perms,
@@ -86,6 +90,9 @@ export default function DashboardPage({
   onGoToHistoryForPlan?: (planName: string) => void
 }) {
   const [data, setData] = useState<Dashboard | null>(null)
+  // "Zamanı Gelen ve Yaklaşan Bakımlar" tablosunda tüm satırlar mı görünsün
+  // (varsayılan: yalnızca ilk DUE_TABLE_LIMIT satır).
+  const [showAllDue, setShowAllDue] = useState(false)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const dueTableRef = useRef<HTMLDivElement>(null)
 
@@ -222,6 +229,18 @@ export default function DashboardPage({
   function scrollToDueTable() {
     dueTableRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
+
+  // "Zamanı Gelen ve Yaklaşan Bakımlar" tablosu varsayılan olarak en fazla
+  // DUE_TABLE_LIMIT satır gösterir; gerisi "Daha fazlasını gör" ile açılır.
+  // Sıra korunur: önce açık iş emirleri (öncelik sırasında, bkz. backend
+  // dashboard() → due_now), ardından yaklaşanlar.
+  const dueRows = data.due_now ?? []
+  const upcomingRows = data.upcoming ?? []
+  const totalDueRows = dueRows.length + upcomingRows.length
+  const visibleDueRows = showAllDue ? dueRows : dueRows.slice(0, DUE_TABLE_LIMIT)
+  const visibleUpcomingRows = showAllDue
+    ? upcomingRows
+    : upcomingRows.slice(0, Math.max(0, DUE_TABLE_LIMIT - visibleDueRows.length))
 
   // perms verilmemişse (ör. eski bir çağıran) ya da anahtar henüz gelmediyse
   // varsayılan olarak GÖRÜNÜR kalır — mevcut davranışı bozmaz.
@@ -465,7 +484,7 @@ export default function DashboardPage({
               <AlertTriangle size={14} color="var(--amber)" /> Zamanı Gelen ve Yaklaşan Bakımlar
             </div>
           </div>
-          {(data.due_now?.length ?? 0) === 0 && data.upcoming.length === 0 ? (
+          {totalDueRows === 0 ? (
             <EmptyState title="Zamanı gelen veya yaklaşan bakım yok" description="Tüm araçlar hedef kilometrelerinden uzakta." />
           ) : (
             <div className="table-scroll">
@@ -479,7 +498,7 @@ export default function DashboardPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {(data.due_now ?? []).map((u, i) => (
+                  {visibleDueRows.map((u, i) => (
                     <tr
                       key={`due-${i}`}
                       className={`${u.critical ? 'critical-row' : 'alert-row'} ${u.maintenance_id ? 'clickable-row' : ''}`}
@@ -511,7 +530,7 @@ export default function DashboardPage({
                       </td>
                     </tr>
                   ))}
-                  {data.upcoming.map((u, i) => (
+                  {visibleUpcomingRows.map((u, i) => (
                     <tr
                       key={`up-${i}`}
                       className={`${u.critical ? 'critical-row' : u.urgent ? 'alert-row' : ''} clickable-row`}
@@ -540,6 +559,15 @@ export default function DashboardPage({
                   ))}
                 </tbody>
               </table>
+              {totalDueRows > DUE_TABLE_LIMIT && (
+                <div style={{ padding: '10px 12px', textAlign: 'center' }}>
+                  <button className="small ghost" onClick={() => setShowAllDue((s) => !s)}>
+                    {showAllDue
+                      ? 'Daha az göster'
+                      : `Daha fazlasını gör (${totalDueRows - DUE_TABLE_LIMIT} araç daha)`}
+                  </button>
+                </div>
+              )}
             </div>
           )}
         </div>
