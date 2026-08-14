@@ -200,6 +200,41 @@ def _migrate_suggestions_flatten_approval(engine: Engine, existing_tables: set[s
         ))
 
 
+def _drop_legacy_vehicles_is_active(engine: Engine, existing_tables: set[str]) -> None:
+    """Eski `vehicles.is_active` sütununu kaldırır.
+
+    Bu sütun projenin ilk sürümlerinde vardı ve tablo `is_active BOOLEAN NOT
+    NULL` (VARSAYILAN DEĞERSİZ) olarak oluşturulmuştu. Alan sonradan modelden
+    çıkarıldı; ancak SQLite'ta var olan bir tablonun sütunu kendiliğinden
+    düşmediği için ESKİ veritabanlarında sütun NOT NULL kısıtıyla kalmaya
+    devam etti. Model artık bu sütunu bilmediğinden INSERT'lerde değer
+    göndermiyor ve YENİ ARAÇ eklenirken şu hata alınıyordu:
+
+        sqlite3.IntegrityError: NOT NULL constraint failed: vehicles.is_active
+
+    (Excel'den araç/km içe aktarırken dosyada sistemde olmayan bir araç kodu
+    geçtiği anda tüm yükleme 500 ile düşüyordu; mevcut araçların GÜNCELLENMESİ
+    ise sorunsuz çalıştığı için hata ancak yeni araç eklenince ortaya
+    çıkıyordu.)
+
+    SQLite 3.35+ `ALTER TABLE ... DROP COLUMN` destekler (Debian tabanlı
+    imajlardaki sürüm çok daha yenidir). Desteklenmeyen bir ortamda sütun
+    yerinde bırakılıp NOT NULL kısıtı etkisiz hale getirilemez; bu durumda
+    migration sessizce atlanır ve uygulama eskisi gibi çalışmaya devam eder.
+    İdempotenttir: sütun yoksa hiçbir şey yapmaz."""
+    if "vehicles" not in existing_tables:
+        return
+    cols = {c["name"] for c in inspect(engine).get_columns("vehicles")}
+    if "is_active" not in cols:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE vehicles DROP COLUMN is_active"))
+    except Exception:  # pragma: no cover - yalnızca çok eski SQLite'larda
+        # Sütun düşürülemedi; uygulamayı başlatmamak yerine devam edilir.
+        pass
+
+
 def run_light_migrations(engine: Engine) -> None:
     if not engine.url.get_backend_name().startswith("sqlite"):
         return  # yalnızca SQLite için otomatik migration uygulanır
@@ -209,6 +244,7 @@ def run_light_migrations(engine: Engine) -> None:
 
     _migrate_suggestions_hierarchical_approval(engine, existing_tables)
     _migrate_suggestions_flatten_approval(engine, existing_tables)
+    _drop_legacy_vehicles_is_active(engine, existing_tables)
 
     # Güvenlik notu (Faz 23 denetimi): buradaki f-string yalnızca yukarıdaki
     # _NEW_COLUMNS sabitinden (kaynak kodda gömülü, kullanıcı girdisi
