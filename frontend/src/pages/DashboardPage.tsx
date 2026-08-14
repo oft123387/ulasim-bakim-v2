@@ -497,8 +497,15 @@ export default function DashboardPage({
                       <td>{hedefDisplay(u)}</td>
                       <td>
                         <span className={u.critical ? 'critical-pill' : undefined}>
-                          <Badge tone="danger">
-                            {u.remaining_km <= 0 ? `Zamanı geldi · ${remainingDisplay(u)}` : 'Bekliyor'}
+                          {/* Başlatılmış (in_progress) iş emirleri de artık bu
+                              listede kalır — bkz. dashboard() → due_rows.
+                              Rozet, işin hangi aşamada olduğunu ayırt eder. */}
+                          <Badge tone={u.status === 'planlandi' ? 'in_progress' : 'danger'}>
+                            {u.status === 'planlandi'
+                              ? `Planlandı · ${remainingDisplay(u)}`
+                              : u.remaining_km <= 0
+                                ? `Zamanı geldi · ${remainingDisplay(u)}`
+                                : 'Bekliyor'}
                           </Badge>
                         </span>
                       </td>

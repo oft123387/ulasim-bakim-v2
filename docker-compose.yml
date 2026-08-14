@@ -57,6 +57,12 @@ services:
     env_file:
       - backend/.env
     environment:
+      # Saat dilimi — uygulama tarih/saatleri sunucunun YEREL saatiyle yazar
+      # (datetime.now()). Konteyner varsayılanı UTC olduğundan Türkiye'de tüm
+      # kayıtlar 3 saat geride görünüyordu. Başka bir ülkede kullanılacaksa
+      # yalnızca bu satır değişir (imajın kendi varsayılanı da Europe/Istanbul,
+      # bkz. Dockerfile).
+      TZ: "Europe/Istanbul"
       # Veritabanı kalıcı volume içinde (db-data). SQLite mutlak yol (4 bölü).
       DATABASE_URL: "sqlite:////app/data/ulasim_bakim.db"
       # Siteyi gerçek bir alan adından yayınlarken buraya o adresi yazın

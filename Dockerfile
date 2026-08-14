@@ -18,8 +18,20 @@ RUN npm run build
 # ============================================================
 FROM python:3.12-slim AS backend
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    # Saat dilimi: uygulama tarihleri datetime.now() ile SUNUCUNUN YEREL
+    # saatine göre yazar. Konteyner varsayılanı UTC olduğu için Türkiye'de
+    # tüm kayıtlar 3 saat geride görünüyordu — imaja tzdata kurulup varsayılan
+    # bölge İstanbul yapılıyor. docker-compose.yml'deki TZ değişkeni bunu
+    # ezebilir (başka bir ülkede kullanılırsa).
+    TZ=Europe/Istanbul
 WORKDIR /app/backend
+
+# Saat dilimi verisi (tzdata) — TZ değişkeninin işe yaraması için gerekir;
+# slim imajlarda kurulu gelmez.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
 
 # Python bağımlılıkları
 COPY backend/requirements.txt ./

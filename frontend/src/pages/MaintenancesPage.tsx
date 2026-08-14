@@ -668,13 +668,11 @@ function MaintenanceDetail({
   // bir sonraki pencerede ön işaretli gelir (kullanıcı değiştirebilir).
   const [lastWorkerIds, setLastWorkerIds] = useState<number[]>([])
   const [noteText, setNoteText] = useState('')
-  const [noteAuthorId, setNoteAuthorId] = useState<number | ''>('')
   const [noteBusy, setNoteBusy] = useState(false)
   // Usta/mühendisin, bakım sırasında tikledikleri bir alt madde için
   // eklediği/düzenlediği not (madde şablonundaki admin notundan bağımsız).
   const [itemNoteId, setItemNoteId] = useState<number | null>(null)
   const [itemNoteText, setItemNoteText] = useState('')
-  const [itemNoteAuthorId, setItemNoteAuthorId] = useState<number | ''>('')
   const [itemNoteBusy, setItemNoteBusy] = useState(false)
   const [itemNoteHadExisting, setItemNoteHadExisting] = useState(false)
   // Bakım ağacında hızlı arama (Ctrl+F) — girilen metne göre eşleşen
@@ -686,6 +684,19 @@ function MaintenanceDetail({
 
   const isStaff = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
   const isTechnician = user.role === 'technician'
+
+  // Kullanıcı isteği: "başkasının vardiyasına atanan bakım, başka vardiyadaki
+  // kişi tarafından açılıp da yanlışlıkla tiklenmesin." İş emri bir vardiyaya
+  // atanmışsa ve kullanıcı o vardiyada değilse madde işaretleme kapatılır
+  // (bilgi amaçlı görüntüleme serbest). Yönetici/mühendis/amir muaftır —
+  // hatalı tikleri düzeltmek zorunda kalabilirler. Backend de aynı kuralı
+  // ayrıca uygular (bkz. POST /api/items/{id}/complete), yani arayüz
+  // atlatılsa bile kayıt oluşmaz.
+  const shiftLocked =
+    shiftModeEnabled &&
+    !isStaff &&
+    m?.assigned_shift != null &&
+    user.shift_id !== m.assigned_shift.id
 
   const load = useCallback(() => {
     api<Maintenance>(`/maintenances/${id}`).then(setM).catch((e) => setError(e.message))
@@ -704,14 +715,19 @@ function MaintenanceDetail({
   useEffect(() => {
     // Vardiyalı çalışma kapalıyken bu listeye gerek yok (seçici zaten
     // gösterilmiyor). Açıkken, seçili vardiya değiştikçe yeniden çekilir.
-    if (!shiftModeEnabled || activeShiftId == null) {
+    // Kullanıcı isteği: "bakım içerisinde sadece aynı vardiya içindeki
+    // kişiler gözüksün." Bu yüzden liste, ekranda seçili vardiyadan DEĞİL,
+    // İŞ EMRİNİN ATANDIĞI vardiyadan gelir; iş emri bir vardiyaya atanmamışsa
+    // ekrandaki seçili vardiyaya düşülür.
+    const sourceShiftId = m?.assigned_shift?.id ?? activeShiftId
+    if (!shiftModeEnabled || sourceShiftId == null) {
       setPickerUsers([])
       return
     }
-    api<User[]>(`/users/assignable?shift_id=${activeShiftId}`)
+    api<User[]>(`/users/assignable?shift_id=${sourceShiftId}`)
       .then(setPickerUsers)
       .catch(() => setPickerUsers([]))
-  }, [shiftModeEnabled, activeShiftId, shiftMembersVersion])
+  }, [shiftModeEnabled, activeShiftId, shiftMembersVersion, m?.assigned_shift?.id])
 
   async function assignTo(userId: number | null) {
     setError('')
@@ -817,28 +833,28 @@ function MaintenanceDetail({
   }
 
   // Bir alt maddeye bakım sırasında not eklemek/düzenlemek için diyaloğu
-  // açar; var olan notu (varsa) önceden doldurur. Vardiyalı çalışma
-  // kapalıyken not sahibi otomatik oturum sahibidir, ayrıca seçilmez.
+  // açar; var olan notu (varsa) önceden doldurur.
+  //
+  // Kullanıcı isteği: "kim eklediyse o notu onun adı gözüksün" — eskiden
+  // vardiyalı çalışmada notu kimin yazdığı bir listeden seçiliyordu ve yanlış
+  // isim seçilebiliyordu. Artık seçim yok: not her zaman OTURUMU AÇAN kişiye
+  // yazılır (author_id gönderilmez, backend oturum sahibini kullanır).
   function openItemNote(itemId: number) {
     setError('')
     const existing = m ? findItemById(m.items ?? [], itemId) : null
     setItemNoteText(existing?.exec_note ?? '')
     setItemNoteHadExisting(!!existing?.exec_note)
-    setItemNoteAuthorId('')
     setItemNoteId(itemId)
   }
 
   async function saveItemNote() {
     if (itemNoteId === null) return
-    if (shiftModeEnabled && itemNoteAuthorId === '') return
     setItemNoteBusy(true)
     setError('')
     try {
       await api(`/items/${itemNoteId}/note`, {
         method: 'PATCH',
-        body: shiftModeEnabled
-          ? { text: itemNoteText.trim(), author_id: itemNoteAuthorId }
-          : { text: itemNoteText.trim() },
+        body: { text: itemNoteText.trim() },
       })
       setItemNoteId(null)
       load()
@@ -879,13 +895,12 @@ function MaintenanceDetail({
 
   async function removeItemNote() {
     if (itemNoteId === null) return
-    if (shiftModeEnabled && itemNoteAuthorId === '') return
     setItemNoteBusy(true)
     setError('')
     try {
       await api(`/items/${itemNoteId}/note`, {
         method: 'PATCH',
-        body: shiftModeEnabled ? { text: '', author_id: itemNoteAuthorId } : { text: '' },
+        body: { text: '' },
       })
       setItemNoteId(null)
       load()
@@ -896,17 +911,16 @@ function MaintenanceDetail({
     }
   }
 
+  // Aynı gerekçe (bkz. openItemNote): iş emri notu da her zaman oturumu açan
+  // kişiye yazılır, isim listeden seçilmez — yanlış isim kaydedilemesin.
   async function addNote() {
     if (!noteText.trim()) return
-    if (shiftModeEnabled && noteAuthorId === '') return
     setNoteBusy(true)
     setError('')
     try {
       await api(`/maintenances/${id}/notes`, {
         method: 'POST',
-        body: shiftModeEnabled
-          ? { text: noteText.trim(), author_id: noteAuthorId }
-          : { text: noteText.trim() },
+        body: { text: noteText.trim() },
       })
       setNoteText('')
       load()
@@ -1333,12 +1347,29 @@ function MaintenanceDetail({
             </span>
           )}
         </div>
+        {shiftLocked && (
+          <div
+            className="row"
+            style={{
+              gap: 8, alignItems: 'center', margin: '0 0 10px', padding: '9px 12px',
+              borderRadius: 8, background: 'rgba(180, 83, 9, 0.10)',
+              border: '1px solid rgba(180, 83, 9, 0.25)', fontSize: 12.5,
+            }}
+          >
+            <ShieldAlert size={15} />
+            <span>
+              Bu iş emri <strong>{m?.assigned_shift?.name}</strong> vardiyasına atanmış. Kendi
+              vardiyanız olmadığı için maddeleri işaretleyemezsiniz — yalnızca
+              görüntüleyebilirsiniz.
+            </span>
+          </div>
+        )}
         <ul className="tree">
           {displayedItems.map((i) => (
             <TreeItem
               key={i.id}
               item={i}
-              canEdit={!!perms.edit_maintenance}
+              canEdit={!!perms.edit_maintenance && !shiftLocked}
               canUnlock={!!perms.approve_maintenance}
               onComplete={requestComplete}
               onUnlock={unlock}
@@ -1392,21 +1423,9 @@ function MaintenanceDetail({
               rows={2}
               style={{ flex: '1 1 260px', minWidth: 220, fontSize: 13, padding: '8px 10px' }}
             />
-            {shiftModeEnabled && (
-              <select
-                value={noteAuthorId}
-                onChange={(e) => setNoteAuthorId(e.target.value ? Number(e.target.value) : '')}
-                style={{ fontSize: 12.5, padding: '8px 8px' }}
-              >
-                <option value="">Notu ekleyen…</option>
-                {pickerUsers.map((u) => (
-                  <option key={u.id} value={u.id}>{u.full_name}</option>
-                ))}
-              </select>
-            )}
             <button
               className="primary"
-              disabled={noteBusy || !noteText.trim() || (shiftModeEnabled && noteAuthorId === '')}
+              disabled={noteBusy || !noteText.trim()}
               onClick={addNote}
             >
               <Send size={13} style={{ marginRight: 6, verticalAlign: -2 }} />
@@ -1444,18 +1463,9 @@ function MaintenanceDetail({
               rows={3}
               style={{ width: '100%', fontSize: 13, padding: '8px 10px', marginBottom: 10 }}
             />
-            {shiftModeEnabled && (
-              <select
-                value={itemNoteAuthorId}
-                onChange={(e) => setItemNoteAuthorId(e.target.value ? Number(e.target.value) : '')}
-                style={{ width: '100%', fontSize: 13, padding: '8px 10px' }}
-              >
-                <option value="">İsminizi seçin…</option>
-                {pickerUsers.map((u) => (
-                  <option key={u.id} value={u.id}>{u.full_name}</option>
-                ))}
-              </select>
-            )}
+            <div className="muted" style={{ fontSize: 12, marginBottom: 4 }}>
+              Not, giriş yapmış kişi adına kaydedilir: <strong>{user.full_name}</strong>
+            </div>
             <div className="row" style={{ marginTop: 14, gap: 8, justifyContent: 'flex-end' }}>
               <button className="ghost" disabled={itemNoteBusy} onClick={() => setItemNoteId(null)}>
                 Vazgeç
@@ -1463,7 +1473,7 @@ function MaintenanceDetail({
               {itemNoteHadExisting && itemNoteText === '' && (
                 <button
                   className="danger"
-                  disabled={itemNoteBusy || (shiftModeEnabled && itemNoteAuthorId === '')}
+                  disabled={itemNoteBusy}
                   onClick={removeItemNote}
                 >
                   Notu Kaldır
@@ -1471,7 +1481,7 @@ function MaintenanceDetail({
               )}
               <button
                 className="primary"
-                disabled={itemNoteBusy || (shiftModeEnabled && itemNoteAuthorId === '') || !itemNoteText.trim()}
+                disabled={itemNoteBusy || !itemNoteText.trim()}
                 onClick={saveItemNote}
               >
                 Kaydet

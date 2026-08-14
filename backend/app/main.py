@@ -3881,6 +3881,23 @@ def complete_item(
     if user.role == "technician" and m.assigned_to_id not in (None, user.id):
         raise HTTPException(403, "Bu bakım size atanmamış")
 
+    # Vardiya koruması (kullanıcı isteği): bir iş emri BİR VARDİYAYA atanmışsa,
+    # o vardiyada olmayan biri iş emrini açıp yanlışlıkla madde tikleyemesin.
+    # Yönetici/mühendis/amir muaftır — hatalı tikleri düzeltmek ya da vardiya
+    # dışı müdahale etmek zorunda kalabilirler. Kural yalnızca vardiyalı
+    # çalışma AÇIKKEN uygulanır; kapalıyken eski davranış korunur (eskiden
+    # atanmış ama artık kullanılmayan vardiyalar kimseyi kilitlemesin).
+    shift_mode_on = services.get_shift_mode(db)
+    is_staff = user.role in ("admin", "engineer", "amir")
+    shift_guard = shift_mode_on and m.assigned_shift_id is not None and not is_staff
+    if shift_guard and user.shift_id != m.assigned_shift_id:
+        shift_name = m.assigned_shift.name if m.assigned_shift else "başka bir"
+        raise HTTPException(
+            403,
+            f"Bu iş emri {shift_name} vardiyasına atanmış — kendi vardiyanız "
+            "olmadığı için madde işaretleyemezsiniz.",
+        )
+
     # Paylaşılan tablet senaryosu: tikleyen kişi oturum sahibinden farklı
     # olabilir (tek cihaz, giriş/çıkış yapılmıyor). Belirtilirse geçerli bir
     # aktif kullanıcı olmalı; tamamlama bu kişiye atfedilir.
@@ -3903,6 +3920,19 @@ def complete_item(
             u = db.get(models.User, uid)
             if not u or not u.is_active:
                 raise HTTPException(400, "Geçersiz kullanıcı seçimi")
+            # İş emri bir vardiyaya atanmışsa yalnızca O VARDİYADAKİ kişiler
+            # "yapan" olarak seçilebilir — başka vardiyadan biri yanlışlıkla
+            # (veya bilerek) bu bakıma yazılamasın.
+            if (
+                shift_mode_on
+                and m.assigned_shift_id is not None
+                and u.shift_id != m.assigned_shift_id
+            ):
+                shift_name = m.assigned_shift.name if m.assigned_shift else "atanan"
+                raise HTTPException(
+                    400,
+                    f"{u.full_name} bu iş emrinin vardiyasında ({shift_name}) değil.",
+                )
             workers.append(u)
 
     item_name = item.name
@@ -4885,11 +4915,12 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
     # dashboard'da görünür kalır. deduped_open ile aynı tekilleştirilmiş
     # kümeden alınır (küçük periyotlar büyük bakımın içine dahilse ayrı
     # satır olarak tekrar gösterilmez).
-    due_rows = sorted(
-        (m for m in deduped_open if m.status == "pending"),
-        key=lambda m: m.created_at,
-        reverse=True,
-    )[:8]
+    #
+    # Kullanıcı isteği: "bekliyor" durumundaki bakımlar bittiyse liste boş
+    # kalmasın — BAŞLATILMIŞ (in_progress = "Planlandı") bakımlar da burada
+    # görünmeye devam etsin; hiç açık bakım kalmadıysa sıra "yaklaşan"lara
+    # geçsin (aşağıdaki `upcoming` listesi zaten öncelik sırasında).
+    due_rows = [m for m in deduped_open if m.status in ("pending", "in_progress")]
     def _due_item(dm: models.Maintenance) -> schemas.UpcomingItem:
         is_time = dm.plan.plan_type == "time"
         if is_time:
@@ -4922,9 +4953,29 @@ def dashboard(db: Session = Depends(get_db), user: models.User = Depends(get_cur
             urgent=urgent,
             critical=critical,
             maintenance_id=dm.id,
+            # Arayüzdeki rozet metni bu alandan gelir: başlatılmış iş emri
+            # "Planlandı", henüz başlanmamış ve hedefi geçmiş "Gecikti",
+            # hedefi geçmemiş "Bekliyor" olarak gösterilir.
+            status=(
+                "planlandi"
+                if dm.status == "in_progress"
+                else ("gecikti" if remaining_km <= 0 else "planlanacak")
+            ),
+            assigned_shift_id=dm.assigned_shift_id,
+            assigned_shift_name=dm.assigned_shift.name if dm.assigned_shift else None,
         )
 
-    due_now = [_due_item(dm) for dm in due_rows]
+    # Öncelik sırası (kullanıcı isteği: "önceliğe göre gösterilsin"):
+    #   1) Hedefi geçmiş olanlar önce — en çok geciken en üstte,
+    #   2) sonra hedefe kalan süreye göre en yakın olan en üstte.
+    # km ve süre bazlı planlar farklı birimlerde olduğu için ortak ölçü
+    # `estimated_days`'tir (bkz. _compute_upcoming_merged'deki aynı gerekçe).
+    def _due_priority(u: schemas.UpcomingItem) -> tuple[int, int]:
+        if u.remaining_km <= 0:
+            return (0, u.remaining_km)  # en negatif (en çok geciken) başa
+        return (1, u.estimated_days if u.estimated_days is not None else u.remaining_km)
+
+    due_now = sorted((_due_item(dm) for dm in due_rows), key=_due_priority)[:8]
 
     # Yalnızca Bakım Planları sayfasında (GET /api/plans, varsayılan) GERÇEKTEN
     # görünen bir plana bağlı tamamlanan bakımlar gösterilir — o sayfa hem

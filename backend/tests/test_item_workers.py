@@ -139,6 +139,81 @@ def test_unknown_worker_id_is_rejected(client, admin_token):
     assert still["is_completed"] is False
 
 
+def _setup_shift_scenario(client, admin, suffix: str):
+    """Vardiyalı çalışma açık; iş emri A vardiyasına atanmış. A vardiyasında
+    bir teknisyen, B vardiyasında başka bir teknisyen bulunur."""
+    maint, leaf = _make_maintenance_with_leaf(client, admin, suffix)
+
+    r = client.patch("/api/shift-mode", headers=auth(admin), json={"enabled": True})
+    assert r.status_code == 200, r.text
+
+    shifts = client.get("/api/shifts", headers=auth(admin)).json()
+    assert len(shifts) >= 2, "varsayılan vardiyalar oluşmalıydı"
+    shift_a, shift_b = shifts[0], shifts[1]
+
+    r = client.patch(
+        f"/api/maintenances/{maint['id']}/assign-shift",
+        headers=auth(admin),
+        json={"assigned_shift_id": shift_a["id"]},
+    )
+    assert r.status_code == 200, r.text
+
+    inside = _create_user(client, admin, f"shift_in_{suffix}", "Vardiyadaki Usta")
+    outside = _create_user(client, admin, f"shift_out_{suffix}", "Diğer Vardiya Ustası")
+    for uid, sid in ((inside["id"], shift_a["id"]), (outside["id"], shift_b["id"])):
+        r = client.patch(f"/api/users/{uid}", headers=auth(admin), json={"shift_id": sid})
+        assert r.status_code == 200, r.text
+
+    return maint, leaf, inside, outside
+
+
+def test_worker_from_another_shift_is_rejected(client, admin_token):
+    """İş emri A vardiyasına atanmışken B vardiyasındaki biri "yapan" olarak
+    seçilemez — yanlış vardiyaya kayıt düşmesin."""
+    admin = admin_token
+    maint, leaf, _inside, outside = _setup_shift_scenario(client, admin, "06")
+
+    r = client.post(
+        f"/api/items/{leaf['id']}/complete",
+        headers=auth(admin),
+        json={"worker_ids": [outside["id"]]},
+    )
+    assert r.status_code == 400, r.text
+    assert "vardiyasında" in r.json()["detail"]
+    assert _leaf_after(client, admin, maint["id"])["is_completed"] is False
+
+
+def test_worker_from_assigned_shift_is_accepted(client, admin_token):
+    admin = admin_token
+    maint, leaf, inside, _outside = _setup_shift_scenario(client, admin, "07")
+
+    r = client.post(
+        f"/api/items/{leaf['id']}/complete",
+        headers=auth(admin),
+        json={"worker_ids": [inside["id"]]},
+    )
+    assert r.status_code == 200, r.text
+    done = _leaf_after(client, admin, maint["id"])
+    assert [w["id"] for w in done["workers"]] == [inside["id"]]
+
+
+def test_technician_from_another_shift_cannot_tick(client, admin_token):
+    """Başka vardiyadaki teknisyen iş emrini açıp madde tikleyemez."""
+    admin = admin_token
+    maint, leaf, _inside, outside = _setup_shift_scenario(client, admin, "08")
+
+    r = client.post(
+        "/api/auth/login",
+        data={"username": outside["username"], "password": "Test1234!"},
+    )
+    assert r.status_code == 200, r.text
+    outsider_token = r.json()["access_token"]
+
+    r = client.post(f"/api/items/{leaf['id']}/complete", headers=auth(outsider_token))
+    assert r.status_code == 403, r.text
+    assert _leaf_after(client, admin, maint["id"])["is_completed"] is False
+
+
 def test_unlocking_item_clears_workers(client, admin_token):
     """Kilit açılıp madde sıfırlanınca "kimler yaptı" kaydı da düşer;
     yeniden tiklendiğinde kişiler baştan seçilir."""
