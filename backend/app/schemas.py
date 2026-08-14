@@ -56,6 +56,9 @@ class ShiftOut(ORM):
     id: int
     name: str
     order_index: int
+    # Vardiya sorumlusu (bkz. models.Shift.supervisor_id). Seçilmemişse None —
+    # o vardiyada kimse başkası adına madde tikleyemez.
+    supervisor: UserOut | None = None
 
 
 class ShiftCreate(BaseModel):
@@ -63,7 +66,12 @@ class ShiftCreate(BaseModel):
 
 
 class ShiftUpdate(BaseModel):
-    name: str
+    # Yalnızca gönderilen alanlar değişir (model_fields_set ile ayırt edilir):
+    # adı değiştirmeden sorumlu atamak ya da tersi mümkün olsun.
+    name: str | None = None
+    # Vardiya sorumlusu — o vardiyanın ÜYESİ olan bir kullanıcının id'si.
+    # None gönderilirse sorumluluk kaldırılır.
+    supervisor_id: int | None = None
 
 
 class ShiftModeConfig(BaseModel):

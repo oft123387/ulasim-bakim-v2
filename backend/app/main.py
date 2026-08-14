@@ -791,6 +791,13 @@ def update_user(
         if body.shift_id is not None and not db.get(models.Shift, body.shift_id):
             raise HTTPException(400, "Geçersiz vardiya")
         changes.append("vardiya kaldırıldı" if body.shift_id is None else f"vardiya: {body.shift_id}")
+        # Kişi eski vardiyasının SORUMLUSUYSA, vardiyadan ayrılınca sorumluluk
+        # da düşer — aksi halde artık üyesi olmadığı bir vardiyada başkaları
+        # adına tikleme yetkisi taşımaya devam ederdi.
+        old_shift = db.get(models.Shift, user.shift_id) if user.shift_id else None
+        if old_shift is not None and old_shift.supervisor_id == user.id:
+            old_shift.supervisor_id = None
+            changes.append(f"{old_shift.name} vardiya sorumluluğu kaldırıldı")
         user.shift_id = body.shift_id
     db.commit()
     db.refresh(user)
@@ -3515,20 +3522,52 @@ def rename_shift(
     db: Session = Depends(get_db),
     actor=Depends(require_permission("manage_users")),
 ):
+    """Vardiya adını ve/veya vardiya sorumlusunu günceller.
+
+    Yalnızca gövdede GÖNDERİLEN alanlar değişir — adı değiştirmeden sorumlu
+    atamak (ya da tersi) mümkündür. Vardiya sorumlusu, o vardiyanın kendi
+    üyesi olmak zorundadır: yalnızca bu kişi başkaları adına madde
+    tikleyebilir (bkz. models.Shift.supervisor_id)."""
     shift = db.get(models.Shift, shift_id)
     if not shift:
         raise HTTPException(404, "Vardiya bulunamadı")
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(400, "Vardiya adı boş olamaz")
-    old_name = shift.name
-    if name != old_name:
-        shift.name = name
+
+    if "name" in body.model_fields_set and body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Vardiya adı boş olamaz")
+        old_name = shift.name
+        if name != old_name:
+            shift.name = name
+            db.commit()
+            services.log_action(
+                db, actor, "update", "shift", shift.id,
+                f"Vardiya adı değiştirildi: {old_name} → {shift.name}",
+            )
+
+    if "supervisor_id" in body.model_fields_set:
+        old_sup = shift.supervisor.full_name if shift.supervisor else "(yok)"
+        if body.supervisor_id is None:
+            shift.supervisor_id = None
+            new_sup = "(yok)"
+        else:
+            chosen = db.get(models.User, body.supervisor_id)
+            if not chosen or not chosen.is_active:
+                raise HTTPException(400, "Geçersiz kullanıcı seçimi")
+            if chosen.shift_id != shift.id:
+                raise HTTPException(
+                    400,
+                    f"{chosen.full_name} bu vardiyanın üyesi değil — önce vardiyaya ekleyin.",
+                )
+            shift.supervisor_id = chosen.id
+            new_sup = chosen.full_name
         db.commit()
         services.log_action(
             db, actor, "update", "shift", shift.id,
-            f"Vardiya adı değiştirildi: {old_name} → {shift.name}",
+            f"Vardiya sorumlusu değiştirildi ({shift.name}): {old_sup} → {new_sup}",
         )
+
+    db.refresh(shift)
     return shift
 
 
@@ -3941,6 +3980,22 @@ def complete_item(
                     f"{u.full_name} bu iş emrinin vardiyasında ({shift_name}) değil.",
                 )
             workers.append(u)
+
+    # Vardiya sorumlusu kuralı (kullanıcı isteği): "seçtiğimiz vardiya
+    # sorumlusu sadece diğerleri adına tikleme yapabilsin." Yani vardiyanın
+    # SIRADAN bir üyesi yalnızca KENDİ adına işaretleyebilir; başka birini
+    # (ya da kendisiyle birlikte başkalarını) yapan olarak yazmak vardiya
+    # sorumlusuna özeldir. Yönetici/mühendis/amir bu kısıttan muaftır.
+    if shift_mode_on and not is_staff and workers:
+        shift = m.assigned_shift or (db.get(models.Shift, user.shift_id) if user.shift_id else None)
+        is_supervisor = shift is not None and shift.supervisor_id == user.id
+        others = [w for w in workers if w.id != user.id]
+        if others and not is_supervisor:
+            raise HTTPException(
+                403,
+                "Başkası adına işaretleme yetkiniz yok — bunu yalnızca vardiya "
+                "sorumlusu yapabilir. Kendi adınıza işaretleyebilirsiniz.",
+            )
 
     item_name = item.name
     try:

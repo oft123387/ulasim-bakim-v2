@@ -788,7 +788,18 @@ function MaintenanceDetail({
   // penceresi açılır (her madde için ayrı ayrı — aynı maddede birden fazla
   // kişi çalışmış olabilir). Vardiyalı çalışma kapalıyken eski davranış
   // korunur: doğrudan oturum sahibine atfedilir.
-  const workerPickerEnabled = shiftModeEnabled && pickerUsers.length > 0
+  //
+  // Vardiya sorumlusu kuralı: yalnızca sorumlu (ve yönetici/mühendis/amir)
+  // BAŞKALARI adına işaretleyebilir. Sıradan bir vardiya üyesi listede
+  // yalnızca kendini görür — backend de aynı kuralı ayrıca uygular.
+  const pickerShift =
+    shifts.find((s) => s.id === (m?.assigned_shift?.id ?? activeShiftId)) ?? null
+  const canPickOthers = isStaff || pickerShift?.supervisor?.id === user.id
+  const selectableWorkers = canPickOthers
+    ? pickerUsers
+    : pickerUsers.filter((u) => u.id === user.id)
+
+  const workerPickerEnabled = shiftModeEnabled && selectableWorkers.length > 0
 
   function requestComplete(itemId: number) {
     setError('')
@@ -798,7 +809,7 @@ function MaintenanceDetail({
     }
     // Aynı vardiyada arka arkaya tiklerken çoğunlukla aynı ekip çalışır —
     // son seçim ön işaretli gelir, kullanıcı gerekirse değiştirir.
-    setWorkerPickIds(lastWorkerIds.filter((wid) => pickerUsers.some((u) => u.id === wid)))
+    setWorkerPickIds(lastWorkerIds.filter((wid) => selectableWorkers.some((u) => u.id === wid)))
     setWorkerPickItemId(itemId)
   }
 
@@ -1515,11 +1526,17 @@ function MaintenanceDetail({
                 const it = m ? findItemById(m.items ?? [], workerPickItemId) : null
                 return it ? it.name : 'Madde'
               })()}
-              {' — '}vardiyada çalışan kişilerden bu maddede görev alanları işaretleyin.
-              Birden fazla kişi seçebilirsiniz.
+              {' — '}
+              {canPickOthers ? (
+                <>vardiyada çalışan kişilerden bu maddede görev alanları işaretleyin.
+                Birden fazla kişi seçebilirsiniz.</>
+              ) : (
+                <>bu maddeyi kendi adınıza işaretliyorsunuz. Başkaları adına
+                işaretlemeyi yalnızca vardiya sorumlusu yapabilir.</>
+              )}
             </div>
             <div style={{ maxHeight: '45vh', overflowY: 'auto', marginBottom: 4 }}>
-              {pickerUsers.map((u) => {
+              {selectableWorkers.map((u) => {
                 const checked = workerPickIds.includes(u.id)
                 return (
                   <label
@@ -1639,6 +1656,7 @@ export default function MaintenancesPage({
   // eklenip/çıkarılabilir.
   const [allUsers, setAllUsers] = useState<User[]>([])
   const [memberBusy, setMemberBusy] = useState(false)
+  const [supervisorBusy, setSupervisorBusy] = useState(false)
   const [addMemberId, setAddMemberId] = useState<number | ''>('')
   // Vardiya üyeliği burada değiştirildiğinde, MaintenanceDetail içindeki
   // isim seçici listesinin (pickerUsers) hemen yeniden çekilmesini
@@ -1690,7 +1708,29 @@ export default function MaintenancesPage({
     }
   }
 
-  const activeShiftName = shifts.find((s) => s.id === activeShiftId)?.name ?? null
+  const activeShift = shifts.find((s) => s.id === activeShiftId) ?? null
+  const activeShiftName = activeShift?.name ?? null
+
+  // Vardiya sorumlusunu değiştirir (yalnızca mühendis/amir/yönetici görür).
+  // null gönderilirse sorumluluk kaldırılır ve o vardiyada kimse başkası
+  // adına tikleyemez.
+  async function setSupervisor(userId: number | null) {
+    if (activeShiftId == null) return
+    setSupervisorBusy(true)
+    setShiftCrudError('')
+    try {
+      const updated = await api<Shift>(`/shifts/${activeShiftId}`, {
+        method: 'PATCH',
+        body: { supervisor_id: userId },
+      })
+      setShifts((prev) => prev.map((s) => (s.id === updated.id ? updated : s)))
+      showToast('✓ Vardiya sorumlusu güncellendi')
+    } catch (e) {
+      setShiftCrudError((e as Error).message)
+    } finally {
+      setSupervisorBusy(false)
+    }
+  }
 
   function startEditShift(s: Shift) {
     setEditingShiftId(s.id)
@@ -1858,6 +1898,14 @@ export default function MaintenancesPage({
               <span key={u.id} className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12.5, padding: '4px 8px' }}>
                 <Avatar name={u.full_name} size={16} />
                 {u.full_name}
+                {activeShift?.supervisor?.id === u.id && (
+                  <span
+                    title="Vardiya sorumlusu — yalnızca bu kişi başkaları adına madde işaretleyebilir"
+                    style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontWeight: 600 }}
+                  >
+                    <ShieldAlert size={12} /> Sorumlu
+                  </span>
+                )}
                 {isStaff && (
                   <button
                     className="ghost"
@@ -1899,6 +1947,30 @@ export default function MaintenancesPage({
                 <UserPlus size={12} style={{ marginRight: 5, verticalAlign: -2 }} />
                 Ekle
               </button>
+            </div>
+          )}
+          {/* Vardiya sorumlusu — mühendis/amir seçer. Yalnızca bu kişi bir
+              maddeyi başkaları adına işaretleyebilir; vardiyanın diğer
+              üyeleri sadece kendi adlarına tikleyebilir. */}
+          {isStaff && (
+            <div className="row" style={{ gap: 8, marginTop: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+              <span className="muted" style={{ fontSize: 12.5, fontWeight: 600 }}>
+                Vardiya sorumlusu:
+              </span>
+              <select
+                value={activeShift?.supervisor?.id ?? ''}
+                disabled={supervisorBusy}
+                onChange={(e) => setSupervisor(e.target.value ? Number(e.target.value) : null)}
+                style={{ fontSize: 12.5, padding: '5px 8px' }}
+              >
+                <option value="">Seçilmedi</option>
+                {allUsers.filter((u) => u.shift_id === activeShiftId).map((u) => (
+                  <option key={u.id} value={u.id}>{u.full_name}</option>
+                ))}
+              </select>
+              <span className="muted" style={{ fontSize: 12 }}>
+                Yalnızca sorumlu, başkaları adına madde işaretleyebilir.
+              </span>
             </div>
           )}
         </div>

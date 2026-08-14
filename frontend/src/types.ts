@@ -13,6 +13,9 @@ export interface Shift {
   id: number
   name: string
   order_index: number
+  // Vardiya sorumlusu — yalnızca bu kişi (ve yönetici/mühendis/amir) bir
+  // maddeyi BAŞKALARI adına tikleyebilir. Seçilmemişse null.
+  supervisor: User | null
 }
 
 export interface ShiftModeConfig {

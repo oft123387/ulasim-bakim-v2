@@ -25,6 +25,11 @@ _NEW_COLUMNS: dict[str, list[tuple[str, str]]] = {
         ("email_verified", "BOOLEAN DEFAULT 0"),
         ("shift_id", "INTEGER"),
     ],
+    "shifts": [
+        # Vardiya sorumlusu (bkz. models.Shift.supervisor_id) — yalnızca bu
+        # kişi başkaları adına madde tikleyebilir.
+        ("supervisor_id", "INTEGER"),
+    ],
     "tree_nodes": [
         ("plan_id", "INTEGER"),
         ("note", "TEXT DEFAULT ''"),

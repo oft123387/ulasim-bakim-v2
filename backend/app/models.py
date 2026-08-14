@@ -40,7 +40,10 @@ class User(Base):
         ForeignKey("shifts.id", ondelete="SET NULL"), nullable=True
     )
 
-    shift = relationship("Shift")
+    # foreign_keys açıkça belirtilir: shifts.supervisor_id da users'a bakıyor
+    # (vardiya sorumlusu), bu yüzden iki tablo arasında iki ayrı FK var ve
+    # SQLAlchemy hangisinin kullanılacağını kendiliğinden çıkaramaz.
+    shift = relationship("Shift", foreign_keys=[shift_id])
 
 
 class Shift(Base):
@@ -53,6 +56,17 @@ class Shift(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(50))
     order_index: Mapped[int] = mapped_column(Integer, default=0)
+    # Vardiya sorumlusu — mühendis/amir tarafından, vardiyanın KENDİ üyeleri
+    # arasından seçilir. Yalnızca bu kişi (ve yönetici/mühendis/amir) bir
+    # bakım maddesini BAŞKALARI adına tikleyebilir; vardiyanın diğer üyeleri
+    # yalnızca kendi adlarına işaretleyebilir (bkz. POST /api/items/{id}
+    # /complete). Sorumlu vardiyadan çıkarılırsa/silinirse alan NULL'a düşer
+    # ve vardiya sorumlusuz kalır (kimse başkası adına tikleyemez).
+    supervisor_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    supervisor = relationship("User", foreign_keys=[supervisor_id])
 
 
 class VerificationCode(Base):

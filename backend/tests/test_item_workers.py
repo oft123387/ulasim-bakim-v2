@@ -214,6 +214,101 @@ def test_technician_from_another_shift_cannot_tick(client, admin_token):
     assert _leaf_after(client, admin, maint["id"])["is_completed"] is False
 
 
+def _login(client, username: str) -> str:
+    r = client.post("/api/auth/login", data={"username": username, "password": "Test1234!"})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def test_only_supervisor_can_tick_on_behalf_of_others(client, admin_token):
+    """Vardiya sorumlusu başkaları adına işaretleyebilir; sıradan üye
+    yalnızca kendi adına."""
+    admin = admin_token
+    maint, leaf, inside, _outside = _setup_shift_scenario(client, admin, "09")
+
+    # Aynı vardiyaya ikinci bir üye ekle.
+    mate = _create_user(client, admin, "shift_mate_09", "Vardiya Arkadaşı")
+    shift_id = client.get(f"/api/maintenances/{maint['id']}", headers=auth(admin)).json()[
+        "assigned_shift"
+    ]["id"]
+    r = client.patch(f"/api/users/{mate['id']}", headers=auth(admin), json={"shift_id": shift_id})
+    assert r.status_code == 200, r.text
+
+    # Sorumlu SEÇİLMEDEN: sıradan üye başkasını yazamaz.
+    member_token = _login(client, mate["username"])
+    r = client.post(
+        f"/api/items/{leaf['id']}/complete",
+        headers=auth(member_token),
+        json={"worker_ids": [inside["id"], mate["id"]]},
+    )
+    assert r.status_code == 403, r.text
+    assert "vardiya sorumlusu" in r.json()["detail"]
+
+    # Kendi adına işaretleyebilir mi? (kilitlenmesin diye ayrı bir iş emrinde
+    # denenir — yukarıdaki istek reddedildiği için madde hâlâ açık.)
+    r = client.post(
+        f"/api/items/{leaf['id']}/complete",
+        headers=auth(member_token),
+        json={"worker_ids": [mate["id"]]},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_supervisor_can_tick_on_behalf_of_others(client, admin_token):
+    admin = admin_token
+    maint, leaf, inside, _outside = _setup_shift_scenario(client, admin, "10")
+    mate = _create_user(client, admin, "shift_mate_10", "Vardiya Arkadaşı 2")
+    shift_id = client.get(f"/api/maintenances/{maint['id']}", headers=auth(admin)).json()[
+        "assigned_shift"
+    ]["id"]
+    r = client.patch(f"/api/users/{mate['id']}", headers=auth(admin), json={"shift_id": shift_id})
+    assert r.status_code == 200, r.text
+
+    # mate'i vardiya sorumlusu yap.
+    r = client.patch(f"/api/shifts/{shift_id}", headers=auth(admin), json={"supervisor_id": mate["id"]})
+    assert r.status_code == 200, r.text
+    assert r.json()["supervisor"]["id"] == mate["id"]
+
+    supervisor_token = _login(client, mate["username"])
+    r = client.post(
+        f"/api/items/{leaf['id']}/complete",
+        headers=auth(supervisor_token),
+        json={"worker_ids": [inside["id"], mate["id"]]},
+    )
+    assert r.status_code == 200, r.text
+    done = _leaf_after(client, admin, maint["id"])
+    assert sorted(w["id"] for w in done["workers"]) == sorted([inside["id"], mate["id"]])
+
+
+def test_supervisor_must_be_member_of_the_shift(client, admin_token):
+    admin = admin_token
+    _maint, _leaf, _inside, outside = _setup_shift_scenario(client, admin, "11")
+    shifts = client.get("/api/shifts", headers=auth(admin)).json()
+    shift_a = shifts[0]
+
+    r = client.patch(
+        f"/api/shifts/{shift_a['id']}", headers=auth(admin), json={"supervisor_id": outside["id"]}
+    )
+    assert r.status_code == 400, r.text
+    assert "üyesi değil" in r.json()["detail"]
+
+
+def test_leaving_shift_clears_supervisor_role(client, admin_token):
+    """Sorumlu vardiyadan çıkarılınca sorumluluğu da düşer."""
+    admin = admin_token
+    _maint, _leaf, inside, _outside = _setup_shift_scenario(client, admin, "12")
+    shift_id = inside["shift_id"] or client.get("/api/shifts", headers=auth(admin)).json()[0]["id"]
+
+    r = client.patch(f"/api/shifts/{shift_id}", headers=auth(admin), json={"supervisor_id": inside["id"]})
+    assert r.status_code == 200, r.text
+
+    r = client.patch(f"/api/users/{inside['id']}", headers=auth(admin), json={"shift_id": None})
+    assert r.status_code == 200, r.text
+
+    shifts = {s["id"]: s for s in client.get("/api/shifts", headers=auth(admin)).json()}
+    assert shifts[shift_id]["supervisor"] is None
+
+
 def test_unlocking_item_clears_workers(client, admin_token):
     """Kilit açılıp madde sıfırlanınca "kimler yaptı" kaydı da düşer;
     yeniden tiklendiğinde kişiler baştan seçilir."""
