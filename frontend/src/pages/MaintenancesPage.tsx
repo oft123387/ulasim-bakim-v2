@@ -611,6 +611,7 @@ function MaintenanceDetail({
   activeShiftId,
   shiftMembersVersion,
   shifts,
+  activeWorkerIds,
   onOpenKnowledge,
 }: {
   id: number
@@ -632,6 +633,13 @@ function MaintenanceDetail({
   // "Vardiya" ataması (m.assigned_shift) için seçenek listesi — "Atanan"
   // (kişi) dropdown'undan bağımsız, ayrı bir satırda gösterilir.
   shifts: Shift[]
+  // Kullanıcı isteği: "vardiya sorumlusu her tikte isim seçmek yerine
+  // vardiyasındaki kendini ve diğer kişileri yukarıda vardiya kısmında
+  // görüyor ya oradan bir isme tıklasın o an tıkladığı isim için tikliyor
+  // olsun." Üstteki vardiya barında (bkz. shiftBar) tıklanarak seçilmiş
+  // kişi(ler) — yalnızca vardiya sorumlusu/yönetici bunu değiştirebilir;
+  // sıradan üyeler için her zaman boş kalır ve tikler kendi adlarına gider.
+  activeWorkerIds: number[]
   // Faz 27 — madde satırındaki "Bilgi" düğmesi (Bakım Bilgi Bankası).
   onOpenKnowledge?: (nodeId: number) => void
 }) {
@@ -659,14 +667,6 @@ function MaintenanceDetail({
   // ayrı tutulur — "Atanan" (iş emri sorumlusu) dropdown'u vardiyadan
   // bağımsız olarak her zaman herkesi gösterir).
   const [pickerUsers, setPickerUsers] = useState<User[]>([])
-  // Madde tiklenirken açılan "bu maddede kimler çalıştı?" penceresi.
-  // workerPickItemId null ise pencere kapalıdır.
-  const [workerPickItemId, setWorkerPickItemId] = useState<number | null>(null)
-  const [workerPickIds, setWorkerPickIds] = useState<number[]>([])
-  const [workerPickBusy, setWorkerPickBusy] = useState(false)
-  // Arka arkaya tiklerken genelde aynı ekip çalışır — son seçim hatırlanır ve
-  // bir sonraki pencerede ön işaretli gelir (kullanıcı değiştirebilir).
-  const [lastWorkerIds, setLastWorkerIds] = useState<number[]>([])
   const [noteText, setNoteText] = useState('')
   const [noteBusy, setNoteBusy] = useState(false)
   // Usta/mühendisin, bakım sırasında tikledikleri bir alt madde için
@@ -782,16 +782,14 @@ function MaintenanceDetail({
     }
   }
 
-  // Kullanıcı isteği: "vardiyaya kişi ekleyince, tiklerken vardiyadaki
-  // kişilerden hangilerinin yaptığı seçilebilsin." Vardiyalı çalışma AÇIK ve
-  // seçilebilecek kişi varsa tik doğrudan kaydedilmez; önce çoklu seçim
-  // penceresi açılır (her madde için ayrı ayrı — aynı maddede birden fazla
-  // kişi çalışmış olabilir). Vardiyalı çalışma kapalıyken eski davranış
-  // korunur: doğrudan oturum sahibine atfedilir.
-  //
-  // Vardiya sorumlusu kuralı: yalnızca sorumlu (ve yönetici/mühendis/amir)
-  // BAŞKALARI adına işaretleyebilir. Sıradan bir vardiya üyesi listede
-  // yalnızca kendini görür — backend de aynı kuralı ayrıca uygular.
+  // Kullanıcı isteği: artık tiklerken açılan bir "kimler yaptı?" penceresi
+  // YOK. Sıradan bir vardiya üyesi zaten başkasını seçemediği için hiç
+  // sorulmaz — tik doğrudan kendi adına kaydedilir. Vardiya sorumlusu (ve
+  // yönetici/mühendis/amir) ise üstteki vardiya barından (bkz. shiftBar)
+  // önceden TIKLAYARAK seçtiği kişi(ler) adına tikler; bu seçim başka bir
+  // isme tıklanana kadar sonraki tüm tiklemelerde aynen kullanılır — her
+  // tikte yeniden isim sormaz. Kimse seçilmemişse (varsayılan) yine kendi
+  // adına kaydedilir.
   const pickerShift =
     shifts.find((s) => s.id === (m?.assigned_shift?.id ?? activeShiftId)) ?? null
   const canPickOthers = isStaff || pickerShift?.supervisor?.id === user.id
@@ -799,18 +797,16 @@ function MaintenanceDetail({
     ? pickerUsers
     : pickerUsers.filter((u) => u.id === user.id)
 
-  const workerPickerEnabled = shiftModeEnabled && selectableWorkers.length > 0
-
   function requestComplete(itemId: number) {
     setError('')
-    if (!workerPickerEnabled) {
+    if (!canPickOthers) {
       void submitComplete(itemId, [])
       return
     }
-    // Aynı vardiyada arka arkaya tiklerken çoğunlukla aynı ekip çalışır —
-    // son seçim ön işaretli gelir, kullanıcı gerekirse değiştirir.
-    setWorkerPickIds(lastWorkerIds.filter((wid) => selectableWorkers.some((u) => u.id === wid)))
-    setWorkerPickItemId(itemId)
+    // Üstteki vardiya barında seçili kişilerden yalnızca bu madde için
+    // geçerli olanlar (aynı vardiyada olanlar) kullanılır.
+    const ids = activeWorkerIds.filter((wid) => selectableWorkers.some((u) => u.id === wid))
+    void submitComplete(itemId, ids)
   }
 
   async function submitComplete(itemId: number, workerIds: number[]) {
@@ -823,23 +819,6 @@ function MaintenanceDetail({
       showToast('✓ Kaydedildi')
     } catch (e) {
       setError((e as Error).message)
-    }
-  }
-
-  async function confirmWorkerPick() {
-    if (workerPickItemId === null) return
-    if (workerPickIds.length === 0) {
-      setError('En az bir kişi seçin')
-      return
-    }
-    setWorkerPickBusy(true)
-    setError('')
-    try {
-      await submitComplete(workerPickItemId, workerPickIds)
-      setLastWorkerIds(workerPickIds)
-      setWorkerPickItemId(null)
-    } finally {
-      setWorkerPickBusy(false)
     }
   }
 
@@ -1502,85 +1481,6 @@ function MaintenanceDetail({
         </div>
       )}
 
-      {/* Madde tiklenirken "bu maddede kimler çalıştı?" — vardiyadaki
-          kişilerden bir veya birkaçı işaretlenir. Yalnızca vardiyalı çalışma
-          açıkken ve vardiyada kişi varken görünür. */}
-      {workerPickItemId !== null && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(15, 23, 42, 0.45)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 200,
-          }}
-          onClick={() => !workerPickBusy && setWorkerPickItemId(null)}
-        >
-          <div
-            className="card"
-            style={{ width: 380, maxWidth: '90vw' }}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
-              <Users size={15} /> Bu maddeyi kimler yaptı?
-            </h3>
-            <div className="muted" style={{ fontSize: 12.5, marginBottom: 10 }}>
-              {(() => {
-                const it = m ? findItemById(m.items ?? [], workerPickItemId) : null
-                return it ? it.name : 'Madde'
-              })()}
-              {' — '}
-              {canPickOthers ? (
-                <>vardiyada çalışan kişilerden bu maddede görev alanları işaretleyin.
-                Birden fazla kişi seçebilirsiniz.</>
-              ) : (
-                <>bu maddeyi kendi adınıza işaretliyorsunuz. Başkaları adına
-                işaretlemeyi yalnızca vardiya sorumlusu yapabilir.</>
-              )}
-            </div>
-            <div style={{ maxHeight: '45vh', overflowY: 'auto', marginBottom: 4 }}>
-              {selectableWorkers.map((u) => {
-                const checked = workerPickIds.includes(u.id)
-                return (
-                  <label
-                    key={u.id}
-                    className="row"
-                    style={{
-                      gap: 8, alignItems: 'center', padding: '7px 6px', cursor: 'pointer',
-                      borderRadius: 6, background: checked ? 'rgba(37, 99, 235, 0.08)' : 'transparent',
-                    }}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      disabled={workerPickBusy}
-                      onChange={() =>
-                        setWorkerPickIds((prev) =>
-                          prev.includes(u.id) ? prev.filter((x) => x !== u.id) : [...prev, u.id],
-                        )
-                      }
-                    />
-                    <Avatar name={u.full_name} size={22} />
-                    <span style={{ fontSize: 13 }}>{u.full_name}</span>
-                  </label>
-                )
-              })}
-            </div>
-            <div className="muted" style={{ fontSize: 12 }}>
-              {workerPickIds.length} kişi seçildi
-            </div>
-            <div className="row" style={{ marginTop: 14, gap: 8, justifyContent: 'flex-end' }}>
-              <button className="ghost" disabled={workerPickBusy} onClick={() => setWorkerPickItemId(null)}>
-                Vazgeç
-              </button>
-              <button
-                className="primary"
-                disabled={workerPickBusy || workerPickIds.length === 0}
-                onClick={confirmWorkerPick}
-              >
-                Tamamla
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
@@ -1640,6 +1540,22 @@ export default function MaintenancesPage({
   const [shiftBusy, setShiftBusy] = useState(false)
   const isStaff = user.role === 'admin' || user.role === 'engineer' || user.role === 'amir'
 
+  // Kullanıcı isteği: "vardiya sorumlusu her tikte isim seçmek yerine
+  // vardiyasındaki kendini ve diğer kişileri yukarıda vardiya kısmında
+  // görüyor ya oradan bir isme tıklasın o an tıkladığı isim için tikliyor
+  // olsun. Başka ismi seçene kadar tekrar isim sormasın. Birden fazla kişi
+  // seçebilme de olsun." — aşağıdaki vardiya barında (shiftBar) isme
+  // tıklandıkça bu listeye eklenip çıkarılır; MaintenanceDetail'e prop
+  // olarak geçilir ve her tiklemede kullanılır. Sıradan bir vardiya üyesi
+  // (sorumlu/yönetici değilse) isim tıklama arayüzünü hiç görmez — o zaman
+  // bu liste her zaman boş kalır ve tikler doğrudan kendi adına gider.
+  const [activeWorkerIds, setActiveWorkerIds] = useState<number[]>([])
+  function toggleActiveWorker(userId: number) {
+    setActiveWorkerIds((prev) =>
+      prev.includes(userId) ? prev.filter((x) => x !== userId) : [...prev, userId],
+    )
+  }
+
   // Kullanıcı isteği: vardiya isimleri değiştirilebilsin, yeni vardiya
   // açılıp kapatılabilsin (bkz. POST/PATCH/DELETE /shifts — manage_users
   // yetkisi gerektirir, üye atamasıyla aynı yetki).
@@ -1677,6 +1593,9 @@ export default function MaintenancesPage({
     setActiveShiftId(shiftId)
     localStorage.setItem(ACTIVE_SHIFT_STORAGE_KEY, String(shiftId))
     setAddMemberId('')
+    // Vardiya değişince önceki "şu an kimin adına tikliyorum" seçimi
+    // anlamsız kalır.
+    setActiveWorkerIds([])
   }
 
   async function setMemberShift(userId: number, shiftId: number | null) {
@@ -1791,6 +1710,11 @@ export default function MaintenancesPage({
     }
   }
 
+  // Vardiya sorumlusu (ve yönetici/mühendis/amir), aşağıdaki üye rozetlerine
+  // TIKLAYARAK "şu an kimin adına tikliyorum" seçimini yapar — sıradan bir
+  // üye bu tıklama arayüzünü hiç görmez, her zaman kendi adına tikler.
+  const canPickOthersInBar = isStaff || activeShift?.supervisor?.id === user.id
+
   const shiftBar = (
     <div className="card" style={{ marginBottom: 16 }}>
       <div className="row" style={{ gap: 10, flexWrap: 'wrap', alignItems: 'center' }}>
@@ -1885,7 +1809,9 @@ export default function MaintenancesPage({
       {shiftCrudError && <div className="error" style={{ marginTop: 8 }}>{shiftCrudError}</div>}
       <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
         {shiftMode?.enabled
-          ? 'Bir madde tikleyen/not ekleyen kişi, seçili vardiyadaki isimler arasından seçilir.'
+          ? (canPickOthersInBar
+              ? 'Sıradan vardiya üyeleri madde tikleyince otomatik kendi adlarına kaydedilir. Siz vardiya sorumlusu/yönetici olduğunuz için aşağıdaki isimlerden birine (veya birkaçına) tıklayarak o kişi(ler) adına tiklemeye geçebilirsiniz — başka bir isme tıklayana kadar seçim aynı kalır.'
+              : 'Madde tiklediğinizde otomatik olarak kendi adınıza kaydedilir — isim seçme penceresi çıkmaz.')
           : 'Kapalıyken bir madde tikleyen/not ekleyen kişi otomatik olarak o an giriş yapmış hesap olur — isim seçme penceresi çıkmaz.'}
       </div>
       {shiftMode?.enabled && activeShiftId != null && (
@@ -1894,35 +1820,79 @@ export default function MaintenancesPage({
             {activeShiftName} Üyeleri:
           </div>
           <div className="row" style={{ gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
-            {allUsers.filter((u) => u.shift_id === activeShiftId).map((u) => (
-              <span key={u.id} className="badge" style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12.5, padding: '4px 8px' }}>
-                <Avatar name={u.full_name} size={16} />
-                {u.full_name}
-                {activeShift?.supervisor?.id === u.id && (
-                  <span
-                    title="Vardiya sorumlusu — yalnızca bu kişi başkaları adına madde işaretleyebilir"
-                    style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontWeight: 600 }}
-                  >
-                    <ShieldAlert size={12} /> Sorumlu
-                  </span>
-                )}
-                {isStaff && (
-                  <button
-                    className="ghost"
-                    disabled={memberBusy}
-                    title="Vardiyadan çıkar"
-                    onClick={() => setMemberShift(u.id, null)}
-                    style={{ padding: 0, minWidth: 0, lineHeight: 1 }}
-                  >
-                    <UserMinus size={12} />
-                  </button>
-                )}
-              </span>
-            ))}
+            {allUsers.filter((u) => u.shift_id === activeShiftId).map((u) => {
+              const isActiveWorker = canPickOthersInBar && activeWorkerIds.includes(u.id)
+              return (
+                <span
+                  key={u.id}
+                  className="badge"
+                  style={{
+                    display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12.5, padding: '4px 8px',
+                    ...(isActiveWorker
+                      ? { background: 'rgba(37, 99, 235, 0.15)', border: '1px solid rgba(37, 99, 235, 0.5)' }
+                      : {}),
+                  }}
+                >
+                  {canPickOthersInBar ? (
+                    <button
+                      className="ghost"
+                      title={
+                        isActiveWorker
+                          ? 'Bu kişi adına tiklemeyi bırak'
+                          : 'Bundan sonraki tikleri bu kişi adına yap (başka bir isme tıklayana kadar)'
+                      }
+                      onClick={() => toggleActiveWorker(u.id)}
+                      style={{
+                        display: 'inline-flex', alignItems: 'center', gap: 5, padding: 0, minWidth: 0,
+                        border: 'none', background: 'transparent', font: 'inherit', color: 'inherit', cursor: 'pointer',
+                      }}
+                    >
+                      {isActiveWorker && <CheckCircle2 size={13} />}
+                      <Avatar name={u.full_name} size={16} />
+                      {u.full_name}
+                    </button>
+                  ) : (
+                    <>
+                      <Avatar name={u.full_name} size={16} />
+                      {u.full_name}
+                    </>
+                  )}
+                  {activeShift?.supervisor?.id === u.id && (
+                    <span
+                      title="Vardiya sorumlusu — yalnızca bu kişi başkaları adına madde işaretleyebilir"
+                      style={{ display: 'inline-flex', alignItems: 'center', gap: 3, fontWeight: 600 }}
+                    >
+                      <ShieldAlert size={12} /> Sorumlu
+                    </span>
+                  )}
+                  {isStaff && (
+                    <button
+                      className="ghost"
+                      disabled={memberBusy}
+                      title="Vardiyadan çıkar"
+                      onClick={() => setMemberShift(u.id, null)}
+                      style={{ padding: 0, minWidth: 0, lineHeight: 1 }}
+                    >
+                      <UserMinus size={12} />
+                    </button>
+                  )}
+                </span>
+              )
+            })}
             {allUsers.filter((u) => u.shift_id === activeShiftId).length === 0 && (
               <span className="muted" style={{ fontSize: 12.5 }}>Bu vardiyaya henüz kimse atanmamış.</span>
             )}
           </div>
+          {canPickOthersInBar && (
+            <div className="muted" style={{ fontSize: 12, marginTop: 8 }}>
+              {activeWorkerIds.length > 0
+                ? `Şu an ${allUsers
+                    .filter((u) => activeWorkerIds.includes(u.id))
+                    .map((u) => u.full_name)
+                    .join(', ')} adına tikliyorsunuz.`
+                : 'Kimse seçilmedi — tikler kendi adınıza kaydedilir. Başkası adına tiklemek için yukarıdan bir isme tıklayın.'}
+            </div>
+          )}
           {isStaff && (
             <div className="row" style={{ gap: 8, marginTop: 10, alignItems: 'center' }}>
               <select
@@ -2331,6 +2301,7 @@ export default function MaintenancesPage({
           activeShiftId={activeShiftId}
           shiftMembersVersion={shiftMembersVersion}
           shifts={shifts}
+          activeWorkerIds={activeWorkerIds}
           onOpenKnowledge={onOpenKnowledge}
         />
       </>
