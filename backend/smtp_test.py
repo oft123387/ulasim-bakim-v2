@@ -1,10 +1,11 @@
 """SMTP teşhis betiği — "mail gitmiyor" sorununu adım adım daraltır.
 
 Kullanım (sunucuda, çalışan konteynerin İÇİNDE — uygulamanın gördüğü
-ayarlarla test etmek için önemlidir):
+ayarlarla test etmek için önemlidir). Konteynerde çalışma dizini zaten
+/app/backend olduğu için "backend." öneki KULLANILMAZ:
 
-    docker compose exec app python -m backend.smtp_test
-    docker compose exec app python -m backend.smtp_test alici@ornek.com
+    docker compose exec app python smtp_test.py
+    docker compose exec app python smtp_test.py alici@ornek.com
 
 Docker'sız (Windows/geliştirme):
 
@@ -18,16 +19,17 @@ Hiçbir zaman şifreyi ekrana yazmaz.
 
 from __future__ import annotations
 
+import os
 import smtplib
 import socket
 import ssl
 import sys
 
-try:  # paket olarak (-m backend.smtp_test)
-    from app import config, email_utils
-except ImportError:  # doğrudan (python smtp_test.py)
-    sys.path.insert(0, __file__.rsplit("/", 1)[0])
-    from app import config, email_utils
+# Betik backend/ klasöründen çalıştırılır; "app" paketi onun altındadır.
+# Farklı bir dizinden çağrılsa da çalışsın diye kendi klasörünü sys.path'e
+# ekliyoruz (os.path ile — Windows'ta ayraç "\" olduğundan rsplit("/") yanlış).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from app import config, email_utils  # noqa: E402
 
 
 def main() -> int:
