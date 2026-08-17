@@ -2,6 +2,13 @@
 .git
 .gitignore
 .agents
+**/.pytest_cache
+_to_delete
+arsiv
+
+# Dokümantasyon ve sunumlar (imaja girmesine gerek yok)
+docs
+README.md
 
 # Node
 **/node_modules
@@ -17,6 +24,8 @@ backend/venv
 backend/*.db
 backend/ulasim_bakim.db
 backend/uploads
+backend/backups
+backend/logs
 
 # Gizli anahtarlar (SECRET_KEY / DATABASE_URL compose'tan verilir)
 backend/.env

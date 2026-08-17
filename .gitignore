@@ -43,6 +43,17 @@ backend/model_cache/
 
 # ---------------------------------------------------------------- Git / araç dosyaları
 .agents/
+.pytest_cache/
+
+# Temizlik sırasında ayrılan, gözden geçirilip elle silinecek dosyalar.
+_to_delete/
+arsiv/
+
+# Kök dizine düşen tek seferlik veri/arşiv dosyaları (yedek .db, .tgz, .zip):
+# bunların yeri repo değil, sunucudaki yedek klasörüdür.
+/*.db
+/*.tgz
+/*.zip
 
 # ---------------------------------------------------------------- IDE / işletim sistemi
 .vscode/

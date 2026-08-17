@@ -31,6 +31,13 @@ yerde toplar.
 * [Proje Yapısı](#proje-yapısı)
 * [Sık Karşılaşılan Sorunlar](#sık-karşılaşılan-sorunlar)
 
+> **Projeye yeni katılıyorsanız** sırasıyla: bu README'nin
+> [Mimari](#mimari) ve [Proje Yapısı](#proje-yapısı) bölümleri →
+> [`docs/sistem-aciklamasi.md`](docs/sistem-aciklamasi.md) (iş kuralları) →
+> [`docs/gelistirme-onerileri.md`](docs/gelistirme-onerileri.md) (bilinen
+> eksikler / yapılacaklar). Tüm doküman listesi:
+> [`docs/README.md`](docs/README.md).
+
 ## Öne Çıkan Özellikler
 
 **Bakım motoru**
@@ -446,27 +453,64 @@ yayınlanır (bkz. [Sunucuda otomatik güncelleme](#sunucuda-otomatik-güncellem
 
 ## Proje Yapısı
 
+Kök dizinde yalnızca çalıştırma/dağıtım dosyaları durur; tüm dokümanlar
+`docs/`, tüm kod `backend/` ve `frontend/` altındadır.
+
 ```
-backend/
+backend/                       FastAPI uygulaması
   app/
-    main.py        FastAPI uç noktaları
-    models.py       SQLAlchemy tabloları
-    schemas.py      Pydantic şemaları (API giriş/çıkış)
-    services.py     İş kuralları (bakım açma, yetkiler, KPI, vb.)
-    migrate.py      Otomatik/hafif şema migration'ları (SQLite)
-    auth.py         JWT kimlik doğrulama + yetki bağımlılıkları
-  tests/            pytest test paketi
-  data/             Gerçek koruyucu bakım kataloğu (koruyucu_bakim.xlsx)
-  seed.py           İlk kurulum örnek verisi
-frontend/
+    main.py                    HTTP uç noktaları (router katmanı)
+    services.py                İş kuralları (bakım açma, yetki, KPI, stok)
+    models.py                  SQLAlchemy tabloları
+    schemas.py                 Pydantic şemaları (API giriş/çıkış)
+    database.py                Motor/oturum kurulumu, DATABASE_URL
+    migrate.py                 Hafif otomatik şema migration'ları (SQLite)
+    auth.py                    JWT kimlik doğrulama + yetki bağımlılıkları
+    config.py                  Ortam değişkeni okuma
+    events.py                  SSE canlı güncelleme yayını
+    excel_utils.py             Excel içe/dışa aktarma (araç, katalog, KPI)
+    export_utils.py            PDF / Word / CSV çıktıları
+    email_utils.py             SMTP bildirimleri
+    backup_utils.py            Otomatik + elle veritabanı yedeği
+    logging_setup.py           Log biçimi ve dosyaya yazma
+    rate_limit.py              İstek hız sınırı
+    qr_utils.py                QR kod üretimi
+    bg_remove.py               Parça görselinden arka plan temizleme
+    assets/                    E-posta şablonu görselleri
+  tests/                       pytest test paketi (24 dosya)
+  data/                        Gerçek bakım kataloğu, varsayılan diyagram/3D model
+  seed.py                      İlk kurulum örnek verisi
+  import_tree.py               Excel'den bakım ağacını içe aktarma
+  cleanup_nonbase_plans.py     Tek seferlik bakım betiği
+  reset_bulk_models.py         Tek seferlik bakım betiği
+  requirements.txt             Çalışma bağımlılıkları
+  requirements-dev.txt         Test/geliştirme bağımlılıkları
+  (uploads/ backups/ logs/ *.db  → çalışma zamanında oluşur, repo'ya girmez)
+
+frontend/                      React + TypeScript + Vite
   src/
-    pages/          Her ana sayfa (Dashboard, Bakımlar, Takvim, KPI, ...)
-    components/     Paylaşılan arayüz bileşenleri (ui.tsx, vb.)
-    api.ts          Backend'e istek yardımcıları
-    types.ts        Paylaşılan TypeScript tipleri
-docker-compose.yml  Üretim/geliştirme Docker düzeni (app + watchtower)
-Dockerfile          Çok aşamalı build (frontend derleme → backend imajı)
-.github/workflows/  CI (pytest + tsc/build) ve GHCR imaj yayını
+    pages/                     Her ana sayfa (Dashboard, Bakımlar, Takvim, KPI, ...)
+    components/                Paylaşılan arayüz bileşenleri (ui.tsx, toast, 3D, ...)
+    api.ts                     Backend'e istek yardımcıları
+    types.ts                   Paylaşılan TypeScript tipleri
+    format.ts                  Tarih/sayı biçimleme
+    liveEvents.ts              SSE istemcisi
+    index.css                  Tüm stiller (tek dosya)
+  (dist/ node_modules/         → derleme çıktısı, repo'ya girmez)
+
+docs/                          Tüm proje dokümantasyonu — bkz. docs/README.md
+  sistem-aciklamasi.md
+  gelistirme-onerileri.md
+  sunucu-kurulumu.md
+  bakim-periyot-duzeltmesi-notlari.md
+  sunumlar/                    Yönetim/proje sunumları (.pptx)
+
+docker-compose.yml             Üretim/geliştirme Docker düzeni (app + watchtower)
+Dockerfile                     Çok aşamalı build (frontend derleme → backend imajı)
+docker-entrypoint.sh           Konteyner başlangıç betiği
+baslat.bat                     Windows'ta Docker'sız hızlı başlatma
+.github/workflows/ci.yml       CI (pytest + tsc/build) ve GHCR imaj yayını
+.env.example / backend/.env.example   Ortam değişkeni şablonları
 ```
 
 ## Sık Karşılaşılan Sorunlar
