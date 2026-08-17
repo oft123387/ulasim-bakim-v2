@@ -14,11 +14,6 @@ services:
     #    kendisi fark edip indirip yeniden başlatır — yani ilk kurulumdan
     #    sonra tek bir komut bile yazmanıza gerek kalmaz.
     build: .
-    # NOT: Depo beyziki/ulasim-bakim'den beyziki/ulasim-bakim-v2'ye taşındı
-    # (eski depoda GitHub Actions kısıtlanmıştı, GitHub Destek'e bildirildi).
-    # GitHub Actions imajı her zaman "ghcr.io/<repo adı>" olarak etiketler
-    # (bkz. .github/workflows/ci.yml → images: ghcr.io/${{ github.repository }}),
-    # bu yüzden bu satır da yeni depo adıyla güncellendi.
     image: ghcr.io/beyziki/ulasim-bakim-v2:latest
     pull_policy: always
     labels:
@@ -57,11 +52,6 @@ services:
     env_file:
       - backend/.env
     environment:
-      # Saat dilimi — uygulama tarih/saatleri sunucunun YEREL saatiyle yazar
-      # (datetime.now()). Konteyner varsayılanı UTC olduğundan Türkiye'de tüm
-      # kayıtlar 3 saat geride görünüyordu. Başka bir ülkede kullanılacaksa
-      # yalnızca bu satır değişir (imajın kendi varsayılanı da Europe/Istanbul,
-      # bkz. Dockerfile).
       TZ: "Europe/Istanbul"
       # Veritabanı kalıcı volume içinde (db-data). SQLite mutlak yol (4 bölü).
       DATABASE_URL: "sqlite:////app/data/ulasim_bakim.db"

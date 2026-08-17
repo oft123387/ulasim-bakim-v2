@@ -31,6 +31,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from . import config
+from .logging_setup import logger
 
 APP_NAME = "Ulaşım Bakım Yönetim Sistemi"
 
@@ -44,6 +45,22 @@ _BANNER_CID = "ulasim-bakim-banner"
 
 def is_configured() -> bool:
     return bool(config.get("SMTP_HOST", ""))
+
+
+def config_summary() -> dict:
+    """SMTP ayarlarının teşhis için güvenli özeti — şifre ASLA döndürülmez,
+    yalnızca girilip girilmediği ve uzunluğu bildirilir (bkz. smtp_test.py ve
+    /api/system/status)."""
+    password = config.get("SMTP_PASSWORD", "")
+    return {
+        "host": config.get("SMTP_HOST", "") or "(boş)",
+        "port": config.get("SMTP_PORT", "587") or "587",
+        "user": config.get("SMTP_USER", "") or "(boş)",
+        "from": config.get("SMTP_FROM", "") or "(boş — SMTP_USER kullanılacak)",
+        "password_set": bool(password),
+        "password_len_stripped": len(password.replace(" ", "")),
+        "banner_found": os.path.isfile(_BANNER_PATH),
+    }
 
 
 def _html_body(body: str) -> str:
@@ -87,7 +104,15 @@ def _html_body(body: str) -> str:
 def send_email(to_addr: str, subject: str, body: str) -> bool:
     host = config.get("SMTP_HOST", "")
     if not host:
-        print(f"[email devre dışı — SMTP yapılandırılmamış] to={to_addr} subject={subject}\n{body}")
+        # SMTP_HOST yoksa gönderim yapılmaz. Bu satır ÖNEMLİ bir teşhis
+        # ipucudur: sunucuda mail hiç gitmiyorsa ilk bakılacak yer budur —
+        # backend/.env'de SMTP_HOST var mı, docker compose onu env_file ile
+        # konteynere aktarmış mı (bkz. docker-compose.yml).
+        logger.warning(
+            "E-posta gönderilmedi: SMTP yapılandırılmamış (SMTP_HOST boş). "
+            "alıcı=%s konu=%s", to_addr, subject
+        )
+        logger.info("[SMTP kapalı — kod konsola yazıldı]\n%s", body)
         return False
 
     port = int(config.get("SMTP_PORT", "587") or "587")
@@ -120,15 +145,42 @@ def send_email(to_addr: str, subject: str, body: str) -> bool:
     msg["From"] = from_addr
     msg["To"] = to_addr
 
+    # NOT: 465 numaralı port "implicit SSL"dir — starttls ile konuşulmaz,
+    # doğrudan SMTP_SSL ile bağlanılması gerekir. Önceden bu ayrım yoktu ve
+    # SMTP_PORT=465 girildiğinde bağlantı sessizce zaman aşımına uğruyordu.
+    use_ssl = port == 465
     try:
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.starttls()
+        if use_ssl:
+            server = smtplib.SMTP_SSL(host, port, timeout=20)
+        else:
+            server = smtplib.SMTP(host, port, timeout=20)
+        with server:
+            if not use_ssl:
+                server.starttls()
             if user:
                 server.login(user, password)
             server.sendmail(from_addr, [to_addr], msg.as_string())
+        logger.info("E-posta gönderildi: alıcı=%s konu=%s", to_addr, subject)
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        # Gmail'de en sık sebep: normal hesap şifresi girilmiş olması.
+        # SMTP AUTH için 2 Adımlı Doğrulama açık + "Uygulama Şifresi" şart.
+        logger.error(
+            "E-posta gönderilemedi (KİMLİK DOĞRULAMA): alıcı=%s kullanıcı=%s hata=%s — "
+            "Gmail kullanıyorsanız SMTP_PASSWORD normal şifre DEĞİL, 16 haneli "
+            "Uygulama Şifresi olmalı.", to_addr, user, e
+        )
+        return False
+    except (OSError, smtplib.SMTPException) as e:
+        # Zaman aşımı / bağlantı reddi genelde sunucunun 587 numaralı porta
+        # giden trafiğinin kurumsal güvenlik duvarınca engellenmesidir.
+        logger.error(
+            "E-posta gönderilemedi (BAĞLANTI/SMTP): alıcı=%s sunucu=%s:%s hata=%s: %s",
+            to_addr, host, port, type(e).__name__, e
+        )
+        return False
     except Exception as e:  # noqa: BLE001 — e-posta hatası isteği kesmemeli
-        print(f"[email gönderilemedi] to={to_addr}: {e}")
+        logger.exception("E-posta gönderilemedi (beklenmeyen): alıcı=%s hata=%s", to_addr, e)
         return False
 
 

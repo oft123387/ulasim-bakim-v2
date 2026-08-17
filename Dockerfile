@@ -12,7 +12,6 @@ RUN npm install
 COPY frontend/ ./
 RUN npm run build
 
-
 # ============================================================
 # 2. Aşama — Backend (FastAPI) çalışma ortamı
 # ============================================================
@@ -20,10 +19,7 @@ FROM python:3.12-slim AS backend
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     # Saat dilimi: uygulama tarihleri datetime.now() ile SUNUCUNUN YEREL
-    # saatine göre yazar. Konteyner varsayılanı UTC olduğu için Türkiye'de
-    # tüm kayıtlar 3 saat geride görünüyordu — imaja tzdata kurulup varsayılan
-    # bölge İstanbul yapılıyor. docker-compose.yml'deki TZ değişkeni bunu
-    # ezebilir (başka bir ülkede kullanılırsa).
+    # saatine göre yazar.
     TZ=Europe/Istanbul
 WORKDIR /app/backend
 
