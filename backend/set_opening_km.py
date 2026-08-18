@@ -251,6 +251,20 @@ def main() -> None:
             db.query(models.MaintenanceNote).delete(synchronize_session=False)
             db.query(models.Maintenance).delete(synchronize_session=False)
             db.commit()
+            # Toplu silme (synchronize_session=False) oturumun kimlik
+            # haritasını (identity map) temizlemez. SQLite silinen birincil
+            # anahtarları yeniden kullandığı için, hemen ardından açılan yeni
+            # bir iş emri aynı id'yi alabilir ve SQLAlchemy "identity map
+            # already had an identity ... replacing it" uyarısı verir.
+            # Zararsızdır ama kafa karıştırır — yalnızca iş emriyle ilgili
+            # nesneler haritadan düşürülerek önlenir (araç nesneleri oturumda
+            # kalmalı, aşağıda baseline_km'leri yazılacak).
+            for _obj in list(db.identity_map.values()):
+                if isinstance(
+                    _obj,
+                    (models.Maintenance, models.MaintenanceItem, models.MaintenanceNote),
+                ):
+                    db.expunge(_obj)
             services.log_action(
                 db, None, "delete_all", "maintenance", None,
                 f"TÜM bakım iş emirleri silindi ({silinen} kayıt, tamamlananlar dahil)",
