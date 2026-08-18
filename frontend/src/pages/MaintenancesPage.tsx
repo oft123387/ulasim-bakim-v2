@@ -1979,6 +1979,32 @@ export default function MaintenancesPage({
   const [flowFilterShift, setFlowFilterShift] = useState<number | ''>('')
   const [flowShiftAssignBusy, setFlowShiftAssignBusy] = useState<number | null>(null)
   const flowCardRef = useRef<HTMLDivElement>(null)
+
+  // Bir iş emri detayından listeye DÖNÜLDÜĞÜNDE (tarayıcının geri tuşu ya da
+  // detay içindeki "Bakım Listesi" düğmesi — ikisi de aynı popstate'i
+  // tetikler, bkz. useDetailHistory.ts) sayfanın en başına, Bakım Akışı
+  // kartına döner.
+  //
+  // NEDEN: detaya girmeden önce listenin ortasında/aşağısındaysa, geri
+  // dönüldüğünde tarayıcı o eski kaydırma konumunu koruyordu; tablette uzun
+  // listede kullanıcı "neredeyim?" durumunda kalıyordu. Artık her dönüşte
+  // listenin başından devam edilir.
+  //
+  // Yalnızca detay -> liste geçişinde çalışır: sayfa ilk açılışında ya da
+  // liste içinde gezinirken kaydırmaya dokunmaz.
+  const prevSelectedRef = useRef<number | null>(selected)
+  useEffect(() => {
+    const prev = prevSelectedRef.current
+    prevSelectedRef.current = selected
+    if (prev === null || selected !== null) return
+    // Liste bu render'da yeni monte edildiği için ref bir sonraki karede
+    // hazır olur.
+    requestAnimationFrame(() => {
+      flowCardRef.current?.scrollIntoView({ behavior: 'auto', block: 'start' })
+      window.scrollTo({ top: 0, behavior: 'auto' })
+    })
+  }, [selected])
+
   const loadUpcoming = useCallback(() => {
     api<UpcomingItem[]>('/vehicles/alerts').then(setUpcoming).catch(() => setUpcoming([]))
   }, [])

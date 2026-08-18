@@ -92,6 +92,25 @@ const NAV_ICONS: Record<Page, ReactElement> = {
   profile: <UserCircle2 size={17} />,
 }
 
+/** Sayfa yenilendiğinde son sayfanın saklandığı anahtar (sessionStorage). */
+const LAST_PAGE_KEY = 'last_page'
+
+/** Yenilemeden sonra geri dönülebilecek sayfalar — bilerek yalnızca HER role
+ * açık olanlar (bkz. aşağıdaki `menu`: show === true olanlar). Role bağlı
+ * sayfalar (Yetki Yönetimi, Kullanıcılar, Sistem Durumu vb.) dışarıda
+ * tutuldu: kullanıcının rolü değişmişse ya da tablette başka bir hesapla
+ * oturum açılmışsa boş bir ekranla karşılaşmasın, Dashboard'a düşsün. */
+const RESTORABLE_PAGES: Page[] = [
+  'dashboard',
+  'maintenances',
+  'history',
+  'parts',
+  'knowledge',
+  'suggestions',
+  'help',
+  'profile',
+]
+
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
   tree: 'Bakım Ağacı',
@@ -117,6 +136,10 @@ export default function App() {
   const [perms, setPerms] = useState<MyPermissions | null>(null)
   const [loading, setLoading] = useState(true)
   const [page, setPage] = useState<Page>('dashboard')
+  // Son sayfa geri yüklemesi oturumda yalnızca BİR kez çalışsın — kullanıcı
+  // yüklendikten sonra menüden başka bir sayfaya geçtiğinde tekrar
+  // tetiklenip onu geri sürüklememeli.
+  const pageRestoredRef = useRef(false)
   const [jumpToMaintenance, setJumpToMaintenance] = useState<number | null>(null)
   const [maintFilter, setMaintFilter] = useState<{ status?: string; planName?: string } | null>(null)
   const [historyFilter, setHistoryFilter] = useState<Partial<HistoryFilters> | null>(null)
@@ -237,6 +260,35 @@ export default function App() {
     startLiveEvents()
     return () => stopLiveEvents()
   }, [user])
+
+  // ------------------------------------------------ son sayfayı hatırlama
+  // Tablette çalışırken sayfa yenilenince (F5, uygulamanın arka plandan
+  // dönmesi, tarayıcının sekmeyi tazelemesi) kullanıcı Dashboard'a
+  // düşüyordu; ustanın üzerinde çalıştığı Bakımlar sayfasına elle geri
+  // dönmesi gerekiyordu. Artık son sayfa sekme oturumunda saklanır ve
+  // yenilemeden sonra oraya dönülür.
+  //
+  // sessionStorage bilinçli tercih: oturum jetonu da orada tutuluyor
+  // (bkz. api.ts), yani sekme kapanınca ikisi birden düşer — "yenileme"
+  // hatırlar, "yeni oturum" hatırlamaz.
+  //
+  // GERİ TUŞU davranışı korunur: geri yüklenen sayfa, geçmişin en altına
+  // bırakılan Dashboard girdisinin ÜSTÜNE eklenir. Böylece kullanıcı geri
+  // tuşuna basınca (istenen davranış) yine Dashboard'a çıkar.
+  useEffect(() => {
+    if (!user || pageRestoredRef.current) return
+    pageRestoredRef.current = true
+    const saved = sessionStorage.getItem(LAST_PAGE_KEY) as Page | null
+    if (!saved || saved === 'dashboard') return
+    if (!RESTORABLE_PAGES.includes(saved)) return
+    setPage(saved)
+    window.history.replaceState({ page: 'dashboard' }, '', '')
+    window.history.pushState({ page: saved }, '', '')
+  }, [user])
+
+  useEffect(() => {
+    if (user) sessionStorage.setItem(LAST_PAGE_KEY, page)
+  }, [page, user])
 
   // QR kod ile açılan derin bağlantıyı uygular: ?vehicle_id=… aracın
   // profil/bakım geçmişi sayfasını, ?part_id=… ilgili parçanın Parça
@@ -520,6 +572,9 @@ export default function App() {
               setToken(null)
               setRefreshToken(null)
               setUser(null)
+              // Çıkışta hatırlanan sayfa da temizlenir — tablette bir sonraki
+              // kişi, önceki kullanıcının kaldığı sayfayla karşılaşmasın.
+              sessionStorage.removeItem(LAST_PAGE_KEY)
               setPage('dashboard')
               setNavOpen(false)
             }}
