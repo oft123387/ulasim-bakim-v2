@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, apiDownload, apiUpload, apiUploadWithFields } from '../api'
-import type { KmSimConfig, KmSimRunResult, Maintenance, UpcomingItem, User, Vehicle, VehicleAttachment, VehicleProfile } from '../types'
+import type { KmSimConfig, KmSimRunResult, Maintenance, Plan, UpcomingItem, User, Vehicle, VehicleAttachment, VehicleProfile } from '../types'
 import { STATUS_TR } from '../types'
 import { PageHeader, Badge, SearchInput, EmptyState, SkeletonTableRows, StatCard } from '../components/ui'
 import { showToast } from '../components/toast'
@@ -216,11 +216,13 @@ function InfoField({ label, value }: { label: string; value: React.ReactNode }) 
 
 function VehicleDetail({
   vehicle,
+  perms,
   onBack,
   onOpenMaintenance,
   onChanged,
 }: {
   vehicle: Vehicle
+  perms: Record<string, boolean>
   onBack: () => void
   onOpenMaintenance: (id: number) => void
   onChanged: () => void
@@ -240,6 +242,28 @@ function VehicleDetail({
   const [docBusy, setDocBusy] = useState(false)
   const docFileRef = useRef<HTMLInputElement>(null)
 
+  // ---------------------------------------------- Bakım başlatma (araç sayfası)
+  // İKİ AYRI İŞLEM — karıştırılmamalı:
+  //   1) "Bekleyeni Başlat"  : sistemin bu araç için OTOMATİK tespit ettiği,
+  //      henüz kimsenin onaylamadığı adayı devreye alır (Bakımlar sayfasındaki
+  //      "Başlatılmayı Bekleyenler" ile aynı işlem, sadece bu araca süzülmüş).
+  //      Hedef km'yi sistem belirler, kullanıcı seçemez.
+  //   2) "Yeni Bakım Başlat" : otomatik tespiti hiç beklemeden, periyot ve
+  //      hedef km'yi kullanıcının kendisi seçtiği elle iş emri açar
+  //      (POST /maintenances/manual). Doğrudan aktif olarak açılır.
+  const [vehicleAlerts, setVehicleAlerts] = useState<UpcomingItem[]>([])
+  const [startOpen, setStartOpen] = useState(false)
+  const [startBusy, setStartBusy] = useState<number | null>(null)
+  const [startError, setStartError] = useState('')
+
+  const [newOpen, setNewOpen] = useState(false)
+  const [newPlans, setNewPlans] = useState<Plan[]>([])
+  const [newPlanId, setNewPlanId] = useState<number | ''>('')
+  const [newTargetKm, setNewTargetKm] = useState('')
+  const [newTargetDate, setNewTargetDate] = useState('')
+  const [newBusy, setNewBusy] = useState(false)
+  const [newError, setNewError] = useState('')
+
   const load = () => {
     api<VehicleProfile>(`/vehicles/${vehicle.id}/profile`)
       .then(setProfile)
@@ -247,6 +271,12 @@ function VehicleDetail({
     api<Maintenance[]>(`/maintenances?vehicle_id=${vehicle.id}`)
       .then(setHistory)
       .catch(() => setHistory([]))
+    // Yalnızca başlatma yetkisi olanlar aday listesini görebilir.
+    if (perms.start_maintenance) {
+      api<UpcomingItem[]>('/vehicles/alerts')
+        .then((rows) => setVehicleAlerts(rows.filter((u) => u.vehicle.id === vehicle.id)))
+        .catch(() => setVehicleAlerts([]))
+    }
   }
   useEffect(load, [vehicle.id])
   // Bu araca ait bir bakım başka bir sayfada (Bakımlar) tamamlanır/açılırsa
@@ -255,6 +285,80 @@ function VehicleDetail({
   useLiveEvent(['maintenance', 'vehicle'], load)
 
   const v = profile?.vehicle ?? vehicle
+
+  // Henüz iş emri açılıp başlatılmamış adaylar — "Bekleyeni Başlat" bunları
+  // listeler. maintenance_id dolu VE zaten başlatılmışsa aday sayılmaz;
+  // backend başlatılmış olanları status='planlandi' ile işaretler.
+  const pendingAlerts = vehicleAlerts.filter((u) => u.status !== 'planlandi')
+
+  // Bu araca uygulanabilecek planlar: "genel" (vehicle_model boş) planlar ve
+  // aracın modeliyle eşleşenler — backend de aynı kuralı uygular, kullanıcıya
+  // hiç kabul edilmeyecek bir seçenek gösterilmesin diye burada da süzülür.
+  const applicablePlans = newPlans.filter(
+    (p) => p.is_active && (!p.vehicle_model || p.vehicle_model === v.model),
+  )
+  const newPlan = applicablePlans.find((p) => p.id === newPlanId) ?? null
+
+  function openNewMaintenance() {
+    setNewPlanId('')
+    setNewTargetKm('')
+    setNewTargetDate('')
+    setNewError('')
+    setNewOpen(true)
+    if (newPlans.length === 0) {
+      api<Plan[]>('/plans').then(setNewPlans).catch(() => setNewPlans([]))
+    }
+  }
+
+  // Aday iş emrini devreye alır. maintenance_id henüz yoksa (kayıt gerçekten
+  // açılmamışsa) önce plan-upcoming ile idempotent şekilde oluşturulur —
+  // MaintenancesPage.planUpcoming ile birebir aynı akış.
+  async function startPending(item: UpcomingItem) {
+    setStartBusy(item.maintenance_id ?? -item.target_km)
+    setStartError('')
+    try {
+      const maintenanceId =
+        item.maintenance_id ??
+        (await api<Maintenance>('/maintenances/plan-upcoming', {
+          method: 'POST',
+          body: { vehicle_id: v.id, target_km: item.target_km },
+        })).id
+      await api(`/maintenances/${maintenanceId}/start`, { method: 'POST', body: {} })
+      setStartOpen(false)
+      load()
+      onChanged()
+      showToast(`✓ ${v.code} bakımı başlatıldı`, 'info')
+    } catch (e) {
+      setStartError((e as Error).message)
+    } finally {
+      setStartBusy(null)
+    }
+  }
+
+  async function submitNewMaintenance() {
+    if (newPlanId === '') return
+    const isTimePlan = newPlan?.plan_type === 'time'
+    if (isTimePlan ? !newTargetDate.trim() : !newTargetKm.trim()) return
+    setNewBusy(true)
+    setNewError('')
+    try {
+      const created = await api<Maintenance>('/maintenances/manual', {
+        method: 'POST',
+        body: isTimePlan
+          ? { vehicle_id: v.id, plan_id: newPlanId, target_date: newTargetDate }
+          : { vehicle_id: v.id, plan_id: newPlanId, target_km: Number(newTargetKm) },
+      })
+      setNewOpen(false)
+      load()
+      onChanged()
+      showToast('✓ Yeni bakım iş emri açıldı', 'info')
+      onOpenMaintenance(created.id)
+    } catch (e) {
+      setNewError((e as Error).message)
+    } finally {
+      setNewBusy(false)
+    }
+  }
 
   async function uploadPhoto(file: File) {
     setPhotoBusy(true)
@@ -584,6 +688,55 @@ function VehicleDetail({
         </div>
       </div>
 
+      {/* Bakım başlatma — iki ayrı işlem, farkı açıkça yazılı */}
+      {(perms.start_maintenance || perms.create_maintenance) && (
+        <div className="card" style={{ marginTop: 16 }}>
+          <div className="card-title" style={{ marginBottom: 4 }}>Bakım Başlat</div>
+          <div className="muted" style={{ fontSize: 12.5, marginBottom: 12 }}>
+            Bu araç için bakım iş emri açmanın iki yolu var — hangisini kullanacağınıza
+            aşağıdaki açıklamalara bakarak karar verin.
+          </div>
+          {startError && <div className="error" style={{ marginBottom: 10 }}>{startError}</div>}
+          <div className="vstart-actions">
+            {perms.start_maintenance && (
+              <div className="vstart-option">
+                <button
+                  className="primary"
+                  onClick={() => { setStartError(''); setStartOpen(true) }}
+                  disabled={pendingAlerts.length === 0}
+                  title={
+                    pendingAlerts.length === 0
+                      ? 'Bu araç için sistemin tespit ettiği bekleyen bir bakım yok'
+                      : 'Sistemin otomatik tespit ettiği bakımı devreye al'
+                  }
+                >
+                  <Play size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
+                  Bekleyeni Başlat
+                  <span className="vstart-count">{pendingAlerts.length}</span>
+                </button>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
+                  <strong>Sistemin bulduğu</strong> bakımı devreye alır. Hedef km'yi araç
+                  kilometresine göre sistem belirler; siz yalnızca onaylarsınız.
+                  {pendingAlerts.length === 0 && ' Şu an bekleyen aday yok.'}
+                </div>
+              </div>
+            )}
+            {perms.create_maintenance && (
+              <div className="vstart-option">
+                <button onClick={openNewMaintenance} title="Periyot ve hedef km'yi kendiniz seçin">
+                  <PlusCircle size={14} style={{ marginRight: 6, verticalAlign: -2 }} />
+                  Yeni Bakım Başlat
+                </button>
+                <div className="muted" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.5 }}>
+                  <strong>Sıfırdan</strong> iş emri açar. Periyodu ve hedef km'yi siz
+                  seçersiniz; otomatik tespit beklenmez, iş emri hemen aktif olur.
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Bakım geçmişi */}
       <div className="table-card" style={{ marginTop: 16 }}>
         <div className="table-toolbar"><div className="card-title">Bakım Geçmişi</div></div>
@@ -630,6 +783,148 @@ function VehicleDetail({
           </div>
         )}
       </div>
+
+      {/* "Bekleyeni Başlat" — sistemin tespit ettiği adaylar */}
+      {startOpen && (
+        <div
+          className="vstart-backdrop"
+          onClick={() => startBusy === null && setStartOpen(false)}
+        >
+          <div className="card vstart-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <Play size={15} /> Bekleyen Bakımı Başlat
+            </h3>
+            <div className="muted" style={{ fontSize: 12.5, marginBottom: 14 }}>
+              {v.code} için sistemin otomatik tespit ettiği bakımlar. "Başlat" dediğinizde
+              iş emri açılır ve Bakımlar listesinde görünmeye başlar.
+            </div>
+            {startError && <div className="error" style={{ marginBottom: 10 }}>{startError}</div>}
+            {pendingAlerts.length === 0 ? (
+              <EmptyState
+                title="Bekleyen bakım yok"
+                description="Bu araç için sistemin şu an tespit ettiği bir bakım bulunmuyor."
+              />
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                {pendingAlerts.map((u) => {
+                  const key = u.maintenance_id ?? -u.target_km
+                  return (
+                    <div key={key} className="vstart-row">
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontWeight: 600, fontSize: 13.5 }}>{u.plan_name}</div>
+                        <div className="muted" style={{ fontSize: 12 }}>
+                          Hedef: {targetLabel(u.target_km, u.target_date, v.model)} ·{' '}
+                          {remainingDisplayV(u)}
+                        </div>
+                      </div>
+                      <button
+                        className="small primary"
+                        disabled={startBusy !== null}
+                        onClick={() => startPending(u)}
+                      >
+                        {startBusy === key ? 'Başlatılıyor…' : 'Başlat'}
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            <div className="row" style={{ justifyContent: 'flex-end', marginTop: 14 }}>
+              <button className="ghost" disabled={startBusy !== null} onClick={() => setStartOpen(false)}>
+                Kapat
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* "Yeni Bakım Başlat" — periyot + hedef kullanıcı tarafından seçilir */}
+      {newOpen && (
+        <div
+          className="vstart-backdrop"
+          onClick={() => !newBusy && setNewOpen(false)}
+        >
+          <div className="card vstart-modal" onClick={(e) => e.stopPropagation()}>
+            <h3 style={{ marginTop: 0, fontSize: 15, display: 'flex', alignItems: 'center', gap: 6 }}>
+              <PlusCircle size={15} /> Yeni Bakım Başlat
+            </h3>
+            <div className="muted" style={{ fontSize: 12.5, marginBottom: 14 }}>
+              {v.code} ({fmtKm(v.current_km)} km) için otomatik tespiti beklemeden, periyodu ve
+              hedefi kendiniz belirleyerek doğrudan aktif bir iş emri açar.
+            </div>
+            {newError && <div className="error" style={{ marginBottom: 10 }}>{newError}</div>}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              <label style={{ fontSize: 12.5 }}>
+                <div className="muted" style={{ marginBottom: 4 }}>Periyot / Plan</div>
+                <select
+                  style={{ width: '100%' }}
+                  value={newPlanId}
+                  onChange={(e) => {
+                    const id = e.target.value ? Number(e.target.value) : ''
+                    setNewPlanId(id)
+                    setNewTargetKm('')
+                    setNewTargetDate('')
+                    const plan = applicablePlans.find((p) => p.id === id)
+                    // Aracın güncel km'sinden sonraki ilk periyot katını öneri
+                    // olarak doldurur — kullanıcı elle değiştirebilir.
+                    if (plan && plan.plan_type === 'km' && plan.interval_km > 0) {
+                      setNewTargetKm(
+                        String(Math.ceil((v.current_km + 1) / plan.interval_km) * plan.interval_km),
+                      )
+                    }
+                  }}
+                >
+                  <option value="">Periyot seçin…</option>
+                  {applicablePlans.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                      {p.vehicle_model ? ` · ${p.vehicle_model}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {newPlan?.plan_type === 'time' ? (
+                <label style={{ fontSize: 12.5 }}>
+                  <div className="muted" style={{ marginBottom: 4 }}>Hedef Tarih</div>
+                  <input
+                    type="date"
+                    style={{ width: '100%' }}
+                    value={newTargetDate}
+                    onChange={(e) => setNewTargetDate(e.target.value)}
+                  />
+                </label>
+              ) : (
+                <label style={{ fontSize: 12.5 }}>
+                  <div className="muted" style={{ marginBottom: 4 }}>Hedef KM</div>
+                  <input
+                    type="number"
+                    style={{ width: '100%' }}
+                    value={newTargetKm}
+                    placeholder="ör. 1.500.000"
+                    onChange={(e) => setNewTargetKm(e.target.value)}
+                  />
+                </label>
+              )}
+            </div>
+            <div className="row" style={{ justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+              <button className="ghost" disabled={newBusy} onClick={() => setNewOpen(false)}>
+                Vazgeç
+              </button>
+              <button
+                className="primary"
+                disabled={
+                  newBusy ||
+                  newPlanId === '' ||
+                  (newPlan?.plan_type === 'time' ? !newTargetDate.trim() : !newTargetKm.trim())
+                }
+                onClick={submitNewMaintenance}
+              >
+                {newBusy ? 'Açılıyor…' : 'Bakımı Başlat'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -881,6 +1176,7 @@ export default function VehiclesPage({
     return (
       <VehicleDetail
         vehicle={selected}
+        perms={perms}
         onBack={() => window.history.back()}
         onOpenMaintenance={onOpenMaintenance}
         onChanged={load}

@@ -553,7 +553,7 @@ table.standalone { background: var(--surface); border-radius: var(--radius-lg); 
   border-radius: 50%;
   pointer-events: none;
 }
-.dashboard-page .page-header { position: relative; z-index: 1; margin-bottom: 0; }
+.dashboard-page .page-header { position:absolute; z-index: 1; margin-bottom: 0; }
 .dashboard-page .page-header h1 { font-size: 23px; }
 .dashboard-page .page-header .page-subtitle { max-width: 720px; line-height: 1.55; }
 .dashboard-page .page-actions .primary { box-shadow: 0 8px 18px rgba(27, 77, 160, 0.20); }
@@ -1938,4 +1938,66 @@ tbody tr.planned-row td:first-child { border-left: 4px solid var(--green); }
   .mnt-cal-cell { min-height: 56px; padding: 4px 3px; }
   .mnt-cal-chip { font-size: 9.5px; }
   .mnt-cal-item-sub { font-size: 11px; }
+}
+
+/* ---------------------------------------------------------------------------
+   Araç profil sayfası — "Bakım Başlat" bloğu (iki ayrı işlem yan yana):
+   "Bekleyeni Başlat" (sistemin bulduğu adayı devreye alır) ve
+   "Yeni Bakım Başlat" (periyot + hedefi kullanıcının seçtiği elle iş emri).
+   İkisinin farkı görsel olarak da belli olsun diye ayrı kutulara alınır.
+--------------------------------------------------------------------------- */
+.vstart-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.vstart-option {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+  background: var(--bg, #fafbfc);
+}
+
+/* Bekleyen aday sayısı rozeti (butonun içinde) */
+.vstart-count {
+  margin-left: 8px;
+  background: rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  padding: 1px 9px;
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.vstart-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 200;
+  padding: 16px;
+}
+
+.vstart-modal {
+  width: 460px;
+  max-width: 90vw;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+/* Modal içindeki tek bir aday satırı */
+.vstart-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+@media (max-width: 640px) {
+  .vstart-actions { grid-template-columns: 1fr; }
 }
