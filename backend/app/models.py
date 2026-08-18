@@ -573,6 +573,48 @@ class MaintenanceNote(Base):
 
     maintenance = relationship("Maintenance", back_populates="notes")
     author = relationship("User")
+    # Nota eklenen fotoğraflar (bkz. MaintenanceNotePhoto). lazy="selectin":
+    # bakım detayı yüklenirken her not için ayrı sorgu atılmasın (N+1) —
+    # MaintenanceItem.workers ile aynı desen.
+    photos = relationship(
+        "MaintenanceNotePhoto",
+        back_populates="note",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        order_by="MaintenanceNotePhoto.id",
+    )
+
+
+class MaintenanceNotePhoto(Base):
+    """Bir bakım notuna (MaintenanceNote) eklenen fotoğraf.
+
+    ItemExecAttachment'tan FARKI: o, belirli bir checklist MADDESİNE bağlıdır
+    ("şu maddeyi tikledim, kanıt fotoğrafı"). Bu ise iş emrinin GENELİNE
+    düşülen serbest nota bağlıdır — checklist'te karşılığı olmayan bir arıza/
+    bulgu fotoğraflanmak istendiğinde kullanılır (ör. "sağ ön balata aşınmış"
+    notunun altına o balatanın fotoğrafı).
+
+    Yalnızca RESİM kabul edilir (bkz. main.py upload_note_photo). Not
+    silinince fotoğraflar da düşer (cascade + ondelete=CASCADE); dosyalar
+    tekil silmede diskten de kaldırılır, toplu silmede artık kalabilir —
+    mevcut ek sistemlerindeki kabul edilmiş davranışla aynı.
+    """
+
+    __tablename__ = "maintenance_note_photos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    note_id: Mapped[int] = mapped_column(
+        ForeignKey("maintenance_notes.id", ondelete="CASCADE"), index=True
+    )
+    filename: Mapped[str] = mapped_column(String(300), default="")
+    original_name: Mapped[str] = mapped_column(String(300), default="")
+    uploaded_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    note = relationship("MaintenanceNote", back_populates="photos")
+    uploaded_by = relationship("User")
 
 
 class Model3D(Base):

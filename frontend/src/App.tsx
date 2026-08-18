@@ -95,21 +95,37 @@ const NAV_ICONS: Record<Page, ReactElement> = {
 /** Sayfa yenilendiğinde son sayfanın saklandığı anahtar (sessionStorage). */
 const LAST_PAGE_KEY = 'last_page'
 
-/** Yenilemeden sonra geri dönülebilecek sayfalar — bilerek yalnızca HER role
- * açık olanlar (bkz. aşağıdaki `menu`: show === true olanlar). Role bağlı
- * sayfalar (Yetki Yönetimi, Kullanıcılar, Sistem Durumu vb.) dışarıda
- * tutuldu: kullanıcının rolü değişmişse ya da tablette başka bir hesapla
- * oturum açılmışsa boş bir ekranla karşılaşmasın, Dashboard'a düşsün. */
-const RESTORABLE_PAGES: Page[] = [
-  'dashboard',
-  'maintenances',
-  'history',
-  'parts',
-  'knowledge',
-  'suggestions',
-  'help',
-  'profile',
-]
+/** Bir sayfanın bu kullanıcıya açık olup olmadığı — aşağıdaki `menu`
+ * dizisindeki `show` koşullarının birebir aynısı. Yenilemeden sonra sayfa
+ * geri yüklenirken kullanılır: kullanıcının göremeyeceği bir sayfaya
+ * dönülürse (rolü değişmiş ya da tablette başka bir hesapla oturum açılmış
+ * olabilir) boş ekran yerine Dashboard'a düşülür.
+ *
+ * DİKKAT: `menu` içindeki görünürlük koşulları değişirse burası da
+ * güncellenmeli — ikisi elle senkron tutuluyor. */
+function canOpenPage(page: Page, role: string, p: Record<string, boolean>): boolean {
+  const isAdmin = role === 'admin'
+  const isStaff = isAdmin || role === 'engineer' || role === 'amir'
+  switch (page) {
+    case 'calendar':
+    case 'vehicles':
+    case 'tree':
+      return isStaff
+    case 'plans':
+    case 'permissions':
+    case 'audit':
+    case 'system':
+      return isAdmin
+    case 'kpi':
+      return isStaff && p.view_dashboard_analytics !== false
+    case 'users':
+      return isAdmin || !!p.manage_users
+    default:
+      // dashboard, maintenances, history, parts, knowledge, suggestions,
+      // help, profile — her role açık.
+      return true
+  }
+}
 
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
@@ -276,15 +292,18 @@ export default function App() {
   // bırakılan Dashboard girdisinin ÜSTÜNE eklenir. Böylece kullanıcı geri
   // tuşuna basınca (istenen davranış) yine Dashboard'a çıkar.
   useEffect(() => {
-    if (!user || pageRestoredRef.current) return
+    // Yetki listesi (perms) yüklenmeden karar verilemez — kullanıcının o
+    // sayfayı görüp göremediği ona bağlı.
+    if (!user || !perms || pageRestoredRef.current) return
     pageRestoredRef.current = true
     const saved = sessionStorage.getItem(LAST_PAGE_KEY) as Page | null
     if (!saved || saved === 'dashboard') return
-    if (!RESTORABLE_PAGES.includes(saved)) return
+    if (!(saved in PAGE_TITLES)) return  // bilinmeyen/eski bir anahtar
+    if (!canOpenPage(saved, user.role, perms.permissions ?? {})) return
     setPage(saved)
     window.history.replaceState({ page: 'dashboard' }, '', '')
     window.history.pushState({ page: saved }, '', '')
-  }, [user])
+  }, [user, perms])
 
   useEffect(() => {
     if (user) sessionStorage.setItem(LAST_PAGE_KEY, page)

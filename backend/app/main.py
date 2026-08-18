@@ -268,6 +268,8 @@ PARTS_DIR = UPLOADS_DIR / "parts"  # Parça Bilgi Bankası: kapak görselleri + 
 PARTS_DIR.mkdir(parents=True, exist_ok=True)
 VEHICLES_DIR = UPLOADS_DIR / "vehicles"  # Araç Profil Sayfası: kapak fotoğrafları
 VEHICLES_DIR.mkdir(parents=True, exist_ok=True)
+NOTES_DIR = UPLOADS_DIR / "notes"  # Bakım notlarına eklenen fotoğraflar
+NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
 # Otomatik veritabanı yedeklerinin yazıldığı klasör (ayrı volume —
 # db-data bozulsa/silinse bile yedekler korunur).
@@ -4263,15 +4265,109 @@ def add_maintenance_note(
             raise HTTPException(400, "Geçersiz kullanıcı seçimi")
         author = picked
 
-    if not body.text.strip():
-        raise HTTPException(400, "Not boş olamaz")
-    note = services.add_maintenance_note(db, m, body.text, author)
+    # Metin boş olabilir: yalnızca fotoğraflı not desteklenir (bkz.
+    # schemas.NoteCreateBody). Fotoğraflar not oluşturulduktan SONRA
+    # yüklendiği için burada "boş" kontrolü yapılamaz.
+    note = services.add_maintenance_note(db, m, body.text.strip(), author)
+    ozet = body.text.strip()[:120] or "(yalnızca fotoğraf)"
     services.log_action(
         db, user, "create", "maintenance_note", note.id,
-        f"Not eklendi ({author.full_name}): {body.text.strip()[:120]}",
+        f"Not eklendi ({author.full_name}): {ozet}",
         detail=f"İş Emri #{m.id} ({m.vehicle.code} — {m.plan.name})",
     )
     return note
+
+
+@app.post("/api/notes/{note_id}/photos", response_model=schemas.NotePhotoOut)
+async def upload_note_photo(
+    note_id: int,
+    file: UploadFile = File(...),
+    uploaded_by_id: int | None = Form(None),
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """İş emrinin GENELİNE düşülen bir nota fotoğraf ekler — checklist'te
+    karşılığı olmayan bir arıza/bulguyu belgelemek için. Madde bazlı
+    fotoğraftan (upload_item_exec_attachment) farkı: o belirli bir checklist
+    maddesine, bu ise notun kendisine bağlanır. Yalnızca RESİM kabul edilir;
+    tablet kameralarının ürettiği HEIC/HEIF dosyaları tarayıcıda
+    görüntülenebilir bir formata çevrilir (diğer görsel uçlarıyla aynı adım).
+    """
+    if not services.has_permission(db, user, "edit_maintenance"):
+        raise HTTPException(403, "Nota fotoğraf ekleme yetkiniz yok")
+    note = db.get(models.MaintenanceNote, note_id)
+    if not note:
+        raise HTTPException(404, "Not bulunamadı")
+    m = note.maintenance
+    if user.role == "technician" and m.assigned_to_id not in (None, user.id):
+        raise HTTPException(403, "Bu bakım size atanmamış")
+
+    uploader = user
+    if uploaded_by_id is not None:
+        chosen = db.get(models.User, uploaded_by_id)
+        if not chosen or not chosen.is_active:
+            raise HTTPException(400, "Geçersiz kullanıcı seçimi")
+        uploader = chosen
+
+    original = file.filename or "gorsel"
+    ext = os.path.splitext(original)[1].lower()
+    content = await file.read()
+    content, ext = await run_in_threadpool(bg_remove.convert_to_browser_image, content, ext)
+    if ext not in _IMAGE_EXTS:
+        raise HTTPException(400, "Yalnızca resim dosyası yüklenebilir")
+    _reject_dangerous_ext(ext)
+    _validate_upload_content(content, ext, "image")
+    content = _sanitize_if_svg(content, ext)
+    fname = f"{uuid.uuid4().hex}{ext}"
+    (NOTES_DIR / fname).write_bytes(content)
+    photo = models.MaintenanceNotePhoto(
+        note_id=note.id, filename=fname, original_name=original,
+        uploaded_by_id=uploader.id,
+    )
+    db.add(photo)
+    db.commit()
+    db.refresh(photo)
+    services.log_action(
+        db, user, "create", "maintenance_note_photo", photo.id,
+        f"Bakım notuna fotoğraf eklendi ({uploader.full_name})",
+        detail=f"İş Emri #{m.id} ({m.vehicle.code} — {m.plan.name})",
+    )
+    return photo
+
+
+@app.delete("/api/note-photos/{photo_id}")
+def delete_note_photo(
+    photo_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(get_current_user),
+):
+    """Not fotoğrafını siler. Madde fotoğraflarındaki yaklaşımın aynısı:
+    işaretleme yetkisi (edit_maintenance) olan herkes silebilir — paylaşılan
+    tablet senaryosunda 'yanlış fotoğraf' düzeltmesi anında yapılabilsin."""
+    if not services.has_permission(db, user, "edit_maintenance"):
+        raise HTTPException(403, "Bu fotoğrafı silme yetkiniz yok")
+    photo = db.get(models.MaintenanceNotePhoto, photo_id)
+    if not photo:
+        raise HTTPException(404, "Fotoğraf bulunamadı")
+    note = photo.note
+    m = note.maintenance if note else None
+    if m and user.role == "technician" and m.assigned_to_id not in (None, user.id):
+        raise HTTPException(403, "Bu bakım size atanmamış")
+    fpath = NOTES_DIR / photo.filename if photo.filename else None
+    label = photo.original_name
+    mid_txt = f"İş Emri #{m.id}" if m else ""
+    db.delete(photo)
+    db.commit()
+    if fpath and fpath.is_file():
+        try:
+            fpath.unlink()
+        except OSError:
+            pass
+    services.log_action(
+        db, user, "delete", "maintenance_note_photo", photo_id,
+        "Bakım notundaki fotoğraf silindi", detail=f"{label} · {mid_txt}",
+    )
+    return {"ok": True}
 
 
 # ================================================================ Yetki Yönetimi

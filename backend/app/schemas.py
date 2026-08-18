@@ -693,15 +693,33 @@ class MaintenancePlanUpcomingIn(BaseModel):
     target_km: int = Field(gt=0)
 
 
+class NotePhotoOut(ORM):
+    """Bir bakım notuna eklenen fotoğraf (bkz. models.MaintenanceNotePhoto).
+    ItemExecAttachmentOut ile aynı desen — o madde bazlı, bu not bazlıdır."""
+    id: int
+    filename: str
+    original_name: str
+    uploaded_by: UserOut | None = None
+    created_at: datetime
+
+
 class NoteOut(ORM):
     id: int
     text: str
     created_at: datetime
     author: UserOut | None
+    photos: list[NotePhotoOut] = []
 
 
 class NoteCreateBody(BaseModel):
-    text: str = Field(min_length=1, max_length=2000)
+    # min_length YOK (bilerek): yalnızca fotoğraflı, metinsiz not
+    # eklenebilmeli — usta sahada bir arızayı yazmak yerine doğrudan
+    # fotoğraflamak isteyebilir. Fotoğraflar notun kendisine bağlandığı için
+    # önce not oluşturulur, sonra fotoğraflar yüklenir (bkz. main.py
+    # upload_note_photo); bu yüzden sunucu, not oluşturulurken fotoğraf gelip
+    # gelmeyeceğini bilemez. Tamamen boş not oluşturulmasını arayüz engeller
+    # (metin de fotoğraf da yoksa "Ekle" düğmesi pasif).
+    text: str = Field(default="", max_length=2000)
     # Paylaşılan tablet senaryosu: notu giren kişi oturum sahibinden farklı
     # olabilir; belirtilirse bu kullanıcı yazar olarak kaydedilir.
     author_id: int | None = None

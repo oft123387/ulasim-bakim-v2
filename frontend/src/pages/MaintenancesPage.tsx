@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { api, apiDownload, apiUploadWithFields } from '../api'
+import { api, apiDownload, apiUpload, apiUploadWithFields } from '../api'
 import { useLiveEvent } from '../liveEvents'
 import { showToast } from '../components/toast'
 import { rawTargetLabel, mergedPeriodLabel, topPeriodLabel } from '../format'
@@ -903,21 +903,67 @@ function MaintenanceDetail({
 
   // Aynı gerekçe (bkz. openItemNote): iş emri notu da her zaman oturumu açan
   // kişiye yazılır, isim listeden seçilmez — yanlış isim kaydedilemesin.
+  // ------------------------------------------- nota fotoğraf ekleme (kuyruk)
+  // Fotoğraflar notun KENDİSİNE bağlandığı için önce not oluşturulmalı, sonra
+  // yüklenmeli. Bu yüzden kullanıcının seçtiği/sürüklediği dosyalar burada
+  // bir kuyrukta bekletilir; "Ekle" denince önce not açılır, dönen not
+  // id'siyle fotoğraflar sırayla yüklenir.
+  const [notePhotos, setNotePhotos] = useState<File[]>([])
+  const [noteDragOver, setNoteDragOver] = useState(false)
+  const notePhotoRef = useRef<HTMLInputElement>(null)
+
+  /** Sürüklenen/seçilen dosyalardan yalnızca resimleri kuyruğa alır. */
+  function queueNotePhotos(files: FileList | null) {
+    if (!files) return
+    const images = Array.from(files).filter((f) => f.type.startsWith('image/'))
+    if (images.length === 0) {
+      setError('Yalnızca fotoğraf eklenebilir')
+      return
+    }
+    setError('')
+    setNotePhotos((prev) => [...prev, ...images])
+  }
+
+  function removeQueuedPhoto(index: number) {
+    setNotePhotos((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  // Aynı gerekçe (bkz. openItemNote): iş emri notu da her zaman oturumu açan
+  // kişiye yazılır, isim listeden seçilmez — yanlış isim kaydedilemesin.
   async function addNote() {
-    if (!noteText.trim()) return
+    // Metin ya da en az bir fotoğraf gerekli — ikisi de yoksa boş not açılmaz.
+    if (!noteText.trim() && notePhotos.length === 0) return
     setNoteBusy(true)
     setError('')
     try {
-      await api(`/maintenances/${id}/notes`, {
+      const note = await api<MaintenanceNote>(`/maintenances/${id}/notes`, {
         method: 'POST',
         body: { text: noteText.trim() },
       })
+      // Fotoğraflar sırayla yüklenir; biri hata verirse kullanıcı görsün diye
+      // tamamı beklenir (not zaten oluşmuş olur, tekrar denemek gerekmez).
+      for (const photo of notePhotos) {
+        await apiUpload(`/notes/${note.id}/photos`, photo)
+      }
       setNoteText('')
+      setNotePhotos([])
       load()
     } catch (e) {
       setError((e as Error).message)
     } finally {
       setNoteBusy(false)
+      if (notePhotoRef.current) notePhotoRef.current.value = ''
+    }
+  }
+
+  async function deleteNotePhoto(photoId: number) {
+    if (!confirm('Bu fotoğraf silinsin mi?')) return
+    setError('')
+    try {
+      await api(`/note-photos/${photoId}`, { method: 'DELETE' })
+      load()
+    } catch (e) {
+      setError((e as Error).message)
     }
   }
 
@@ -1396,7 +1442,25 @@ function MaintenanceDetail({
             <ul style={{ listStyle: 'none', margin: '0 0 12px', padding: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
               {(m.notes ?? []).map((n: MaintenanceNote) => (
                 <li key={n.id} style={{ padding: '8px 10px', background: 'var(--bg-soft, rgba(0,0,0,0.03))', borderRadius: 8, fontSize: 13 }}>
-                  <div style={{ marginBottom: 4 }}>{n.text}</div>
+                  {n.text && <div style={{ marginBottom: 4 }}>{n.text}</div>}
+                  {(n.photos ?? []).length > 0 && (
+                    <div className="note-photo-grid">
+                      {(n.photos ?? []).map((ph) => (
+                        <div key={ph.id} className="note-photo">
+                          <a href={`/uploads/notes/${ph.filename}`} target="_blank" rel="noreferrer">
+                            <img src={`/uploads/notes/${ph.filename}`} alt={ph.original_name} />
+                          </a>
+                          <button
+                            className="note-photo-del"
+                            title="Fotoğrafı sil"
+                            onClick={() => deleteNotePhoto(ph.id)}
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   <div className="muted" style={{ fontSize: 11.5, display: 'flex', alignItems: 'center', gap: 5 }}>
                     <Avatar name={n.author?.full_name ?? '?'} size={16} />
                     {n.author?.full_name ?? 'Bilinmiyor'} · {fmt(n.created_at)}
@@ -1405,7 +1469,50 @@ function MaintenanceDetail({
               ))}
             </ul>
           )}
-          <div className="row" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'flex-start' }}>
+          {/* Sürükle-bırak alanı: dosya buraya bırakılabilir, tıklanınca da
+              kamera/galeri açılır. Tablette "çek ve bırak" akışı için. */}
+          <div
+            className={`note-drop${noteDragOver ? ' over' : ''}`}
+            onDragOver={(e) => { e.preventDefault(); setNoteDragOver(true) }}
+            onDragLeave={() => setNoteDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault()
+              setNoteDragOver(false)
+              queueNotePhotos(e.dataTransfer.files)
+            }}
+            onClick={() => notePhotoRef.current?.click()}
+          >
+            <Camera size={15} />
+            <span>
+              Fotoğrafı buraya sürükleyin ya da <strong>tıklayıp çekin</strong>
+            </span>
+            <input
+              ref={notePhotoRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              multiple
+              style={{ display: 'none' }}
+              onChange={(e) => queueNotePhotos(e.target.files)}
+            />
+          </div>
+          {notePhotos.length > 0 && (
+            <div className="note-photo-grid" style={{ marginTop: 10 }}>
+              {notePhotos.map((f, i) => (
+                <div key={`${f.name}-${i}`} className="note-photo">
+                  <img src={URL.createObjectURL(f)} alt={f.name} />
+                  <button
+                    className="note-photo-del"
+                    title="Kuyruktan çıkar"
+                    onClick={() => removeQueuedPhoto(i)}
+                  >
+                    <Trash2 size={12} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="row" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'flex-start', marginTop: 10 }}>
             <textarea
               value={noteText}
               onChange={(e) => setNoteText(e.target.value)}
@@ -1415,11 +1522,15 @@ function MaintenanceDetail({
             />
             <button
               className="primary"
-              disabled={noteBusy || !noteText.trim()}
+              disabled={noteBusy || (!noteText.trim() && notePhotos.length === 0)}
               onClick={addNote}
             >
               <Send size={13} style={{ marginRight: 6, verticalAlign: -2 }} />
-              Ekle
+              {noteBusy
+                ? 'Ekleniyor…'
+                : notePhotos.length > 0
+                  ? `Ekle (${notePhotos.length} foto)`
+                  : 'Ekle'}
             </button>
           </div>
         </div>

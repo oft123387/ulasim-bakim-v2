@@ -168,11 +168,23 @@ export interface Item {
   children: Item[]
 }
 
+/** Bir bakım notuna eklenen fotoğraf (backend: MaintenanceNotePhoto).
+ * /uploads/notes/<filename> altında servis edilir. */
+export interface NotePhoto {
+  id: number
+  filename: string
+  original_name: string
+  uploaded_by: User | null
+  created_at: string
+}
+
 export interface MaintenanceNote {
   id: number
   text: string
   created_at: string
   author: User | null
+  // Notla birlikte yüklenen fotoğraflar. Eski kayıtlarda boş dizidir.
+  photos?: NotePhoto[]
 }
 
 export interface Maintenance {
