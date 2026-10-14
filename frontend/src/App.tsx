@@ -6,6 +6,7 @@ import { ROLE_TR } from './types'
 import Login from './pages/Login'
 import ParticleNetwork from './components/ParticleNetwork'
 import DashboardPage from './pages/DashboardPage'
+import DashboardPageKopya from './pages/DashboardPageKopya'
 import MaintenancesPage from './pages/MaintenancesPage'
 import HistoryPage, { type HistoryFilters } from './pages/HistoryPage'
 import AuditLogPage from './pages/AuditLogPage'
@@ -53,6 +54,7 @@ import {
 
 export type Page =
   | 'dashboard'
+  | 'dashboard-copy'
   | 'maintenances'
   | 'calendar'
   | 'history'
@@ -74,6 +76,7 @@ type Theme = 'light' | 'dark'
 
 const NAV_ICONS: Record<Page, ReactElement> = {
   dashboard: <LayoutDashboard size={17} />,
+  'dashboard-copy': <LayoutDashboard size={17} />,
   tree: <Workflow size={17} />,
   maintenances: <Wrench size={17} />,
   calendar: <CalendarDays size={17} />,
@@ -129,6 +132,7 @@ function canOpenPage(page: Page, role: string, p: Record<string, boolean>): bool
 
 const PAGE_TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
+  'dashboard-copy': 'Dashboard Kopya',
   tree: 'Bakım Ağacı',
   maintenances: 'Bakımlar',
   calendar: 'Takvim',
@@ -450,6 +454,7 @@ export default function App() {
 
   const menu: { key: Page; label: string; show: boolean }[] = [
     { key: 'dashboard', label: 'Dashboard', show: true },
+    { key: 'dashboard-copy', label: 'Dashboard Kopya', show: true },
     { key: 'maintenances', label: 'Bakımlar', show: true },
     { key: 'calendar', label: 'Takvim', show: isStaff },
     { key: 'vehicles', label: 'Araçlar', show: isStaff },
@@ -623,6 +628,18 @@ export default function App() {
           <div key={page} className="page-transition">
           {page === 'dashboard' && (
             <DashboardPage
+              user={user}
+              perms={p}
+              onOpenMaintenance={openMaintenance}
+              onGoToMaintenances={() => navigate('maintenances')}
+              onFilterMaintenances={goToFilteredMaintenances}
+              onNavigate={(p) => navigate(p)}
+              onGoToHistoryThisMonth={goToHistoryThisMonth}
+              onGoToHistoryForPlan={goToHistoryForPlan}
+            />
+          )}
+          {page === 'dashboard-copy' && (
+            <DashboardPageKopya
               user={user}
               perms={p}
               onOpenMaintenance={openMaintenance}
