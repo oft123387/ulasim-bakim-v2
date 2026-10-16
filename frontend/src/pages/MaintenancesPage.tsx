@@ -704,7 +704,7 @@ function MaintenanceDetail({
   }, [id])
 
   useEffect(load, [load])
-  useLiveEvent(['maintenance', 'vehicle'], load)
+  useLiveEvent(['maintenance', 'vehicle', 'tree_node'], load)
 
   useEffect(() => {
     // Teknisyenlerin de kendi aralarındaki isim listesini görebilmesi
