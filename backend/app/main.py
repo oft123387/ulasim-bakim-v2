@@ -1488,6 +1488,7 @@ def update_plan(
         setattr(p, k, v)
     db.commit()
     db.refresh(p)
+    services.sync_open_maintenance_trees(db)
     services.log_action(db, actor, "update", "plan", p.id, f"Bakım planı güncellendi: {p.name}")
     return p
 
@@ -1503,6 +1504,7 @@ def delete_plan(plan_id: int, db: Session = Depends(get_db), actor=Depends(requi
     if db.query(models.Maintenance).filter_by(plan_id=plan_id).first():
         p.is_active = False
         db.commit()
+        services.sync_open_maintenance_trees(db)
         services.log_action(
             db, actor, "update", "plan", plan_id,
             f"Bakım planı pasife alındı (açık bakımları var): {name}",
@@ -1514,6 +1516,7 @@ def delete_plan(plan_id: int, db: Session = Depends(get_db), actor=Depends(requi
     db.query(models.PartHotspot).filter_by(plan_id=plan_id).delete()
     db.delete(p)
     db.commit()
+    services.sync_open_maintenance_trees(db)
     services.log_action(db, actor, "delete", "plan", plan_id, f"Bakım planı silindi: {name}")
     return {"ok": True, "deactivated": False}
 
@@ -1661,6 +1664,7 @@ def create_node(
     db.add(n)
     db.commit()
     db.refresh(n)
+    services.sync_open_maintenance_trees(db)
     services.log_action(db, actor, "create", "tree_node", n.id, f"Ağaç maddesi eklendi: {n.name}")
     return n
 
@@ -1708,6 +1712,7 @@ def update_node(
         n.note = data["note"]
     db.commit()
     db.refresh(n)
+    services.sync_open_maintenance_trees(db)
     services.log_action(db, actor, "update", "tree_node", n.id, f"Ağaç maddesi güncellendi: {n.name}")
     return n
 
@@ -1836,6 +1841,7 @@ def delete_node(node_id: int, db: Session = Depends(get_db), actor=Depends(requi
     name = n.name
     db.delete(n)
     db.commit()
+    services.sync_open_maintenance_trees(db)
     services.log_action(db, actor, "delete", "tree_node", node_id, f"Ağaç maddesi silindi: {name}")
     return {"ok": True}
 
@@ -1858,6 +1864,7 @@ def delete_plan_tree(plan_id: int, db: Session = Depends(get_db), actor=Depends(
     for r in roots:
         db.delete(r)
     db.commit()
+    services.sync_open_maintenance_trees(db)
     services.log_action(
         db, actor, "delete", "tree_node", plan_id,
         f"'{p.name}' planının ağacı tamamen silindi ({deleted} ana bölüm).",
@@ -1881,6 +1888,7 @@ def delete_all_trees(db: Session = Depends(get_db), actor=Depends(require_admin)
     for r in roots:
         db.delete(r)
     db.commit()
+    services.sync_open_maintenance_trees(db)
     services.log_action(
         db, actor, "delete", "tree_node", 0,
         f"TÜM bakım ağaçları silindi ({deleted} ana bölüm, {plans_affected} plan/şablon etkilendi).",
@@ -1908,6 +1916,7 @@ async def import_tree_excel(
         result = excel_utils.import_maintenance_tree(db, content, vehicle_model=vehicle_model)
     except Exception as e:
         raise HTTPException(400, f"Excel işlenemedi: {e}")
+    services.sync_open_maintenance_trees(db)
     plan_names = ", ".join(p["name"] for p in result["plans"])
     model_label = vehicle_model.strip() or "Genel"
     reset_count = result.get("maintenances_reset", 0)
@@ -1975,6 +1984,7 @@ async def import_bulk_catalog(
         # anlamlıdır.
         return schemas.BulkCatalogImportResult(**result)
 
+    services.sync_open_maintenance_trees(db)
     models_label = ", ".join(result["vehicle_models"]) or "—"
     # Katalog güncellenince o modellerdeki araçlar için otomatik bakım
     # adaylarını HEMEN yeniden değerlendir — admin'in aracı elle güncellemesi
@@ -3273,8 +3283,9 @@ def get_maintenance(
         raise HTTPException(404, "Bakım bulunamadı")
     if user.role == "technician" and m.assigned_to_id not in (None, user.id):
         raise HTTPException(403, "Bu bakım size atanmamış")
+    services.sync_open_maintenance_trees(db)
     detail = schemas.MaintenanceDetail.model_validate(m)
-    detail.items = _build_item_tree(m.items, db)
+    detail.items = _build_item_tree(m.items, db, vehicle_model=m.vehicle.model)
     detail.covered_tiers = services.compute_covered_tiers(m)
     return detail
 
@@ -3323,7 +3334,7 @@ def export_maintenance_items(
     fmt = (format or "xlsx").lower()
     if fmt not in _EXPORT_FORMATS:
         raise HTTPException(400, "Geçersiz format (xlsx, csv, pdf, docx desteklenir)")
-    items = _build_item_tree(m.items, db)
+    items = _build_item_tree(m.items, db, vehicle_model=m.vehicle.model)
     title = f"İş Emri #{m.id} — {m.vehicle.code} — {m.plan.name}"
     content = export_utils.build_item_completion_export(
         m.id, m.vehicle.code, m.plan.name, items, fmt, title,
@@ -3396,7 +3407,11 @@ def _parse_tier_kms(raw: str | None) -> list[int]:
     return sorted(out)
 
 
-def _build_item_tree(items, db: Session | None = None) -> list[schemas.ItemOut]:
+def _build_item_tree(
+    items,
+    db: Session | None = None,
+    vehicle_model: str | None = None,
+) -> list[schemas.ItemOut]:
     # Faz 10: her maddenin bağlı olduğu şablon düğümünün (source_node_id)
     # not ve eklerini tek seferde topla.
     notes: dict[int, str] = {}
@@ -3418,16 +3433,81 @@ def _build_item_tree(items, db: Session | None = None) -> list[schemas.ItemOut]:
                     notes[n.id] = n.note
                 if n.card_code:
                     card_codes[n.id] = n.card_code
+            attachment_node_ids = set(source_ids)
+            source_paths: dict[int, tuple[str, ...]] = {}
+            if vehicle_model is not None:
+                # A component can be represented by a separate TreeNode in
+                # every maintenance-period plan. Share its reference files
+                # across those plans only when both vehicle model and full
+                # component path match.
+                all_nodes = db.query(models.TreeNode).all()
+                nodes_by_id = {node.id: node for node in all_nodes}
+                candidate_plan_ids = {
+                    p.id
+                    for p in db.query(models.MaintenancePlan).all()
+                    if services._model_matches(p.vehicle_model, vehicle_model)
+                }
+                root_plan_ids: dict[int, int | None] = {}
+
+                def get_root_plan_id(node: models.TreeNode) -> int | None:
+                    trail: list[models.TreeNode] = []
+                    current = node
+                    while current.id not in root_plan_ids:
+                        trail.append(current)
+                        if current.parent_id is None:
+                            root_plan_ids[current.id] = current.plan_id
+                            break
+                        parent = nodes_by_id.get(current.parent_id)
+                        if parent is None:
+                            root_plan_ids[current.id] = None
+                            break
+                        current = parent
+                    root_plan_id = root_plan_ids.get(current.id)
+                    for ancestor in trail:
+                        root_plan_ids[ancestor.id] = root_plan_id
+                    return root_plan_id
+
+                def get_node_path(node: models.TreeNode) -> tuple[str, ...]:
+                    path: list[str] = []
+                    current: models.TreeNode | None = node
+                    while current is not None:
+                        path.append(current.name)
+                        current = nodes_by_id.get(current.parent_id) if current.parent_id is not None else None
+                    return tuple(reversed(path))
+
+                candidate_ids_by_path: dict[tuple[str, ...], set[int]] = {}
+                for node in all_nodes:
+                    root_plan_id = get_root_plan_id(node)
+                    if root_plan_id is None or root_plan_id in candidate_plan_ids:
+                        candidate_ids_by_path.setdefault(get_node_path(node), set()).add(node.id)
+                for node_id in source_ids:
+                    source_node = nodes_by_id.get(node_id)
+                    if source_node is not None:
+                        path = get_node_path(source_node)
+                        source_paths[node_id] = path
+                        attachment_node_ids.update(candidate_ids_by_path.get(path, ()))
+
             atts = (
                 db.query(models.NodeAttachment)
-                .filter(models.NodeAttachment.node_id.in_(set(source_ids)))
+                .filter(models.NodeAttachment.node_id.in_(attachment_node_ids))
                 .order_by(models.NodeAttachment.id)
                 .all()
             )
+            attachments_by_node: dict[int, list[schemas.NodeAttachmentOut]] = {}
             for a in atts:
-                attach.setdefault(a.node_id, []).append(
+                attachments_by_node.setdefault(a.node_id, []).append(
                     schemas.NodeAttachmentOut.model_validate(a)
                 )
+            if vehicle_model is None:
+                attach.update(attachments_by_node)
+            else:
+                for node_id in source_ids:
+                    equivalent_ids = candidate_ids_by_path.get(source_paths.get(node_id, ()), {node_id})
+                    attach[node_id] = [
+                        attachment
+                        for equivalent_id in equivalent_ids
+                        for attachment in attachments_by_node.get(equivalent_id, [])
+                    ]
         item_ids = [i.id for i in items]
         if item_ids:
             exec_atts = (

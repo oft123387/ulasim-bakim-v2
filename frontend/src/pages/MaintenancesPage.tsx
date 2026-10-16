@@ -59,10 +59,13 @@ const CALENDAR_HISTORY_MONTHS = 12
 
 // ---------------------------------------------------------- Madde ekleri (Faz 10)
 function AttachmentChip({ att }: { att: NodeAttachment }) {
-  const href = att.kind === 'link' ? att.url : `/uploads/attachments/${att.filename}`
+  const href = att.kind === 'link' || (att.kind === 'video' && !att.filename)
+    ? att.url
+    : `/uploads/attachments/${att.filename}`
   const icon =
     att.kind === 'image' ? <ImageIcon size={13} /> :
     att.kind === 'pdf' ? <FileText size={13} /> :
+    att.kind === 'video' ? <PlayCircle size={13} /> :
     att.kind === 'link' ? <LinkIcon size={13} /> : <Download size={13} />
   const text = att.label || att.original_name || att.url || 'Ek'
   return (
@@ -704,7 +707,12 @@ function MaintenanceDetail({
   }, [id])
 
   useEffect(load, [load])
-  useLiveEvent(['maintenance', 'vehicle', 'tree_node'], load)
+  useLiveEvent(['maintenance', 'vehicle', 'plan', 'tree_node', 'attachment'], load)
+
+  useEffect(() => {
+    const interval = setInterval(load, 30000)
+    return () => clearInterval(interval)
+  }, [load])
 
   useEffect(() => {
     // Teknisyenlerin de kendi aralarındaki isim listesini görebilmesi

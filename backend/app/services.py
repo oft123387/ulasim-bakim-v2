@@ -980,6 +980,190 @@ def _copy_tree_snapshot(db: Session, m: models.Maintenance, applicable_plans: li
         item.tiers = ",".join(str(k) for k in sorted(tiers[key]))
 
 
+def sync_open_maintenance_trees(db: Session) -> int:
+    """Açık iş emirlerini, ilgili araç için geçerli güncel bakım ağacıyla
+    eşitler. Tamamlanan maddeler ve tamamlanan iş emirleri geçmiş kaydı
+    olduğundan korunur; artık şablonda olmayan, tamamlanmamış maddeler
+    kaldırılır."""
+    maintenances = (
+        db.query(models.Maintenance)
+        .filter(models.Maintenance.status != "completed")
+        .all()
+    )
+    active_plans = db.query(models.MaintenancePlan).filter_by(is_active=True).all()
+    synced = 0
+    for maintenance in maintenances:
+        plan = maintenance.plan
+        if plan.plan_type == "km" and maintenance.target_km > 0:
+            plans = [
+                candidate
+                for candidate in active_plans
+                if candidate.plan_type == "km"
+                and candidate.interval_km > 0
+                and not candidate.is_catalog_only
+                and _model_matches(candidate.vehicle_model, maintenance.vehicle.model)
+                and maintenance.target_km % candidate.interval_km == 0
+            ]
+            if plan.id not in {candidate.id for candidate in plans}:
+                plans.append(plan)
+        else:
+            plans = [plan]
+
+        ordered_plans = sorted(plans, key=lambda candidate: -_plan_size(candidate))
+        # Each path segment includes the occurrence of a same-named sibling,
+        # so legitimate duplicate names in a single plan remain distinct.
+        desired: dict[tuple, dict] = {}
+        next_order: dict[tuple | None, int] = {}
+
+        def walk(
+            node: models.TreeNode,
+            parent_path: tuple,
+            parent_key: tuple | None,
+            duplicate_index: int,
+            period: int | None,
+        ) -> None:
+            key = parent_path + ((node.name, duplicate_index),)
+            entry = desired.get(key)
+            if entry is None:
+                order_index = node.order_index if len(ordered_plans) == 1 else next_order.get(parent_key, 0)
+                next_order[parent_key] = max(next_order.get(parent_key, 0), order_index + 1)
+                entry = {
+                    "node": node,
+                    "parent": parent_key,
+                    "order_index": order_index,
+                    "periods": set(),
+                }
+                desired[key] = entry
+            if period is not None:
+                entry["periods"].add(period)
+
+            counts: dict[str, int] = {}
+            for child in sorted(node.children, key=lambda item: item.order_index):
+                occurrence = counts.get(child.name, 0)
+                counts[child.name] = occurrence + 1
+                walk(child, key, key, occurrence, period)
+
+        for candidate in ordered_plans:
+            period = candidate.interval_km if candidate.plan_type == "km" and len(ordered_plans) > 1 else None
+            root_counts: dict[str, int] = {}
+            for root in _plan_roots(db, candidate):
+                occurrence = root_counts.get(root.name, 0)
+                root_counts[root.name] = occurrence + 1
+                walk(root, tuple(), None, occurrence, period)
+
+        items = list(maintenance.items)
+        if not desired:
+            # An intentionally empty template removes unfinished checklist
+            # entries while retaining completed entries and their ancestors.
+            by_id = {item.id: item for item in items}
+            retained_ids = {item.id for item in items if item.is_completed}
+            for item in items:
+                if item.id not in retained_ids:
+                    continue
+                parent_id = item.parent_id
+                while parent_id is not None and parent_id in by_id:
+                    retained_ids.add(parent_id)
+                    parent_id = by_id[parent_id].parent_id
+            for item in items:
+                if item.id in retained_ids:
+                    item.source_node_id = None
+                    item.tiers = ""
+                else:
+                    db.delete(item)
+            synced += 1
+            continue
+
+        children: dict[int | None, list[models.MaintenanceItem]] = {}
+        for item in items:
+            children.setdefault(item.parent_id, []).append(item)
+        for siblings in children.values():
+            siblings.sort(key=lambda item: item.order_index)
+
+        existing_by_path: dict[tuple, models.MaintenanceItem] = {}
+
+        def index_existing(
+            item: models.MaintenanceItem,
+            parent_path: tuple,
+            duplicate_index: int,
+        ) -> None:
+            key = parent_path + ((item.name, duplicate_index),)
+            existing_by_path[key] = item
+            counts: dict[str, int] = {}
+            for child in children.get(item.id, []):
+                occurrence = counts.get(child.name, 0)
+                counts[child.name] = occurrence + 1
+                index_existing(child, key, occurrence)
+
+        root_counts: dict[str, int] = {}
+        for root in children.get(None, []):
+            occurrence = root_counts.get(root.name, 0)
+            root_counts[root.name] = occurrence + 1
+            index_existing(root, tuple(), occurrence)
+
+        existing_by_source = {
+            item.source_node_id: item
+            for item in items
+            if item.source_node_id is not None
+        }
+        used: set[int] = set()
+        synced_by_path: dict[tuple, models.MaintenanceItem] = {}
+        mandatory_exceptions = _load_vehicle_mandatory_exceptions(db, maintenance.vehicle_id)
+
+        for key, entry in desired.items():
+            node = entry["node"]
+            item = existing_by_path.get(key)
+            if item is None or item.id in used:
+                item = existing_by_source.get(node.id)
+            if item is None or item.id in used:
+                parent_item = synced_by_path.get(entry["parent"]) if entry["parent"] is not None else None
+                item = models.MaintenanceItem(
+                    maintenance_id=maintenance.id,
+                    parent_id=parent_item.id if parent_item else None,
+                    source_node_id=node.id,
+                    name=node.name,
+                    order_index=entry["order_index"],
+                    tiers=",".join(str(period) for period in sorted(entry["periods"])),
+                    is_completed=not _node_is_mandatory_for_vehicle(node, mandatory_exceptions),
+                )
+                db.add(item)
+                db.flush()
+            else:
+                parent_item = synced_by_path.get(entry["parent"]) if entry["parent"] is not None else None
+                item.parent_id = parent_item.id if parent_item else None
+                item.source_node_id = node.id
+                item.name = node.name
+                item.order_index = entry["order_index"]
+                item.tiers = ",".join(str(period) for period in sorted(entry["periods"]))
+                # An unchecked/auto-completed item follows changes to the
+                # template's mandatory setting; human completion is retained.
+                if item.completed_by_id is None and item.completed_at is None:
+                    item.is_completed = not _node_is_mandatory_for_vehicle(node, mandatory_exceptions)
+            used.add(item.id)
+            synced_by_path[key] = item
+
+        stale = [item for item in items if item.id not in used]
+        retained_ids = {item.id for item in stale if item.is_completed}
+        by_id = {item.id: item for item in items}
+        for item in stale:
+            if item.id in retained_ids:
+                parent_id = item.parent_id
+                while parent_id is not None and parent_id in by_id:
+                    retained_ids.add(parent_id)
+                    parent_id = by_id[parent_id].parent_id
+
+        for item in stale:
+            if item.id in retained_ids:
+                item.source_node_id = None
+                item.tiers = ""
+            else:
+                db.delete(item)
+        synced += 1
+
+    if synced:
+        db.commit()
+    return synced
+
+
 def resync_maintenance_tiers(db: Session, m: "models.Maintenance") -> dict:
     """Zaten açılmış (silinmemiş) bir iş emrinin checklist'ini, hedef km'sinin
     kapsadığı TÜM uygulanabilir km planlarıyla yeniden hizalar.

@@ -725,6 +725,64 @@ def build_maintenances_workbook(maintenances: list, title: str = "Bakımlar") ->
 
 
 # ================================================================= Bakım ağacı içe aktarma
+def _snapshot_plan_tree_metadata(db, plan_id: int) -> dict[tuple[str, ...], dict]:
+    roots = (
+        db.query(models.TreeNode)
+        .filter_by(parent_id=None, plan_id=plan_id)
+        .order_by(models.TreeNode.order_index)
+        .all()
+    )
+    snapshot: dict[tuple[str, ...], dict] = {}
+
+    def walk(node: models.TreeNode, parent_path: tuple[str, ...]) -> None:
+        path = parent_path + (node.name,)
+        snapshot[path] = {
+            "note": node.note,
+            "attachments": [
+                {
+                    "kind": attachment.kind,
+                    "label": attachment.label,
+                    "filename": attachment.filename,
+                    "original_name": attachment.original_name,
+                    "url": attachment.url,
+                    "created_at": attachment.created_at,
+                }
+                for attachment in node.attachments
+            ],
+        }
+        for child in sorted(node.children, key=lambda item: (item.order_index, item.id)):
+            walk(child, path)
+
+    for root in roots:
+        walk(root, tuple())
+    return snapshot
+
+
+def _restore_plan_tree_metadata(db, plan_id: int, snapshot: dict[tuple[str, ...], dict]) -> None:
+    if not snapshot:
+        return
+    roots = (
+        db.query(models.TreeNode)
+        .filter_by(parent_id=None, plan_id=plan_id)
+        .order_by(models.TreeNode.order_index)
+        .all()
+    )
+
+    def walk(node: models.TreeNode, parent_path: tuple[str, ...]) -> None:
+        path = parent_path + (node.name,)
+        previous = snapshot.get(path)
+        if previous is not None:
+            if not node.note and previous["note"]:
+                node.note = previous["note"]
+            for attachment in previous["attachments"]:
+                db.add(models.NodeAttachment(node_id=node.id, **attachment))
+        for child in sorted(node.children, key=lambda item: (item.order_index, item.id)):
+            walk(child, path)
+
+    for root in roots:
+        walk(root, tuple())
+
+
 def import_maintenance_tree(db, workbook_source: str | bytes, vehicle_model: str = "") -> dict:
     """'Koruyucu Bakım Liste Çalışması' formatındaki xlsx'i okuyup her bakım
     periyodu (km) için ayrı bir MaintenancePlan + o plana özel bakım ağacı
@@ -753,10 +811,9 @@ def import_maintenance_tree(db, workbook_source: str | bytes, vehicle_model: str
     dosyada bulunsa bile atlanır ve varsa daha önce oluşturulmuş
     plan+ağacı da temizlenir.
 
-    Ayrıca bu kapsamdaki (genel veya belirli bir araç modeli) HENÜZ
-    TAMAMLANMAMIŞ (Bekliyor/Devam Ediyor) tüm iş emirleri silinir, böylece
-    güncellenmiş ağaçtan baştan açılırlar; Tamamlanmış iş emirleri (Bakım
-    Geçmişi) korunur.
+    Önceden açılmış tamamlanmamış iş emirleri silinmez; içe aktarma
+    tamamlandıktan sonra güncel ağaçla eşitlenir. Tamamlanan iş emirleri
+    geçmiş kaydı olarak değişmeden kalır.
 
     Dönüş: {"plans": [...özet...], "plans_obj": [MaintenancePlan...],
     "nodes_created": N, "maintenances_reset": N}
@@ -813,23 +870,7 @@ def import_maintenance_tree(db, workbook_source: str | bytes, vehicle_model: str
                 db.delete(stale)
             db.flush()
 
-    # Excel'den bakım ağacı (yeniden) yüklendiğinde, aynı kapsamdaki (genel
-    # veya belirli bir araç modeli) HENÜZ TAMAMLANMAMIŞ iş emirleri silinir;
-    # böylece bir sonraki km kontrolünde güncellenmiş ağaçtan baştan
-    # (temiz) açılırlar. Tamamlanmış (Bakım Geçmişi) iş emirlerine
-    # dokunulmaz — geçmiş kaydı olarak kalır.
-    open_q = (
-        db.query(models.Maintenance)
-        .join(models.Vehicle)
-        .filter(models.Maintenance.status.in_(["pending", "in_progress"]))
-    )
-    if vehicle_model:
-        open_q = open_q.filter(models.Vehicle.model == vehicle_model)
     reset_count = 0
-    for m in open_q.all():
-        db.delete(m)
-        reset_count += 1
-    db.flush()
 
     plans_touched: list[models.MaintenancePlan] = []
     total_nodes = 0
@@ -852,8 +893,11 @@ def import_maintenance_tree(db, workbook_source: str | bytes, vehicle_model: str
             db.flush()
         plans_touched.append(plan)
 
-        # Bu plana ait önceki ağacı temizle (yeniden içe aktarma güvenli olsun)
-        db.query(models.TreeNode).filter_by(parent_id=None, plan_id=plan.id).delete()
+        # Aynı yoldaki admin notları ve ekleri yeniden içe aktarmada koru.
+        tree_metadata = _snapshot_plan_tree_metadata(db, plan.id)
+        old_roots = db.query(models.TreeNode).filter_by(parent_id=None, plan_id=plan.id).all()
+        for old_root in old_roots:
+            db.delete(old_root)
         db.flush()
 
         # sütunları gezerek kategori > alt kategori > bileşen > checklist maddeleri ağacını kur
@@ -927,6 +971,8 @@ def import_maintenance_tree(db, workbook_source: str | bytes, vehicle_model: str
                 item_order += 1
                 total_nodes += 1
             db.flush()
+
+        _restore_plan_tree_metadata(db, plan.id, tree_metadata)
 
     db.commit()
     for p in plans_touched:
@@ -1089,8 +1135,8 @@ def import_bulk_catalog(
     o plana ait ağaç TAMAMEN yeniden kurulur (idempotent — aynı dosyayı
     tekrar yüklemek o modelin ağacını günceller/üzerine yazar, diğer
     modellere dokunmaz, çift madde oluşturmaz) ve o modeldeki henüz
-    TAMAMLANMAMIŞ iş emirleri sıfırlanır (import_maintenance_tree ile aynı
-    kural). Baştan/sondan boşluklu hücreler (ör. "ARAÇ İÇİ ") temizlenir.
+    TAMAMLANMAMIŞ iş emirleri silinmez; güncel ağaçla eşitlenir.
+    Baştan/sondan boşluklu hücreler (ör. "ARAÇ İÇİ ") temizlenir.
 
     ARAÇ'ı boş olan satırlar ve BAKIM hücresi tamamen BOŞ olan satırlar
     (sayfa sonundaki boş dolgu satırları) atlanır, `skipped` listesinde
@@ -1379,7 +1425,7 @@ def import_bulk_catalog(
     plans_updated = 0
     nodes_created = 0
     leaves_created = 0
-    models_reset: set[str] = set()
+
 
     for (plan_type, interval_km, interval_months, vehicle_model), items in rows_by_plan.items():
         # Kullanıcı talebi: kaynak dosyada görünen HER periyot (ör. 800.000 km
@@ -1418,8 +1464,11 @@ def import_bulk_catalog(
             plan.is_catalog_only = is_catalog_only  # yeniden yüklemede güncel duruma göre tazele
             plans_updated += 1
 
-        # Bu plana ait önceki ağacı temizle (yeniden içe aktarma güvenli olsun)
-        db.query(models.TreeNode).filter_by(parent_id=None, plan_id=plan.id).delete()
+        # Aynı yoldaki admin eklerini yeniden içe aktarmada koru.
+        tree_metadata = _snapshot_plan_tree_metadata(db, plan.id)
+        old_roots = db.query(models.TreeNode).filter_by(parent_id=None, plan_id=plan.id).all()
+        for old_root in old_roots:
+            db.delete(old_root)
         db.flush()
 
         bolge_nodes: dict[str, models.TreeNode] = {}
@@ -1491,23 +1540,7 @@ def import_bulk_catalog(
             nodes_created += 1
             leaves_created += 1
         db.flush()
-        models_reset.add(vehicle_model)
-
-    # Ağacı yenilenen her araç modeli için henüz TAMAMLANMAMIŞ iş emirlerini
-    # sıfırla (import_maintenance_tree ile aynı idempotent kural) — böylece
-    # güncellenmiş ağaçtan baştan açılırlar. Tamamlanmış bakımlar korunur.
-    for vm in models_reset:
-        (
-            db.query(models.Maintenance)
-            .filter(
-                models.Maintenance.status.in_(["pending", "in_progress"]),
-                models.Maintenance.vehicle_id.in_(
-                    db.query(models.Vehicle.id).filter(models.Vehicle.model == vm)
-                ),
-            )
-            .delete(synchronize_session=False)
-        )
-
+        _restore_plan_tree_metadata(db, plan.id, tree_metadata)
     if dry_run:
         # Önizleme: hiçbir şey kalıcı olmasın — yukarıdaki tüm db.add/flush
         # çağrıları yalnızca bu (henüz commit edilmemiş) işlem içinde
