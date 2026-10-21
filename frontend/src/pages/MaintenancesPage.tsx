@@ -1741,6 +1741,8 @@ export default function MaintenancesPage({
   const [upcoming, setUpcoming] = useState<UpcomingItem[]>([])
   const [upcomingBusy, setUpcomingBusy] = useState<number | null>(null)
   const [upcomingError, setUpcomingError] = useState('')
+  const [completeKmOpenId, setCompleteKmOpenId] = useState<number | null>(null)
+  const [completeKmInput, setCompleteKmInput] = useState('')
   // "İleri tarihe zamanla" inline tarih seçici — hangi satırın açık olduğunu
   // (busyKey ile aynı anahtar) ve o an seçili tarihi tutar.
   const [scheduleOpenKey, setScheduleOpenKey] = useState<number | null>(null)
@@ -2389,12 +2391,30 @@ export default function MaintenancesPage({
 
   async function completeUpcoming(item: UpcomingItem) {
     if (!item.maintenance_id) return
+    const isKmPlan = item.target_km > 0
+    if (isKmPlan && completeKmOpenId !== item.maintenance_id) {
+      setCompleteKmInput('')
+      setCompleteKmOpenId(item.maintenance_id)
+      return
+    }
     if (!confirm(`${item.vehicle.code} — ${item.plan_name} bakımını doğrudan TAMAMLANDI yapmak istiyor musunuz?`)) return
     setUpcomingBusy(item.maintenance_id)
     setUpcomingError('')
     try {
-      if (!(await askCompletedKm(item.maintenance_id, item.target_km > 0))) return
+      if (isKmPlan && completeKmInput.trim()) {
+        const km = Number(completeKmInput)
+        if (!Number.isSafeInteger(km) || km <= 0) {
+          setUpcomingError('Bakımın yapıldığı kilometreyi geçerli bir tam sayı olarak giriniz')
+          return
+        }
+        await api(`/maintenances/${item.maintenance_id}/completed-km`, {
+          method: 'PATCH',
+          body: { completed_km: km },
+        })
+      }
       await api(`/maintenances/${item.maintenance_id}/force-complete`, { method: 'POST' })
+      setCompleteKmOpenId(null)
+      setCompleteKmInput('')
       loadUpcoming()
       showToast('✓ İş emri tamamlandı yapıldı')
     } catch (e) {
@@ -2797,7 +2817,49 @@ export default function MaintenancesPage({
                           )}
                         </div>
                       )}
-                      {user.role === 'admin' && !!item.maintenance_id && <button className="small" disabled={upcomingBusy === busyKey} onClick={() => completeUpcoming(item)}>Tamamlandı Yap</button>}
+                      {user.role === 'admin' && !!item.maintenance_id && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, alignItems: 'flex-start' }}>
+                          <button
+                            className="small"
+                            disabled={upcomingBusy === busyKey}
+                            onClick={() => completeUpcoming(item)}
+                          >
+                            {completeKmOpenId === item.maintenance_id ? 'Onayla ve Tamamla' : 'Tamamlandı Yap'}
+                          </button>
+                          {completeKmOpenId === item.maintenance_id && item.target_km > 0 && (
+                            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                              <label
+                                htmlFor={`upcoming-completed-km-${item.maintenance_id}`}
+                                className="muted"
+                                style={{ fontSize: 12 }}
+                              >
+                                Bakım km:
+                              </label>
+                              <input
+                                id={`upcoming-completed-km-${item.maintenance_id}`}
+                                type="number"
+                                min={1}
+                                step={1}
+                                placeholder="İsteğe bağlı"
+                                value={completeKmInput}
+                                onChange={(e) => setCompleteKmInput(e.target.value)}
+                                disabled={upcomingBusy === busyKey}
+                                style={{ width: 125, fontSize: 12.5, padding: '4px 6px' }}
+                              />
+                              <button
+                                className="small ghost"
+                                disabled={upcomingBusy === busyKey}
+                                onClick={() => {
+                                  setCompleteKmOpenId(null)
+                                  setCompleteKmInput('')
+                                }}
+                              >
+                                Vazgeç
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </td></tr>
                   })}</tbody></table></div>
                 </section>
