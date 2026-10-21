@@ -682,6 +682,8 @@ function MaintenanceDetail({
   // Admin kısayolları: tek tek madde işaretlemeden iş emrini doğrudan
   // tamamlandı yapma / tamamlandı durumundan çıkarma.
   const [statusActionBusy, setStatusActionBusy] = useState(false)
+  const [forceCompleteKmOpen, setForceCompleteKmOpen] = useState(false)
+  const [forceCompleteKmInput, setForceCompleteKmInput] = useState('')
   const [assignableUsers, setAssignableUsers] = useState<User[]>([])
   const [assignBusy, setAssignBusy] = useState(false)
   const [shiftAssignBusy, setShiftAssignBusy] = useState(false)
@@ -1035,12 +1037,33 @@ function MaintenanceDetail({
 
   async function forceComplete() {
     if (!m) return
+    if (m.plan.plan_type === 'km') {
+      setForceCompleteKmInput(m.completed_km?.toString() ?? '')
+      setForceCompleteKmOpen(true)
+      return
+    }
+    await submitForceComplete()
+  }
+
+  async function submitForceComplete() {
+    if (!m) return
     if (!confirm(`İş Emri #${m.id} (${m.vehicle.code} — ${m.plan.name}) tek tek madde işaretlenmeden doğrudan TAMAMLANDI yapılsın mı?`)) return
     setError('')
     setStatusActionBusy(true)
     try {
-      if (!(await askCompletedKm(m.id, m.plan.plan_type === 'km', m.completed_km))) return
+      if (m.plan.plan_type === 'km' && forceCompleteKmInput.trim()) {
+        const km = Number(forceCompleteKmInput)
+        if (!Number.isSafeInteger(km) || km <= 0) {
+          setError('Bakımın yapıldığı kilometreyi geçerli bir tam sayı olarak giriniz')
+          return
+        }
+        await api(`/maintenances/${m.id}/completed-km`, {
+          method: 'PATCH',
+          body: { completed_km: km },
+        })
+      }
       await api(`/maintenances/${m.id}/force-complete`, { method: 'POST' })
+      setForceCompleteKmOpen(false)
       load()
       showToast('✓ İş emri tamamlandı yapıldı')
     } catch (e) {
@@ -1222,6 +1245,49 @@ function MaintenanceDetail({
             )}
           </div>
         </div>
+        {forceCompleteKmOpen && m.plan.plan_type === 'km' && (
+          <div
+            className="row"
+            style={{
+              marginTop: 12,
+              padding: 12,
+              border: '1px solid var(--border)',
+              borderRadius: 8,
+              background: 'var(--bg-secondary)',
+              gap: 8,
+              flexWrap: 'wrap',
+            }}
+          >
+            <label htmlFor="force-complete-km" style={{ fontSize: 13 }}>
+              Bakımın yapıldığı km (isteğe bağlı):
+            </label>
+            <input
+              id="force-complete-km"
+              type="number"
+              min={1}
+              step={1}
+              placeholder={`Boş: ${fmtKm(m.vehicle.current_km)}`}
+              value={forceCompleteKmInput}
+              onChange={(e) => setForceCompleteKmInput(e.target.value)}
+              disabled={statusActionBusy}
+              style={{ width: 170 }}
+            />
+            <button
+              className="small primary"
+              disabled={statusActionBusy}
+              onClick={submitForceComplete}
+            >
+              {statusActionBusy ? 'Kaydediliyor…' : 'Km ile Tamamla'}
+            </button>
+            <button
+              className="small ghost"
+              disabled={statusActionBusy}
+              onClick={() => setForceCompleteKmOpen(false)}
+            >
+              Vazgeç
+            </button>
+          </div>
+        )}
         <div className="muted" style={{ margin: '10px 0' }}>
           İş Emri #{m.id} · {hedefLabel(m)}'de açıldı · Oluşturma: {fmt(m.created_at)} ·
           Başlangıç: {fmt(m.started_at)} · Bitiş: {fmt(m.completed_at)} · Açılış KM: {fmtKm(m.km_at_open)} ·{' '}
