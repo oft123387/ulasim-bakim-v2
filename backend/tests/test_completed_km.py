@@ -8,8 +8,8 @@ gözüksün bakım geçmişi sayfasında da o yüzde yine gözüksün."
 
 PATCH /api/maintenances/{id}/completed-km uç noktasını uçtan uca (yalnızca
 services.compute_km_deviation_pct birim testini değil) doğrular: kayıt,
-sapma hesabı, aracın km'sinin ileri taşınması, geriye alma engeli, süre
-bazlı planlarda reddedilmesi ve teknisyen yetki kısıtı."""
+sapma hesabı, aracın km'sinin yalnızca ileri taşınması, süre bazlı
+planlarda reddedilmesi ve teknisyen yetki kısıtı."""
 
 from datetime import date, datetime, timedelta
 
@@ -89,19 +89,27 @@ def test_completed_km_advances_vehicle_current_km(client, admin_token):
         _cleanup(client, admin, v, plan)
 
 
-def test_completed_km_cannot_go_backwards(client, admin_token):
+def test_completed_km_can_be_lower_than_current_vehicle_km_without_rolling_vehicle_back(
+    client, admin_token,
+):
     admin = admin_token
     v, plan, m = _make_activated_km_candidate(client, admin, "CkmModelC", start_km=199_000)
     try:
-        client.patch(
+        advanced = client.patch(
             f"/api/maintenances/{m['id']}/completed-km", headers=auth(admin),
             json={"completed_km": 199_300},
         )
+        assert advanced.status_code == 200, advanced.text
+
         r = client.patch(
             f"/api/maintenances/{m['id']}/completed-km", headers=auth(admin),
-            json={"completed_km": 199_100},
+            json={"completed_km": 199_200},
         )
-        assert r.status_code == 400
+        assert r.status_code == 200, r.text
+        assert r.json()["completed_km"] == 199_200
+        vehicles = client.get("/api/vehicles", headers=auth(admin)).json()
+        vehicle = next(row for row in vehicles if row["id"] == v["id"])
+        assert vehicle["current_km"] == 199_300
     finally:
         _cleanup(client, admin, v, plan)
 

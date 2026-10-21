@@ -156,6 +156,30 @@ function ItemExtras({
 const fmt = (s: string | null) => (s ? new Date(s).toLocaleString('tr-TR') : '—')
 const fmtKm = (n: number) => n.toLocaleString('tr-TR')
 
+async function askCompletedKm(
+  maintenanceId: number,
+  isKmPlan: boolean,
+  existingKm?: number | null,
+): Promise<boolean> {
+  if (!isKmPlan) return true
+  const value = window.prompt(
+    'Bakımın yapıldığı kilometreyi girin (isteğe bağlı). Boş bırakırsanız kayıtlı araç kilometresi kullanılır.',
+    existingKm?.toString() ?? '',
+  )
+  if (value === null) return false
+  if (!value.trim()) return true
+
+  const km = Number(value)
+  if (!Number.isSafeInteger(km) || km <= 0) {
+    throw new Error('Geçerli bir tam kilometre giriniz')
+  }
+  await api(`/maintenances/${maintenanceId}/completed-km`, {
+    method: 'PATCH',
+    body: { completed_km: km },
+  })
+  return true
+}
+
 // Süre bazlı (aylık/yıllık) iş emirlerinde gerçek hedef bir km değil takvim
 // tarihidir (target_date) — backend km alanını bu durumda gizler (null).
 // Tablo/başlık gösterimlerinde ikisini de doğru biçimde tek bir metne çevirir.
@@ -819,6 +843,14 @@ function MaintenanceDetail({
 
   async function submitComplete(itemId: number, workerIds: number[]) {
     try {
+      const item = findItemById(m?.items ?? [], itemId)
+      const [done, total] = countLeaves(m?.items ?? [])
+      const completesMaintenance = item?.children.length === 0 && done + 1 >= total
+      if (
+        completesMaintenance &&
+        m &&
+        !(await askCompletedKm(m.id, m.plan.plan_type === 'km', m.completed_km))
+      ) return
       await api(`/items/${itemId}/complete`, {
         method: 'POST',
         body: workerIds.length ? { worker_ids: workerIds } : {},
@@ -1007,6 +1039,7 @@ function MaintenanceDetail({
     setError('')
     setStatusActionBusy(true)
     try {
+      if (!(await askCompletedKm(m.id, m.plan.plan_type === 'km', m.completed_km))) return
       await api(`/maintenances/${m.id}/force-complete`, { method: 'POST' })
       load()
       showToast('✓ İş emri tamamlandı yapıldı')
@@ -2294,6 +2327,7 @@ export default function MaintenancesPage({
     setUpcomingBusy(item.maintenance_id)
     setUpcomingError('')
     try {
+      if (!(await askCompletedKm(item.maintenance_id, item.target_km > 0))) return
       await api(`/maintenances/${item.maintenance_id}/force-complete`, { method: 'POST' })
       loadUpcoming()
       showToast('✓ İş emri tamamlandı yapıldı')

@@ -3914,12 +3914,6 @@ def set_maintenance_completed_km(
     if m.plan.plan_type != "km":
         raise HTTPException(400, "Bu alan yalnızca km bazlı bakımlarda kullanılabilir")
     v = m.vehicle
-    if body.completed_km < v.current_km:
-        raise HTTPException(
-            400,
-            f"Girilen km ({fmt_km(body.completed_km)}) aracın şu anki km'sinden "
-            f"({fmt_km(v.current_km)}) küçük olamaz — kilometre geriye alınamaz.",
-        )
     old_completed_km = m.completed_km
     m.completed_km = body.completed_km
     old_vehicle_km = v.current_km
@@ -3930,7 +3924,7 @@ def set_maintenance_completed_km(
     db.commit()
     services.log_action(
         db, actor, "update", "maintenance", m.id,
-        f"Bakım yapılırken güncel km girildi: {v.code} — {m.plan.name}",
+        f"Bakımın yapıldığı km girildi: {v.code} — {m.plan.name}",
         detail=f"Hedef {fmt_km(m.target_km)} km",
         old_value=str(old_completed_km) if old_completed_km is not None else "",
         new_value=str(body.completed_km),
